@@ -12,11 +12,12 @@ import { logger } from "../utils/logger.js";
 import * as THREE from "three";
 
 let shapeCounter = 0;
+export function nextId() { return ++shapeCounter; }
 
 export class ComplexShape2D extends ComplexPrimitive2D {
   constructor(params = {}) {
     super(params);
-    this.id = ++shapeCounter;
+    this.id = nextId();
     this.primitiveType = 'line';
 
     // Initialize vertices
@@ -60,7 +61,6 @@ export class ComplexShape2D extends ComplexPrimitive2D {
   }
 
   calculateBaseSDF(point, time = 0, depth = 0) {
-    logger.debug(`Calculating base SDF for shape ${this.id} at point (${point.x}, ${point.y}), time: ${time}, depth: ${depth}`);
     return this.edges.length > 0 ? this.distanceToEdge(this.edges[0], point, time, depth) : Infinity;
   }
 
@@ -68,8 +68,6 @@ export class ComplexShape2D extends ComplexPrimitive2D {
     const { x: x1, y: y1 } = edge.vertexA.position;
     const { x: x2, y: y2 } = edge.vertexB.position;
     const { x, y } = point;
-
-    logger.debug(`Calculating distance to edge for shape ${this.id}: Edge from (${x1}, ${y1}) to (${x2}, ${y2}), Point: (${x}, ${y}), time: ${time}, depth: ${depth}`);
 
     // Vector from edge start to point
     const dx = x - x1;

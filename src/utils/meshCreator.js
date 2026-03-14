@@ -140,28 +140,21 @@ export function marchingSquares(sdfFn, bounds, resolution = 100) {
         // For each edge pair, calculate the crossing points
         for (const [edge1, edge2] of edgePairs) {
           // Calculate each edge's interpolated point
-          const corners = [
-            [0, 3], // Corners for edge 0 (bottom)
-            [1, 2], // Corners for edge 1 (right)
-            [2, 3], // Corners for edge 2 (top)
-            [0, 3]  // Corners for edge 3 (left)
-          ];
+          const edgeCorners = [[0, 1], [1, 2], [2, 3], [3, 0]];
           
-          const c1 = corners[edge1][0];
-          const c2 = corners[edge1][1];
+          const [c1, c2] = edgeCorners[edge1];
           const pt1 = interpolate(
             edge1, i, j, 
             values[c1], values[c2]
           );
           
-          const c3 = corners[edge2][0];
-          const c4 = corners[edge2][1];
+          const [c3, c4] = edgeCorners[edge2];
           const pt2 = interpolate(
             edge2, i, j,
             values[c3], values[c4]
           );
           
-          cell.edges.push([pt1, pt2]);
+          cell.edges.push([pt1, pt2, edge1, edge2]);
         }
       }
       
@@ -189,98 +182,101 @@ export function marchingSquares(sdfFn, bounds, resolution = 100) {
     return [];
   }
   
-  // Trace contours using the cell crossing information
+  // ── Contour tracing ───────────────────────────────────────────────────────
+  //
+  // Each interior grid edge is shared by exactly two cells.  Given a segment
+  // that exits through edge N of cell (ci, cj), the continuation is always
+  // found in a specific neighbour at a specific entry edge:
+  //
+  //   exit edge 0 (bottom) → cell (ci,   cj-1), entry edge 2 (top)
+  //   exit edge 1 (right)  → cell (ci+1, cj),   entry edge 3 (left)
+  //   exit edge 2 (top)    → cell (ci,   cj+1), entry edge 0 (bottom)
+  //   exit edge 3 (left)   → cell (ci-1, cj),   entry edge 1 (right)
+  //
+  // This is O(1) per step and works in all four cardinal directions.
+
+  // [di, dj, entryEdge]
+  const NEXT = {
+    0: [ 0, -1, 2],
+    1: [ 1,  0, 3],
+    2: [ 0,  1, 0],
+    3: [-1,  0, 1]
+  };
+
   const contours = [];
+  // visited key: `${i},${j},${segmentIndex}`
   const visited = new Set();
-  
-  function cellKey(i, j, edgeIndex) {
-    return `${i},${j},${edgeIndex}`;
-  }
-  
-  // Look for unvisited cells with contour crossings
+
   for (let j = 0; j < resolution; j++) {
     for (let i = 0; i < resolution; i++) {
       const cell = cellCrossings[j][i];
-      
-      // Skip if no contour or already visited
       if (cell.edges.length === 0) continue;
-      
-      // For each edge pair in this cell
+
       for (let e = 0; e < cell.edges.length; e++) {
-        const key = cellKey(i, j, e);
-        if (visited.has(key)) continue;
-        
-        // Start a new contour
+        const startKey = `${i},${j},${e}`;
+        if (visited.has(startKey)) continue;
+
+        // Start a new contour from this unvisited segment
         const contour = [];
-        
-        // Add the first edge pair's points
-        const [pt1, pt2] = cell.edges[e];
+        visited.add(startKey);
+
+        const [pt1, pt2, , exitEdge0] = cell.edges[e];
         contour.push(pt1, pt2);
-        visited.add(key);
-        
-        // Trace this contour until it closes or reaches a boundary
-        let completed = false;
-        let iterations = 0;
-        const MAX_ITERATIONS = resolution * resolution * 2; // Safety limit
-        
-        // We'll start with a simplified tracer that just collects edge pairs
-        // In a more advanced implementation, we would follow the contour
-        // by finding adjacent cells that share an edge with our current endpoint
-        
-        let currI = i;
-        let currJ = j;
-        
-        while (!completed && iterations < MAX_ITERATIONS) {
-          iterations++;
-          
-          // Check adjacent cells (simplified - just checking east first)
+
+        let ci       = i;
+        let cj       = j;
+        let exitEdge = exitEdge0;
+
+        // Follow the chain until we close the loop or hit a boundary
+        const MAX_STEPS = resolution * resolution * 2;
+        for (let step = 0; step < MAX_STEPS; step++) {
+          const [di, dj, entryEdge] = NEXT[exitEdge];
+          const ni = ci + di;
+          const nj = cj + dj;
+
+          // Out of bounds → open contour, stop
+          if (ni < 0 || ni >= resolution || nj < 0 || nj >= resolution) break;
+
+          const neighbour = cellCrossings[nj][ni];
+          if (neighbour.edges.length === 0) break;
+
+          // Find the segment in the neighbour whose entry edge matches
           let found = false;
-          
-          // Check neighboring cells - right
-          if (currI < resolution - 1) {
-            const neighborCell = cellCrossings[currJ][currI + 1];
-            if (neighborCell.edges.length > 0) {
-              for (let ne = 0; ne < neighborCell.edges.length; ne++) {
-                const neighborKey = cellKey(currI + 1, currJ, ne);
-                if (!visited.has(neighborKey)) {
-                  const [nextPt1, nextPt2] = neighborCell.edges[ne];
-                  
-                  // If any point is close to our last point, add it
-                  const lastPoint = contour[contour.length - 1];
-                  const d1 = Math.hypot(nextPt1.x - lastPoint.x, nextPt1.y - lastPoint.y);
-                  const d2 = Math.hypot(nextPt2.x - lastPoint.x, nextPt2.y - lastPoint.y);
-                  
-                  if (d1 < dx/2) {
-                    contour.push(nextPt2);
-                    visited.add(neighborKey);
-                    currI += 1;
-                    found = true;
-                    break;
-                  } else if (d2 < dx/2) {
-                    contour.push(nextPt1);
-                    visited.add(neighborKey);
-                    currI += 1;
-                    found = true;
-                    break;
-                  }
-                }
+          for (let ne = 0; ne < neighbour.edges.length; ne++) {
+            const nKey = `${ni},${nj},${ne}`;
+            const [, , neighbourEntry, neighbourExit] = neighbour.edges[ne];
+
+            if (neighbourEntry !== entryEdge) continue;
+
+            // Loop closed — the exit point connects back to our start
+            if (visited.has(nKey)) {
+              // Only close if this really is our start cell
+              if (ni === i && nj === j && ne === e) {
+                contour.push(contour[0]); // close the loop
               }
+              found = true;
+              break;
             }
+
+            visited.add(nKey);
+            contour.push(neighbour.edges[ne][1]); // push pt2
+            exitEdge = neighbourExit;
+            ci = ni;
+            cj = nj;
+            found = true;
+            break;
           }
-          
-          // If we didn't find a neighbor to the right, try other directions
-          if (!found) {
-            completed = true; // For now, just stop when we can't find a continuation
-          }
+
+          if (!found) break; // boundary or saddle dead-end
         }
-        
+
         if (contour.length > 2) {
           contours.push(contour);
         }
       }
     }
   }
-  
+
   logger.info(`Marching squares completed. Found ${contours.length} contours.`);
   return contours;
 }
@@ -319,42 +315,32 @@ export function marchingCubes(sdfFn3D, bounds3D, resolution = 50, options = {}) 
     );
     mc.scale.set(size / 2, size / 2, size / 2);
     
-    // Fill the grid with SDF values
-    const stepSize = 1 / resolution;
+    // Fill mc.field — Three.js MarchingCubes indexes as: k*size² + j*size + i
+    const size2 = resolution * resolution;
     logger.debug('Filling grid with SDF values...');
     
     let minSDF = Infinity;
     let maxSDF = -Infinity;
     
-    for (let i = 0; i < resolution; i++) {
-      const x = xmin + (i / resolution) * (xmax - xmin);
+    for (let k = 0; k < resolution; k++) {
+      const z = zmin + (k / (resolution - 1)) * (zmax - zmin);
       for (let j = 0; j < resolution; j++) {
-        const y = ymin + (j / resolution) * (ymax - ymin);
-        for (let k = 0; k < resolution; k++) {
-          const z = zmin + (k / resolution) * (zmax - zmin);
-          
-          // Convert to grid coordinates (-1 to 1)
-          const nx = (i / resolution) * 2 - 1;
-          const ny = (j / resolution) * 2 - 1;
-          const nz = (k / resolution) * 2 - 1;
-          
+        const y = ymin + (j / (resolution - 1)) * (ymax - ymin);
+        for (let i = 0; i < resolution; i++) {
+          const x = xmin + (i / (resolution - 1)) * (xmax - xmin);
           const value = sdfFn3D({ x, y, z });
-          
-          // Track SDF range for debugging
           minSDF = Math.min(minSDF, value);
           maxSDF = Math.max(maxSDF, value);
-          
-          mc.setCell(i, j, k, value);
+          mc.field[k * size2 + j * resolution + i] = value;
         }
       }
     }
     
     logger.debug(`SDF value range: [${minSDF.toFixed(4)}, ${maxSDF.toFixed(4)}]`);
     
-    // Generate the isosurface
-    logger.debug(`Generating isosurface with isolation value: ${isoLevel}`);
     mc.isolation = isoLevel;
-    logger.info(`Marching cubes completed. Generated geometry with ${geometry.attributes.position.count} vertices.`);
+    mc.update();
+    logger.info(`Marching cubes completed.`);
     
     return mc;
   } 

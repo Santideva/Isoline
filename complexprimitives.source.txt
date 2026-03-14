@@ -1,0 +1,5448 @@
+
+================================================================================
+// FILE: src/Geometry/ComplexShape2d.js
+================================================================================
+
+// File: src/primitives/ComplexShape2D.js
+import { Vertex } from "./Vertex.js";
+import { Edge } from "./Edge.js";
+import { ComplexPrimitive2D } from "../Primitives/ComplexPrimitive2d.js";
+import { 
+  createCompositeSDF, 
+  weightedRUnion, 
+  weightedRIntersection, 
+  weightedRDifference 
+} from "../utils/SDFBlending.js";
+import { logger } from "../utils/logger.js";
+import * as THREE from "three";
+
+let shapeCounter = 0;
+export function nextId() { return ++shapeCounter; }
+
+export class ComplexShape2D extends ComplexPrimitive2D {
+  constructor(params = {}) {
+    super(params);
+    this.id = nextId();
+    this.primitiveType = 'line';
+
+    // Initialize vertices
+    this.vertices = params.vertices || [
+      new Vertex({ position: { x: 0, y: 0 }, color: this.color }),
+      new Vertex({ position: { x: 1, y: 0 }, color: this.color })
+    ];
+
+    // Initialize edge
+    this.edges = params.edges || [
+      new Edge(this.vertices[0], this.vertices[1], this.distanceMapper)
+    ];
+
+    this.face = null;
+
+    // Initialize blend parameters
+    this.blendParams = {
+      smoothness: params.smoothness || 8,
+      operation: params.operation || 'union',
+      primitives: (params.primitives || []).filter(p => p !== this),
+      basePrimitive: params.basePrimitive || null
+    };
+
+    this.updateCompositeSDF();
+
+    // Log creation
+    logger.info(`Created ComplexShape2D with id: ${this.id} as a line-segment primitive`);
+    this._logVertexPositions('Initial');
+  }
+
+  /**
+   * Return a brand-new clone of this ComplexShape2D with identical parameters
+   */
+  clone() {
+    return new ComplexShape2D(this._params);
+  }
+  
+  // Helper method to log vertex positions
+  _logVertexPositions(prefix) {
+    logger.debug(`${prefix} Vertex Positions: Vertex A: (${this.vertices[0].position.x}, ${this.vertices[0].position.y}), Vertex B: (${this.vertices[1].position.x}, ${this.vertices[1].position.y})`);
+  }
+
+  calculateBaseSDF(point, time = 0, depth = 0) {
+    logger.debug(`Calculating base SDF for shape ${this.id} at point (${point.x}, ${point.y}), time: ${time}, depth: ${depth}`);
+    return this.edges.length > 0 ? this.distanceToEdge(this.edges[0], point, time, depth) : Infinity;
+  }
+
+  distanceToEdge(edge, point, time = 0, depth = 0) {
+    const { x: x1, y: y1 } = edge.vertexA.position;
+    const { x: x2, y: y2 } = edge.vertexB.position;
+    const { x, y } = point;
+
+    logger.debug(`Calculating distance to edge for shape ${this.id}: Edge from (${x1}, ${y1}) to (${x2}, ${y2}), Point: (${x}, ${y}), time: ${time}, depth: ${depth}`);
+
+    // Vector from edge start to point
+    const dx = x - x1;
+    const dy = y - y1;
+
+    // Edge vector
+    const edgeX = x2 - x1;
+    const edgeY = y2 - y1;
+
+    // Square of edge length
+    const edgeLengthSquared = edgeX * edgeX + edgeY * edgeY;
+
+    // If edge is effectively a point, return distance to that point
+    if (edgeLengthSquared === 0) {
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // Project point onto edge line, clamped to [0,1]
+    const t = Math.max(0, Math.min(1, (dx * edgeX + dy * edgeY) / edgeLengthSquared));
+
+    // Closest point on edge
+    const closestX = x1 + t * edgeX;
+    const closestY = y1 + t * edgeY;
+
+    // Distance to closest point
+    return Math.sqrt((x - closestX) ** 2 + (y - closestY) ** 2);
+  }
+
+  updateCompositeSDF() {
+    const primitives = (this.blendParams.primitives || []).filter(p => p !== this);
+    const { operation, smoothness, basePrimitive } = this.blendParams;
+
+    logger.debug(`Updating composite SDF for shape ${this.id}. Blending operation: ${operation}, Smoothness: ${smoothness}`);
+    
+    if (primitives.length === 0) {
+      this.compositeSDF = null;
+      logger.debug(`No additional primitives. Composite SDF for shape ${this.id} is set to null.`);
+      return;
+    }
+
+    const op = operation.toLowerCase();
+    
+    if (op === 'difference') {
+      if (basePrimitive) {
+        const orderedPrimitives = [
+          basePrimitive,
+          ...primitives.filter(p => p !== basePrimitive)
+        ];
+        this.compositeSDF = createCompositeSDF(orderedPrimitives, smoothness, 'difference');
+      } else {
+        this.compositeSDF = createCompositeSDF(primitives, smoothness, 'difference');
+      }
+    } else {
+      if (op !== 'union' && op !== 'intersection') {
+        console.warn(`Invalid blending operation: "${op}". Defaulting to "union".`);
+      }
+      this.compositeSDF = createCompositeSDF(
+        primitives,
+        smoothness,
+        op === 'intersection' ? 'intersection' : 'union'
+      );
+    }
+    
+    logger.debug(`Composite SDF updated for shape ${this.id}.`);
+  }
+
+  computeSDF(point, callStack = [], time = 0, depth = 0) {
+    // Prevent infinite recursion
+    if (callStack.includes(this.id)) {
+      console.warn(`Detected recursive SDF calculation for shape ${this.id}`);
+      return this.calculateBaseSDF(point, time, depth);
+    }
+
+    const newCallStack = [...callStack, this.id];
+    const baseSDF = this.calculateBaseSDF(point, time, depth);
+
+    // If no blending primitives, return base SDF
+    if (!this.blendParams.primitives?.length) {
+      return baseSDF;
+    }
+
+    if (!this.compositeSDF) {
+      console.warn("Composite SDF not initialized. Returning base SDF.");
+      return baseSDF;
+    }
+
+    const compositeSdfValue = this.getCompositeSdfValue(point, newCallStack, time, depth);
+    const op = this.blendParams.operation.toLowerCase();
+    const smoothness = this.blendParams.smoothness;
+
+    // Apply appropriate blending operation
+    if (op === 'union') {
+      return weightedRUnion(baseSDF, compositeSdfValue, smoothness);
+    } else if (op === 'intersection') {
+      return weightedRIntersection(baseSDF, compositeSdfValue, smoothness);
+    } else if (op === 'difference') {
+      return this.blendParams.basePrimitive ? 
+        compositeSdfValue : 
+        weightedRDifference(baseSDF, compositeSdfValue, smoothness);
+    }
+    
+    return baseSDF;
+  }
+
+  getCompositeSdfValue(point, callStack = [], time = 0, depth = 0) {
+    try {
+      if (typeof this.compositeSDF !== 'function') return Infinity;
+      
+      const primitives = this.blendParams.primitives.filter(p => p !== this);
+      
+      if (primitives.length === 0) return Infinity;
+      
+      if (primitives.length === 1) {
+        return primitives[0].computeSDF ? 
+          primitives[0].computeSDF(point, callStack, time, depth) : 
+          primitives[0].computeSDF(point, callStack);
+      }
+      
+      // Need to adapt the compositeSDF call to include time and depth
+      // This is a simplification since we don't have the full implementation of createCompositeSDF
+      return this.compositeSDF(point, time, depth);
+    } catch (error) {
+      console.error(`Error computing composite SDF: ${error}`);
+      return Infinity;
+    }
+  }
+
+  createLineObject(time = 0) {
+    logger.debug(`Creating line object for shape ${this.id} at time: ${time}`);
+    
+    // Create base points from vertices
+    const basePoints = [
+      new THREE.Vector3(this.vertices[0].position.x, this.vertices[0].position.y, 0),
+      new THREE.Vector3(this.vertices[1].position.x, this.vertices[1].position.y, 0)
+    ];
+    
+    const points = [];
+    
+    // Visualize distance mapping effect if applicable
+    if (this.distanceMapper && typeof this.distanceMapper === 'function') {
+      const numIntermediatePoints = 20;
+      
+      // Calculate edge direction and normal once
+      const edgeX = this.vertices[1].position.x - this.vertices[0].position.x;
+      const edgeY = this.vertices[1].position.y - this.vertices[0].position.y;
+      
+      const normal = {
+        x: -edgeY,
+        y: edgeX
+      };
+      
+      // Normalize the normal
+      const length = Math.sqrt(normal.x * normal.x + normal.y * normal.y);
+      if (length > 0) {
+        normal.x /= length;
+        normal.y /= length;
+      }
+      
+      // Apply distance mapper visualization with time parameter
+      const originalDistance = 0;
+      const mappedDistance = this.distanceMapper(originalDistance, time, 0);
+      const displacement = mappedDistance - originalDistance;
+      const scaleFactor = 0.1;
+      
+      for (let i = 0; i <= numIntermediatePoints; i++) {
+        const t = i / numIntermediatePoints;
+        const x = this.vertices[0].position.x + t * edgeX;
+        const y = this.vertices[0].position.y + t * edgeY;
+        
+        const visualX = x + normal.x * displacement * scaleFactor;
+        const visualY = y + normal.y * displacement * scaleFactor;
+        
+        points.push(new THREE.Vector3(visualX, visualY, 0));
+      }
+    } else {
+      // Use base points if no special visualization needed
+      points.push(...basePoints);
+    }
+    
+    // Create geometry and material
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    
+    // Create color
+    const color = new THREE.Color();
+    if (this.color && typeof this.color.h !== 'undefined') {
+      const h = this.color.h / 360;
+      const s = typeof this.color.s === 'number' ? this.color.s : 0.8;
+      const l = typeof this.color.l === 'number' ? this.color.l : 0.6;
+      color.setHSL(h, s, l);
+    } else {
+      color.set(0x0000ff);
+    }
+    
+    const lineMaterial = new THREE.LineBasicMaterial({ color });
+    
+    logger.debug(`Line object created for shape ${this.id} with ${points.length} points at time: ${time}`);
+    return new THREE.Line(geometry, lineMaterial);
+  }
+
+  addBlendPrimitive(primitive, operation = null) {
+    if (!this.blendParams.primitives) {
+      this.blendParams.primitives = [];
+    }
+    
+    if (primitive !== this) {
+      this.blendParams.primitives.push(primitive);
+    } else {
+      console.warn("Attempted to add self-reference to blend primitives. Ignoring.");
+    }
+    
+    if (operation) {
+      this.blendParams.operation = operation;
+    }
+    
+    this.updateCompositeSDF();
+    return this;
+  }
+
+  setBlendParams(params = {}) {
+    const replacer = (key, value) => {
+      if (key === "primitives") return undefined;
+      return value;
+    };
+
+    const oldParams = JSON.stringify(this.blendParams, replacer);
+    
+    this.blendParams = {
+      ...this.blendParams,
+      ...params
+    };
+    
+    if (this.blendParams.primitives) {
+      this.blendParams.primitives = this.blendParams.primitives.filter(p => p !== this);
+    }
+    
+    if (oldParams !== JSON.stringify(this.blendParams, replacer)) {
+      this.updateCompositeSDF();
+    }
+    
+    return this;
+  }
+
+  setBasePrimitive(primitive) {
+    if (primitive === this) {
+      console.warn("Cannot set self as base primitive. Ignoring.");
+      return this;
+    }
+    
+    this.blendParams.basePrimitive = primitive;
+    
+    if (this.blendParams.operation.toLowerCase() === 'difference') {
+      this.updateCompositeSDF();
+    }
+    
+    return this;
+  }
+
+  clearBlendPrimitives() {
+    this.blendParams.primitives = [];
+    this.updateCompositeSDF();
+    return this;
+  }
+
+  transform(matrix) {
+    // Log pre-transformation vertex positions
+    this._logVertexPositions('Before Transform');
+    
+    super.transform(matrix);
+    
+    // Transform vertices
+    for (const vertex of this.vertices) {
+      if (vertex.transform) {
+        vertex.transform(matrix);
+      }
+    }
+    
+    // Log post-transformation vertex positions
+    this._logVertexPositions('After Transform');
+    
+    this.updateCompositeSDF();
+    return this;
+  }
+
+  /**
+   * Static method for serializing a ComplexShape2D instance.
+   * Extracts properties necessary to reconstruct the shape.
+   * @param {ComplexShape2D} instance - The ComplexShape2D instance to serialize.
+   * @returns {Object} An object containing serializable properties.
+   */
+  static getSerializableParameters(instance) {
+    const params = {};
+    
+    // Extract vertices: for each vertex, store its position and color.
+    if (instance.vertices && Array.isArray(instance.vertices)) {
+      params.vertices = instance.vertices.map(v => ({
+        position: { x: v.position.x, y: v.position.y },
+        color: v.color
+      }));
+    }
+    
+    // Include metric if it exists
+    if (instance.metric !== undefined) {
+      params.metric = { ...instance.metric };
+    }
+    
+    // Include blend parameters and store references to blended primitives
+    if (instance.blendParams !== undefined) {
+      params.blendParams = { ...instance.blendParams };
+      if (instance.blendParams.primitives && Array.isArray(instance.blendParams.primitives)) {
+        params.blendParams.primitiveRefs = instance.blendParams.primitives.map(p => p.id);
+      }
+    }
+    
+    // Include primitive type (e.g., 'line')
+    params.primitiveType = instance.primitiveType;
+    
+    // Include the constructor name for debugging
+    params._shapeClass = instance.constructor ? instance.constructor.name : null;
+    
+    return params;
+  }
+}
+
+================================================================================
+// FILE: src/Geometry/Edge.js
+================================================================================
+
+// File: src/geometry/Edge.js
+
+import { identityMapping } from "../utils/DistanceMapping.js";
+
+let edgeCounter = 0;
+
+export class Edge {
+  constructor(vertexA, vertexB, distanceMapper = identityMapping) {
+    this.id = ++edgeCounter;
+    this.vertexA = vertexA;
+    this.vertexB = vertexB;
+    this.distanceMapper = distanceMapper;
+  }
+
+  getRawDistance() {
+    const dx = this.vertexB.position.x - this.vertexA.position.x;
+    const dy = this.vertexB.position.y - this.vertexA.position.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  getEffectiveDistance() {
+    const rawDistance = this.getRawDistance();
+    return this.distanceMapper(rawDistance);
+  }
+}
+
+================================================================================
+// FILE: src/Geometry/Face.js
+================================================================================
+
+// File: src/geometry/Face.js
+
+let faceCounter = 0;
+
+export class Face {
+  constructor(vertices = []) {
+    this.id = ++faceCounter;
+    this.vertices = vertices;
+  }
+
+  getFaceColor() {
+    const total = this.vertices.length;
+    const blended = this.vertices.reduce(
+      (acc, vertex) => {
+        acc.h += vertex.color.h;
+        acc.s += vertex.color.s;
+        acc.l += vertex.color.l;
+        acc.a += vertex.color.a;
+        return acc;
+      },
+      { h: 0, s: 0, l: 0, a: 0 }
+    );
+    return {
+      h: blended.h / total,
+      s: blended.s / total,
+      l: blended.l / total,
+      a: blended.a / total,
+    };
+  }
+
+  transform(matrix) {
+    this.vertices.forEach(vertex => vertex.transform(matrix));
+  }
+}
+
+================================================================================
+// FILE: src/Geometry/FaceTransformations.js
+================================================================================
+
+// File: src/geometry/FaceTransformations.js
+
+/**
+ * Applies a linear translation to a face.
+ * @param {Face} face - The face to transform.
+ * @param {Object} delta - The translation vector { dx, dy }.
+ */
+export function translateFace(face, { dx, dy }) {
+    face.vertices.forEach(vertex => {
+      vertex.position.x += dx;
+      vertex.position.y += dy;
+    });
+    return face;
+  }
+  
+  /**
+   * Applies a rotation to a face around a given center.
+   * @param {Face} face - The face to rotate.
+   * @param {number} angle - The angle in radians.
+   * @param {Object} center - The center of rotation { x, y }.
+   */
+  export function rotateFace(face, angle, center) {
+    face.vertices.forEach(vertex => {
+      const { x, y } = vertex.position;
+      const translatedX = x - center.x;
+      const translatedY = y - center.y;
+      const rotatedX = translatedX * Math.cos(angle) - translatedY * Math.sin(angle);
+      const rotatedY = translatedX * Math.sin(angle) + translatedY * Math.cos(angle);
+      vertex.position.x = rotatedX + center.x;
+      vertex.position.y = rotatedY + center.y;
+    });
+    return face;
+  }
+  
+  /**
+   * Applies a non-linear "bending" transformation to a face.
+   * This is just a simplistic example where vertices are displaced based on a sine function.
+   * @param {Face} face - The face to transform.
+   * @param {number} intensity - The bending intensity.
+   */
+  export function bendFace(face, intensity) {
+    face.vertices.forEach(vertex => {
+      // Apply a simple sine-based vertical displacement for bending effect.
+      vertex.position.y += Math.sin(vertex.position.x) * intensity;
+    });
+    return face;
+  }
+  
+  // Additional transformations such as twisting, tapering, etc., could be added here.
+  
+================================================================================
+// FILE: src/Geometry/Vertex.js
+================================================================================
+
+// File: src/geometry/Vertex.js
+
+let vertexCounter = 0;
+
+export class Vertex {
+    constructor({ position = { x: 0, y: 0 }, color = { h: 0, s: 1, l: 0.5, a: 1 } } = {}) {
+      this.id = ++vertexCounter;        
+      this.position = position; // Metric component
+      this.color = color;       // Color component in HSLA or another color space
+    }
+  
+    // Apply a 2D transformation (for example)
+    transform(matrix) {
+      const { x, y } = this.position;
+      const newX = matrix.a * x + matrix.b * y + (matrix.tx || 0);
+      const newY = matrix.c * x + matrix.d * y + (matrix.ty || 0);
+      this.position = { x: newX, y: newY };
+    }
+  }
+  
+================================================================================
+// FILE: src/index.js
+================================================================================
+
+// File: src/index.js
+// Responsibilities: GUI setup, parameter binding, event wiring.
+// All scene/render logic lives in SceneManager.
+
+import { SceneManager } from "./rendering/SceneManager.js";
+import { stateStore } from "./state/stateStore.js";
+import { logger } from "./utils/logger.js";
+import * as dat from "dat.gui";
+
+import { initializeSaveFeature, loadScene, autoSaveAndGarbageCollect } from "./persistence.js";
+
+
+// -----------------------------------------------------------------------------
+// 1. SceneManager — owns scene, camera, renderer, primitives, animation loop
+// -----------------------------------------------------------------------------
+const sceneManager = new SceneManager(document.getElementById("viewport"));
+
+
+// -----------------------------------------------------------------------------
+// 2. Schur / render parameters (GUI-bound, read by sceneManager.compose())
+// -----------------------------------------------------------------------------
+const schurParams = {
+  baseIds:    [],
+  operations: ['union'],
+  weight:     8,
+  rotation:   0,
+  scale:      1,
+  posX:       0,
+  posY:       0,
+  isoOffset:  0.15
+};
+
+const renderParams = {
+  method: "contours (2D)"
+};
+
+
+// -----------------------------------------------------------------------------
+// 3. DOM: base-shape multi-select + Compose button
+// -----------------------------------------------------------------------------
+const baseSelect = document.getElementById('base-shapes');
+const composeBtn = document.getElementById('compose-btn');
+
+if (!baseSelect || !composeBtn) {
+  console.error("Missing #base-shapes or #compose-btn in HTML");
+}
+
+function refreshBaseShapeOptions() {
+  baseSelect.innerHTML = '';
+  stateStore.getShapes().forEach(shape => {
+    const opt = document.createElement('option');
+    opt.value       = shape.id;
+    opt.textContent = `#${shape.id} (${shape.constructor.name})`;
+    baseSelect.appendChild(opt);
+  });
+}
+
+// Initial population and keep in sync with state changes
+refreshBaseShapeOptions();
+stateStore.onVisualUpdate(refreshBaseShapeOptions);
+
+baseSelect.addEventListener('change', () => {
+  schurParams.baseIds = Array.from(baseSelect.selectedOptions)
+                             .map(opt => Number(opt.value));
+});
+
+composeBtn.addEventListener('click', () => {
+  if (schurParams.baseIds.length < 2) {
+    alert("Select at least two base shapes.");
+    return;
+  }
+  sceneManager.compose(schurParams, renderParams);
+  refreshBaseShapeOptions();
+});
+
+
+// -----------------------------------------------------------------------------
+// 4. Visual update callback — refresh line geometry when stateStore changes
+// -----------------------------------------------------------------------------
+stateStore.onVisualUpdate((shapeId) => {
+  const match = sceneManager.getActivePrimitives()
+    .find(p => p.instance.id === shapeId && p.type === "line");
+  if (match) sceneManager.updateLineGeometry();
+});
+
+
+// -----------------------------------------------------------------------------
+// 5. Initialize mapping config
+// -----------------------------------------------------------------------------
+stateStore.updateMappingConfig({
+  mappingType:    "polynomial",
+  polyCoeffs:     [0, 1, 0.5],
+  a: 1, b: 1, c: 0, e: 0,
+  blendFactor:    0.5,
+  frequency:      1.0,
+  recursionLimit: 3
+});
+
+
+// -----------------------------------------------------------------------------
+// 6. Seed the scene with a default line primitive
+// -----------------------------------------------------------------------------
+sceneManager.addPrimitive("line");
+refreshBaseShapeOptions();
+
+
+// -----------------------------------------------------------------------------
+// 7. dat.GUI
+// -----------------------------------------------------------------------------
+const gui = new dat.GUI();
+gui.domElement.style.position = "absolute";
+gui.domElement.style.left     = "0px";
+gui.domElement.style.top      = "10px";
+
+
+// ── Primitive management ─────────────────────────────────────────────────────
+const primitiveSelection = { primitive: "Line" };
+gui.add(primitiveSelection, "primitive", ["Line", "Triangle", "Arc"])
+  .name("Add Primitive")
+  .onChange(value => {
+    sceneManager.addPrimitive(value.toLowerCase());
+    refreshBaseShapeOptions();
+  });
+
+gui.add({ removeLast: () => {
+  sceneManager.removeLast();
+  refreshBaseShapeOptions();
+}}, 'removeLast').name('Remove Last Primitive');
+
+gui.add({ clearAll: () => {
+  sceneManager.clearAll();
+  refreshBaseShapeOptions();
+}}, 'clearAll').name('Clear All Primitives');
+
+
+// ── Lighting ─────────────────────────────────────────────────────────────────
+const lightingFolder = gui.addFolder("Lighting");
+lightingFolder.add(sceneManager.lightingManager.ambientLight,     "intensity", 0, 2).name("Ambient");
+lightingFolder.add(sceneManager.lightingManager.directionalLight, "intensity", 0, 2).name("Directional");
+
+
+// ── Distance Mapping ─────────────────────────────────────────────────────────
+const mapperFolder  = gui.addFolder("Distance Mapping");
+const mappingParams = { a: 1, b: 1, c: 0, e: 0, polyCoeffs: "0,1,0.5" };
+
+// Helper: apply mapping change to all active line primitives
+function applyMappingToLines() {
+  sceneManager.getActivePrimitives()
+    .filter(p => p.type === "line")
+    .forEach(p => stateStore.applyGlobalMappingToShape(p.instance.id));
+}
+
+mapperFolder.add(stateStore, "selectedMappingType", [
+  "identity","polynomial","exponential","logarithmic",
+  "sinusoidal","power","composite","periodic",
+  "temporal","recursive","sequential","blended"
+]).name("Mapping Type").onChange(() => {
+  applyMappingToLines();
+  logger.info(`Mapper type updated to: ${stateStore.selectedMappingType}`);
+});
+
+mapperFolder.add(stateStore, "blendFactor", 0, 1).step(0.01).name("Blend Factor")
+  .onChange(() => { stateStore.updateMappingConfig({ blendFactor: stateStore.blendFactor }); applyMappingToLines(); });
+
+mapperFolder.add(stateStore, "timeFrequency", 0.1, 5).step(0.1).name("Time Frequency")
+  .onChange(() => { stateStore.updateMappingConfig({ frequency: stateStore.timeFrequency }); applyMappingToLines(); });
+
+mapperFolder.add(stateStore, "amplitude", 0, 2).step(0.1).name("Amplitude")
+  .onChange(() => { stateStore.updateMappingConfig({ amplitude: stateStore.amplitude }); applyMappingToLines(); });
+
+mapperFolder.add(stateStore, "recursionLimit", 1, 5).step(1).name("Recursion Depth")
+  .onChange(() => { stateStore.updateMappingConfig({ recursionLimit: stateStore.recursionLimit }); applyMappingToLines(); });
+
+mapperFolder.add(mappingParams, "polyCoeffs").name("Poly Coeffs (comma-sep)")
+  .onFinishChange(val => {
+    const coeffs = val.split(",").map(Number);
+    stateStore.updateMappingConfig({ polyCoeffs: coeffs });
+    applyMappingToLines();
+  });
+
+mapperFolder.add(mappingParams, "a", 0.1, 5).step(0.1).name("Scale Factor (a)")
+  .onChange(() => { stateStore.updateMappingConfig({ a: mappingParams.a }); applyMappingToLines(); });
+
+mapperFolder.add(mappingParams, "b", 0.1, 5).step(0.1).name("Rate Factor (b)")
+  .onChange(() => { stateStore.updateMappingConfig({ b: mappingParams.b }); applyMappingToLines(); });
+
+mapperFolder.add(mappingParams, "c", -2, 2).step(0.1).name("Offset (c)")
+  .onChange(() => { stateStore.updateMappingConfig({ c: mappingParams.c }); applyMappingToLines(); });
+
+mapperFolder.add(mappingParams, "e", -2, 2).step(0.1).name("Additional Offset (e)")
+  .onChange(() => { stateStore.updateMappingConfig({ e: mappingParams.e }); applyMappingToLines(); });
+
+mapperFolder.open();
+
+
+// ── Triangle Controls ─────────────────────────────────────────────────────────
+const triangleFolder = gui.addFolder("Triangle Controls");
+const triangleParams = { size: 1, rotation: 0, cornerRounding: 0, posX: -1, posY: 0 };
+
+function lastTriangle() { return sceneManager.getLastOfType("triangle"); }
+
+triangleFolder.add(triangleParams, "size", 0.1, 5).onChange(v => {
+  const t = lastTriangle(); if (t) { t.instance.updateParameters({ size: v }); stateStore.triggerVisualUpdate(t.instance.id); }
+});
+triangleFolder.add(triangleParams, "rotation", 0, Math.PI * 2).onChange(v => {
+  const t = lastTriangle(); if (t) { t.instance.updateParameters({ rotation: v }); stateStore.triggerVisualUpdate(t.instance.id); }
+});
+triangleFolder.add(triangleParams, "cornerRounding", 0, 2).onChange(v => {
+  const t = lastTriangle(); if (t) { t.instance.updateParameters({ cornerRounding: v }); stateStore.triggerVisualUpdate(t.instance.id); }
+});
+triangleFolder.add(triangleParams, "posX", -5, 5).onChange(v => {
+  const t = lastTriangle(); if (t) { t.instance.updateParameters({ position: { x: v, y: triangleParams.posY } }); stateStore.triggerVisualUpdate(t.instance.id); }
+});
+triangleFolder.add(triangleParams, "posY", -5, 5).onChange(v => {
+  const t = lastTriangle(); if (t) { t.instance.updateParameters({ position: { x: triangleParams.posX, y: v } }); stateStore.triggerVisualUpdate(t.instance.id); }
+});
+triangleFolder.open();
+
+
+// ── Arc Controls ──────────────────────────────────────────────────────────────
+const arcFolder = gui.addFolder("Arc Controls");
+const arcParams = { radius: 1.5, startAngle: 0, endAngle: Math.PI, segments: 8, thickness: 0, posX: 1, posY: 0 };
+
+function lastArc() { return sceneManager.getLastOfType("arc"); }
+
+arcFolder.add(arcParams, "radius", 0.1, 5).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ radius: v }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "startAngle", 0, Math.PI * 2).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ startAngle: v }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "endAngle", 0, Math.PI * 2).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ endAngle: v }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "segments", 3, 20).step(1).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ segments: v }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "thickness", 0, 2).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ thickness: v }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "posX", -5, 5).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ position: { x: v, y: arcParams.posY } }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.add(arcParams, "posY", -5, 5).onChange(v => {
+  const a = lastArc(); if (a) { a.instance.updateParameters({ position: { x: arcParams.posX, y: v } }); stateStore.triggerVisualUpdate(a.instance.id); }
+});
+arcFolder.open();
+
+
+// ── Schur Composition ─────────────────────────────────────────────────────────
+const schurFolder = gui.addFolder("Schur Composition");
+
+schurFolder.add(schurParams, "operations", ["union", "intersection", "difference"])
+  .name("Operation")
+  .onChange(val => { schurParams.operations = [val]; });
+
+schurFolder.add(schurParams, "weight",   0,         10     ).name("Smoothness");
+schurFolder.add(schurParams, "rotation", 0,         Math.PI * 2).name("Rotation");
+schurFolder.add(schurParams, "scale",    0.1,       5      ).name("Scale");
+schurFolder.add(schurParams, "posX",     -5,        5      ).name("Translate X");
+schurFolder.add(schurParams, "posY",     -5,        5      ).name("Translate Y");
+
+const renderMethods = ["contours (2D)", "fill (2D)", "arcs", "surface (3D)"];
+schurFolder.add(renderParams, "method", renderMethods)
+  .name("Render As")
+  .onChange(() => {
+    // Only re-render if a composition already exists
+    if (sceneManager.currentSchur) {
+      sceneManager.compose(schurParams, renderParams);
+      refreshBaseShapeOptions();
+    }
+  });
+
+schurFolder.open();
+
+
+// -----------------------------------------------------------------------------
+// 8. Persistence
+// -----------------------------------------------------------------------------
+initializeSaveFeature(gui);
+
+gui.add({
+  loadState: async () => {
+    const success = await loadScene({
+      clearVisuals:  () => sceneManager.clearVisuals(),
+      createVisual:  (shape) => sceneManager.createVisual(shape),
+      triggerRender: () => sceneManager.triggerRender()
+    });
+    alert(success ? "Scene loaded successfully!" : "Failed to load scene. See console for details.");
+  }
+}, 'loadState').name('Load Saved Scene');
+
+window.addEventListener('beforeunload', async () => {
+  await autoSaveAndGarbageCollect();
+});
+
+
+// -----------------------------------------------------------------------------
+// 9. Garbage collection
+// -----------------------------------------------------------------------------
+setInterval(() => stateStore.runGarbageCollection(), 5 * 60 * 1000);
+
+
+// -----------------------------------------------------------------------------
+// 10. Start animation loop
+// -----------------------------------------------------------------------------
+sceneManager.start();
+================================================================================
+// FILE: src/persistence.js
+================================================================================
+
+// persistence.js
+
+import Dexie from 'dexie';
+import { stateStore } from './state/stateStore.js';
+import { logger } from './utils/logger.js';
+import { ComplexShape2D } from './Geometry/ComplexShape2d.js';
+import { ComplexPrimitive2D } from './Primitives/ComplexPrimitive2d.js';
+import { TrianglePrimitive, ArcPrimitive } from './Primitives/primaryDerivativePrimitives.js';
+
+// =============================================================================
+// 1. SETUP: Initialize Dexie Database and Define Schema
+// =============================================================================
+
+// Create a new Dexie database instance.
+const db = new Dexie('MathShapeDB');
+
+// Define the database schema for version 1:
+// - 'shapes' table: stores each shape record with primary key 'id',
+//   and indexes on 'type' and 'createdAt' (to support ordering and querying).
+// - 'metadata' table: stores scene-level metadata as key-value pairs.
+db.version(1).stores({
+  shapes: 'id, type, createdAt',
+  metadata: 'key'
+});
+
+// =============================================================================
+// 2. TYPE DETECTION AND UTILITY FUNCTIONS
+// =============================================================================
+
+/**
+ * determineShapeType
+ * Robustly determines the type of shape, using multiple strategies.
+ * The order is:
+ * 1. Specific primitives: TrianglePrimitive and ArcPrimitive.
+ * 2. ComplexShape2D: if it is a line segment then 'line', otherwise 'complexShape'.
+ * 3. ComplexPrimitive2D.
+ * 4. Composite shapes (if blendParams exists).
+ * 5. Fallback to an explicit shape.type (if provided) or the constructor name.
+ */
+function determineShapeType(shape) {
+  let resolvedType = '';
+
+  // 1. Specific primitives
+  if (shape instanceof TrianglePrimitive) {
+    resolvedType = 'triangle';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Detected as TrianglePrimitive.`);
+  } else if (shape instanceof ArcPrimitive) {
+    resolvedType = 'arc';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Detected as ArcPrimitive.`);
+  }
+  // 2. ComplexShape2D handling
+  else if (shape instanceof ComplexShape2D) {
+    resolvedType = shape.isLineSegment ? 'line' : 'complexShape';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Detected as ComplexShape2D (${resolvedType}).`);
+  }
+  // 3. ComplexPrimitive2D handling
+  else if (shape instanceof ComplexPrimitive2D) {
+    resolvedType = 'complexPrimitive';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Detected as ComplexPrimitive2D.`);
+  }
+  // 4. Composite/tessellation shapes based on blendParams
+  else if (shape.blendParams && shape.blendParams.primitives && Array.isArray(shape.blendParams.primitives)) {
+    resolvedType = 'composite';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Detected as composite (via blendParams).`);
+  }
+  // 5. Fallback: if an explicit type property exists, then use it
+  else if (shape.type && typeof shape.type === 'string') {
+    resolvedType = shape.type;
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Falling back to explicit shape.type: ${resolvedType}.`);
+  }
+  // 6. Check constructor name as a last resort
+  else if (shape.constructor && shape.constructor.name) {
+    resolvedType = shape.constructor.name.toLowerCase();
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Falling back to constructor name: ${resolvedType}.`);
+  }
+  // 7. Last resort generic type
+  else {
+    resolvedType = 'generic';
+    logger.debug(`Shape ID ${shape.id || 'unknown'}: Unable to determine type. Defaulting to generic.`);
+  }
+
+  logger.debug(`Final determined type for shape ID ${shape.id || 'unknown'}: ${resolvedType}`);
+  return resolvedType;
+}
+
+/**
+ * extractBasicParameters
+ * Extracts fundamental parameters from any shape for fallback serialization.
+ */
+function extractBasicParameters(shape) {
+  const params = {};
+
+  // Extract universal properties
+  if (shape.position !== undefined) {
+    params.position = {
+      x: shape.position.x || 0,
+      y: shape.position.y || 0
+    };
+  }
+
+  if (shape.size !== undefined) params.size = shape.size;
+  if (shape.rotation !== undefined) params.rotation = shape.rotation;
+
+  if (shape.color !== undefined) {
+    params.color = { ...shape.color };
+  }
+
+  // Add constructor name for better deserialization
+  params._shapeClass = shape.constructor ? shape.constructor.name : null;
+
+  // Extract common shape-specific properties
+  if (shape.type === 'triangle' || shape instanceof TrianglePrimitive) {
+    if (shape.cornerRounding !== undefined) params.cornerRounding = shape.cornerRounding;
+    if (shape.edgeSmoothness !== undefined) params.edgeSmoothness = [...shape.edgeSmoothness];
+  } else if (shape.type === 'arc' || shape instanceof ArcPrimitive) {
+    if (shape.radius !== undefined) params.radius = shape.radius;
+    if (shape.startAngle !== undefined) params.startAngle = shape.startAngle;
+    if (shape.endAngle !== undefined) params.endAngle = shape.endAngle;
+    if (shape.segments !== undefined) params.segments = shape.segments;
+    if (shape.thickness !== undefined) params.thickness = shape.thickness;
+  }
+
+  return params;
+}
+
+// =============================================================================
+// 3. CAPTURE & FILTER FUNCTIONS
+// =============================================================================
+
+/**
+ * captureVisualState
+ * Iterates over all shapes in stateStore.sessionShapes and marks those
+ * that are currently rendered as persistent.
+ */
+export function captureVisualState() {
+  let flaggedCount = 0;
+  try {
+    stateStore.sessionShapes.forEach(shape => {
+      try {
+    // Skip the default shape with ID of 1
+    if (shape.rendered === true && shape.id !== 1) {
+      shape.persistent = true;
+      flaggedCount++;
+    }
+      } catch (error) {
+        logger.error(`Error flagging shape ${shape.id}: ${error.message}`);
+      }
+    });
+    logger.info(`Successfully flagged ${flaggedCount} shapes as persistent`);
+    return flaggedCount > 0;
+  } catch (error) {
+    logger.error(`Failed to capture visual state: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * getOrderedPersistentShapes
+ * Filters the shapes marked as persistent and returns an array ordered by creation time.
+ */
+export function getOrderedPersistentShapes() {
+  try {
+    const persistentShapes = Array.from(stateStore.sessionShapes)
+      .filter(shape => shape.persistent === true);
+    const orderedShapes = persistentShapes.sort((a, b) => a.createdAt - b.createdAt);
+    logger.info(`Retrieved ${orderedShapes.length} persistent shapes, ordered by creation time`);
+    return orderedShapes;
+  } catch (error) {
+    logger.error(`Failed to get ordered persistent shapes: ${error.message}`);
+    return [];
+  }
+}
+
+// =============================================================================
+// 4. SERIALIZATION FUNCTION
+// =============================================================================
+
+/**
+ * serializeShapesForStorage
+ * Creates a serializable representation of the persistent shapes along with scene metadata.
+ * It first checks if the shape's constructor has a static getSerializableParameters method.
+ * Otherwise, it falls back in this order:
+ * 1. If the shape is an instance of ComplexShape2D, extract its vertices, metric, and blend parameters.
+ * 2. Else if the shape is an instance of ComplexPrimitive2D, extract its metric and color.
+ * 3. Else, fall back to generic extraction (e.g., size, position, rotation, and color).
+ */
+export function serializeShapesForStorage() {
+  try {
+    const orderedShapes = getOrderedPersistentShapes();
+
+    if (orderedShapes.length === 0) {
+      logger.warn("No persistent shapes found to serialize");
+      return null;
+    }
+
+    logger.info(`Starting serialization for ${orderedShapes.length} shapes`);
+
+    const serializableShapes = orderedShapes.map(shape => {
+      try {
+        let parameters = {};
+        const shapeId = shape.id || 'unknown-id';
+        const shapeType = determineShapeType(shape);
+        let dependencyRefs = null;
+        
+        // 1. Gather SchurComposition dependencies if applicable
+        if (shapeType === 'schur-composition') {
+          dependencyRefs = Array.from(stateStore.dependencyMap.get(shapeId) || []);
+        }        
+
+        if (!shapeType || shapeType === 'generic') {
+          logger.warn(`Shape with ID ${shapeId} has no defined type. Using ${shapeType}`);
+        }
+
+        // 1. Use static getSerializableParameters if defined on the constructor
+        if (shape.constructor && typeof shape.constructor.getSerializableParameters === 'function') {
+          try {
+            logger.debug(`Using static getSerializableParameters from ${shape.constructor.name} for shape ${shapeId} of type ${shapeType}`);
+            parameters = shape.constructor.getSerializableParameters(shape);
+          } catch (serializeError) {
+            logger.warn(`Error in static serialization for ${shapeId}: ${serializeError.message}`);
+            parameters = extractBasicParameters(shape);
+          }
+        }
+        // 2. Fallback for ComplexShape2D if static method is not defined
+        else if (shape instanceof ComplexShape2D && shape.vertices) {
+          logger.info(`Serializing ComplexShape2D with ID ${shapeId}`);
+          parameters.vertices = shape.vertices.map(v => ({
+            position: { x: v.position.x, y: v.position.y },
+            color: v.color
+          }));
+          if (shape.metric !== undefined) {
+            parameters.metric = { ...shape.metric };
+          }
+          if (shape.blendParams !== undefined) {
+            parameters.blendParams = { ...shape.blendParams };
+            // Store references to blended primitives
+            if (shape.blendParams.primitives && Array.isArray(shape.blendParams.primitives)) {
+              parameters.blendParams.primitiveRefs = shape.blendParams.primitives.map(p => p.id);
+            }
+          }
+        }
+        // 3. Fallback for ComplexPrimitive2D
+        else if (shape instanceof ComplexPrimitive2D) {
+          logger.info(`Serializing ComplexPrimitive2D with ID ${shapeId}`);
+          parameters.metric = { ...shape.metric };
+          parameters.color = { ...shape.color };
+          if (shape.distanceMapper && shape.distanceMapper.name) {
+            parameters.distanceMapper = shape.distanceMapper.name;
+          }
+        }
+        // 4. Generic fallback
+        else {
+          logger.warn(`Using generic fallback serialization for shape ${shapeId} of type ${shapeType}`);
+          parameters = extractBasicParameters(shape);
+        }
+
+        // Always include the constructor name for better type restoration
+        parameters._shapeClass = shape.constructor ? shape.constructor.name : null;
+
+        logger.debug(`Shape ${shapeId} of type ${shapeType} serialized with parameters: ${JSON.stringify(parameters)}`);
+
+        return {
+          id: shapeId,
+          type: shapeType,
+          createdAt: shape.createdAt,
+          data: parameters,
+          distanceMapperName:
+            shape.distanceMapperName ||
+            (shape.distanceMapper && shape.distanceMapper.name) ||
+            'identity',
+          // existing blend refs
+          primitiveRefs: parameters.blendParams?.primitiveRefs || [],
+          // new Schur dependency refs
+          dependencyRefs:  dependencyRefs                      
+        };
+      } catch (shapeError) {
+        logger.error(`Error serializing shape ${shape.id}: ${shapeError.message}`, shapeError);
+        return null;
+      }
+    }).filter(shape => shape !== null);
+
+    const sceneMetadata = {
+      version: '1.0',
+      timestamp: Date.now(),
+      mappingConfig: {
+        selectedMappingType: stateStore.selectedMappingType,
+        blendFactor: stateStore.blendFactor,
+        timeFrequency: stateStore.timeFrequency,
+        recursionLimit: stateStore.recursionLimit,
+        amplitude: stateStore.amplitude,
+        polyCoeffs: stateStore.mappingParams ? stateStore.mappingParams.polyCoeffs : [0, 1, 0],
+        a: stateStore.mappingParams ? stateStore.mappingParams.a : 1,
+        b: stateStore.mappingParams ? stateStore.mappingParams.b : 1,
+        c: stateStore.mappingParams ? stateStore.mappingParams.c : 0,
+        e: stateStore.mappingParams ? stateStore.mappingParams.e : 0
+      }
+    };
+
+    logger.info(`Successfully serialized ${serializableShapes.length} shapes`);
+    return { shapes: serializableShapes, metadata: sceneMetadata };
+  } catch (error) {
+    logger.error(`Failed to serialize shapes: ${error.message}`, error);
+    return null;
+  }
+}
+
+// =============================================================================
+// 5. SAVE AND LOAD FUNCTIONS USING DEXIE
+// =============================================================================
+
+/**
+ * saveScene
+ * This function captures the current visual state, serializes the data,
+ * and then saves it to IndexedDB via Dexie.
+ */
+export async function saveScene(sceneName = 'default') {
+  try {
+    const captured = captureVisualState();
+    if (!captured) {
+      logger.warn("No shapes were flagged as persistent during capture");
+      return false;
+    }
+
+    const serializedData = serializeShapesForStorage();
+    if (!serializedData) {
+      logger.error("Failed to serialize visual state");
+      return false;
+    }
+
+    // Clear existing scene data from the Dexie tables.
+    await db.shapes.clear();
+    await db.metadata.clear();
+
+    // Save each shape record into the 'shapes' table.
+    await db.shapes.bulkPut(serializedData.shapes);
+
+    // Add scene-level metadata into the 'metadata' table, using a fixed key (e.g., 'scene').
+    await db.metadata.put({ key: 'scene', value: { sceneName, ...serializedData.metadata } });
+
+    // Reset persistence flags after saving.
+    resetPersistenceFlags();
+
+    logger.info(`Visual state saved successfully as scene '${sceneName}'`);
+    return true;
+  } catch (error) {
+    logger.error(`Failed to save visual state: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * loadScene
+ * Loads the saved scene from IndexedDB via Dexie, reconstructs the shapes, 
+ * and restores scene metadata.
+ */
+// Enhanced loadScene function with proper visual rendering support
+export async function loadScene({ clearVisuals, createVisual, triggerRender }) {
+  try {
+    // 1️⃣ Clear in-memory shapes
+    stateStore.clear();
+
+    // 2️⃣ Clear all Three.js visuals
+    clearVisuals();
+
+    // 3️⃣ Fetch saved shapes and metadata
+    const savedShapes = await db.shapes.toArray();
+    const metaRecord  = await db.metadata.get('scene');
+
+    if (!savedShapes || savedShapes.length === 0) {
+      logger.warn("No scene data found in IndexedDB");
+      return false;
+    }
+
+    // 4️⃣ First pass: deserialize into stateStore and create visuals
+    const shapesMap = new Map();
+    for (const record of savedShapes) {
+      const shape = stateStore.createShapeFromSerialized(record.type, record.data);
+      shape.id        = record.id;
+      shape.createdAt = record.createdAt;
+            
+      if (!shape) {
+        logger.warn(`Failed to deserialize shape record ${record.id}`);
+        continue;
+      }
+
+      // restore identifiers and timestamp
+      shape.id        = record.id;
+      shape.createdAt = record.createdAt;
+
+      // restore any custom mapper name (optional)
+      if (record.distanceMapperName) {
+        shape.distanceMapperName = record.distanceMapperName;
+      }
+
+      // add to session
+      stateStore.addShape(shape);
+      shapesMap.set(record.id, shape);
+
+      // delegate actual mesh/line creation and scene.add
+      createVisual(shape);
+
+      logger.debug(`Loaded and visualized shape ${shape.id} of type ${record.type}`);
+    }
+
+    // 5️⃣ Second pass: reconnect composite primitives by ID
+    for (const record of savedShapes) {
+      const refIds = record.data?.blendParams?.primitiveRefs;
+      if (!refIds || !Array.isArray(refIds)) continue;
+
+      const composite = shapesMap.get(record.id);
+      if (composite && typeof composite.addBlendPrimitive === 'function') {
+        for (const pid of refIds) {
+          const prim = shapesMap.get(pid);
+          if (prim) {
+            composite.addBlendPrimitive(prim);
+            logger.debug(`Reconnected primitive ${pid} to composite ${record.id}`);
+          } else {
+            logger.warn(`Primitive ${pid} not found for composite ${record.id}`);
+          }
+        }
+        // update SDF and visuals
+        if (typeof composite.updateCompositeSDF === 'function') {
+          composite.updateCompositeSDF();
+          createVisual(composite);
+        }
+      }
+  // 5.b: restore SchurComposition dependency graph
+  if (record.type === 'schur-composition' && Array.isArray(record.dependencyRefs)) {
+    // stateStore.dependencyMap is a Map<schurId, Set<childIds>>
+    stateStore._updateDependencies(record.id, record.dependencyRefs);
+    logger.debug(
+      `Reconnected SchurComposition deps for ${record.id}: [${record.dependencyRefs.join(', ')}]`
+    );
+  }
+
+    }
+
+    // 6️⃣ Restore global mapping configuration
+    if (metaRecord?.value?.mappingConfig) {
+      stateStore.updateMappingConfig(metaRecord.value.mappingConfig);
+      logger.debug("Restored mapping configuration from metadata");
+    }
+
+    // 7️⃣ Final render
+    triggerRender();
+    logger.info(`Scene '${metaRecord?.value?.sceneName || 'default'}' loaded successfully`);
+    return true;
+
+  } catch (error) {
+    logger.error(`Failed to load scene: ${error.message}`, error);
+    return false;
+  }
+}
+
+// =============================================================================
+// 6. END-OF-SESSION PERSISTENCE & GARBAGE COLLECTION
+// =============================================================================
+
+/**
+ * autoSaveAndGarbageCollect
+ * Designed for end-of-session persistence, this function automatically saves the current scene
+ * and then performs garbage collection on stateStore to remove stale or unrendered shapes.
+ * It returns true if both operations succeed.
+ */
+export async function autoSaveAndGarbageCollect() {
+  try {
+    // Auto-save the current scene.
+    const saved = await saveScene('autosave');
+    if (!saved) {
+      logger.error("Auto-save failed.");
+      return false;
+    }
+    logger.info("Auto-save completed successfully.");
+
+    // Perform garbage collection using stateStore's method (assumed to exist).
+    if (typeof stateStore.runGarbageCollection === 'function') {
+      stateStore.runGarbageCollection();
+      logger.info("Garbage collection executed successfully.");
+    } else {
+      logger.warn("stateStore.runGarbageCollection is not implemented.");
+    }
+    return true;
+  } catch (error) {
+    logger.error(`Failed in autoSaveAndGarbageCollect: ${error.message}`);
+    return false;
+  }
+}
+
+// =============================================================================
+// 7. RESET PERSISTENCE FLAGS FUNCTION
+// =============================================================================
+
+/**
+ * resetPersistenceFlags
+ * Clears the 'persistent' flag on all shapes after saving.
+ */
+export function resetPersistenceFlags() {
+  try {
+    let count = 0;
+    stateStore.sessionShapes.forEach(shape => {
+      if (shape.persistent === true) {
+        shape.persistent = false;
+        count++;
+      }
+    });
+    logger.info(`Reset persistence flags for ${count} shapes`);
+    return true;
+  } catch (error) {
+    logger.error(`Failed to reset persistence flags: ${error.message}`);
+    return false;
+  }
+}
+
+// =============================================================================
+// 8. UI INTEGRATION: DAT.GUI AND STANDALONE BUTTON
+// =============================================================================
+
+/**
+ * addSaveButtonToGUI
+ * Adds a 'Save Current State' button to the dat.GUI interface.
+ */
+export function addSaveButtonToGUI(gui) {
+  const saveFolder = gui.addFolder('Save/Restore');
+  const saveController = {
+    saveState: async function() {
+      const success = await saveScene();
+      if (success) {
+        alert("Visual state saved successfully!");
+      } else {
+        alert("Failed to save visual state. Check console for details.");
+      }
+    }
+  };
+  saveFolder.add(saveController, 'saveState').name('Save Current State');
+  saveFolder.open();
+}
+
+/**
+ * setupSaveButton
+ * Sets up an event listener for a standalone HTML button (if it exists) with id 'saveButton'.
+ */
+export function setupSaveButton() {
+  const saveButton = document.getElementById('saveButton');
+  if (saveButton) {
+    saveButton.addEventListener('click', async () => {
+      const success = await saveScene();
+      if (success) {
+        alert("Visual state saved successfully!");
+      } else {
+        alert("Failed to save visual state. Check console for details.");
+      }
+    });
+    logger.info("Save button event listener set up");
+  }
+}
+
+/**
+ * initializeSaveFeature
+ * Initializes the save feature by wiring up both the dat.GUI button and the standalone HTML button.
+ * This function should be called from index.js after the GUI is initialized.
+ */
+export function initializeSaveFeature(gui) {
+  if (gui) {
+    addSaveButtonToGUI(gui);
+  }
+  setupSaveButton();
+  logger.info("Save feature initialized");
+}
+
+export function addLoadButtonToGUI(gui, { clearVisuals, createVisual, triggerRender }) {
+  const folder = gui.addFolder('Load');
+  folder.add({
+    loadState: async () => {
+      const ok = await loadScene({ clearVisuals, createVisual, triggerRender });
+      alert(ok ? "Loaded!" : "Load failed; see console.");
+    }
+  }, 'loadState').name('Load Saved Scene');
+  folder.open();
+}
+
+
+================================================================================
+// FILE: src/Primitives/ComplexPrimitive2d.js
+================================================================================
+
+// File: src/primitives/ComplexPrimitive2D.js (Updated)
+
+import { identityMapping, distanceMappingRegistry } from "../utils/DistanceMapping.js";
+
+/**
+ * Base class for 2D primitives defined on the complex plane.
+ * Each primitive has:
+ *  - A "metric" (real) component: describes spatial properties.
+ *  - A "color" (imaginary) component: represented in HSLA.
+ * The effective metric distance is computed by applying a configurable mapping
+ * function to the raw Euclidean distance.
+ */
+export class ComplexPrimitive2D {
+  constructor(params = {}) {
+    // Real (metric) properties.
+    this.metric = {
+      center: (params.metric && params.metric.center) || { x: 0, y: 0 },
+      scale: (params.metric && params.metric.scale) || 1,
+    };
+
+    // Imaginary (color) properties: HSLA.
+    this.color = params.color || { h: 0, s: 1, l: 0.5, a: 1 };
+
+    // Set the distance mapping function.
+    // Options:
+    // 1. Directly provide a function
+    // 2. Provide a registered mapper name and its parameters
+    // 3. Provide a configuration for a polynomial mapping
+    if (params.distanceMapper && typeof params.distanceMapper === 'function') {
+      this.distanceMapper = params.distanceMapper;
+    } else if (params.distanceMapper && typeof params.distanceMapper === 'string') {
+      // Use a registered mapper
+      const mapperName = params.distanceMapper;
+      const mapperParams = params.distanceMapperParams || {};
+      
+      if (distanceMappingRegistry[mapperName]) {
+        // Check if this is a factory function or direct mapper
+        if (typeof distanceMappingRegistry[mapperName] === 'function' && 
+            distanceMappingRegistry[mapperName].length > 0) {
+          // It's a factory function, call it with params
+          this.distanceMapper = distanceMappingRegistry[mapperName](
+            mapperParams.a, mapperParams.b, mapperParams.c, mapperParams.e
+          );
+        } else {
+          // It's a direct mapper function
+          this.distanceMapper = distanceMappingRegistry[mapperName];
+        }
+      } else {
+        console.warn(`Mapper "${mapperName}" not found, using identity mapping`);
+        this.distanceMapper = identityMapping;
+      }
+    } else if (params.metric && params.metric.polyCoeffs) {
+      this.distanceMapper = distanceMappingRegistry.polynomial(params.metric.polyCoeffs);
+    } else {
+      this.distanceMapper = identityMapping;
+    }
+  }
+
+  /**
+   * Computes the raw Euclidean distance from a point to the primitive's center.
+   * @param {Object} point - { x, y } coordinate.
+   * @returns {number}
+   */
+  getRawDistance(point) {
+    const dx = point.x - this.metric.center.x;
+    const dy = point.y - this.metric.center.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  /**
+   * Computes the effective metric distance by applying the distance mapping.
+   * @param {Object} point - { x, y } coordinate.
+   * @returns {number} Effective (mapped) distance.
+   */
+  getMetricDistance(point) {
+    const rawDistance = this.getRawDistance(point);
+    return this.distanceMapper(rawDistance);
+  }
+
+  /**
+   * Computes the signed distance from a given point to the boundary of the primitive.
+   * Subclasses should implement this, typically using getMetricDistance.
+   * @param {Object} point - { x, y } coordinate.
+   * @returns {number}
+   */
+  computeSDF(point) {
+    throw new Error("computeSDF() must be implemented in the subclass");
+  }
+
+  /**
+   * Maps the SDF value to an HSLA color.
+   * Modulates lightness and alpha based on the SDF value.
+   * @param {number} sdfValue - The SDF value at a point.
+   * @returns {Object} Color in HSLA format.
+   */
+  getColor(sdfValue) {
+    const intensity = Math.exp(-Math.abs(sdfValue));
+    return {
+      h: this.color.h,
+      s: this.color.s,
+      l: this.color.l * intensity,
+      a: this.color.a * intensity,
+    };
+  }
+
+  /**
+   * Applies a 2D affine transformation to the metric (real) component.
+   * @param {Object} matrix - { a, b, c, d, tx, ty }.
+   */
+  transform(matrix) {
+    const { x, y } = this.metric.center;
+    const newX = matrix.a * x + matrix.b * y + (matrix.tx || 0);
+    const newY = matrix.c * x + matrix.d * y + (matrix.ty || 0);
+    this.metric.center = { x: newX, y: newY };
+
+    // Adjust the scale if the matrix includes uniform scaling.
+    this.metric.scale *= Math.sqrt((matrix.a ** 2 + matrix.d ** 2) / 2);
+  }
+
+  /**
+   * Static method for serializing a ComplexPrimitive2D instance.
+   * Extracts properties necessary for later deserialization.
+   * @param {ComplexPrimitive2D} instance - The instance to serialize.
+   * @returns {Object} An object containing serializable properties.
+   */
+  static getSerializableParameters(instance) {
+    const params = {};
+
+    // Extract metric properties
+    if (instance.metric) {
+      params.metric = { ...instance.metric };
+    }
+    
+    // Extract color properties
+    if (instance.color) {
+      params.color = { ...instance.color };
+    }
+    
+    // Extract distance mapper name if available (assumes mapper has a "name" property)
+    if (instance.distanceMapper && instance.distanceMapper.name) {
+      params.distanceMapperName = instance.distanceMapper.name;
+    } else {
+      params.distanceMapperName = "identity";
+    }
+    
+    // Include any additional properties that are common to all ComplexPrimitive2D instances
+    // For instance, if you have other fields you wish to serialize, add them here.
+    
+    // Include the constructor name for debugging or deserialization purposes.
+    params._shapeClass = instance.constructor ? instance.constructor.name : null;
+    
+    return params;
+  }
+}
+
+================================================================================
+// FILE: src/Primitives/primaryDerivativePrimitives.js
+================================================================================
+
+// File: src/primitives/primaryDerivativePrimitives.js
+import { ComplexShape2D, nextId } from "../Geometry/ComplexShape2d.js";
+import { Vertex } from "../Geometry/Vertex.js";
+import { Edge } from "../Geometry/Edge.js";
+import { 
+  weightedRUnion, 
+  weightedRIntersection, 
+  weightedRDifference 
+} from "../utils/SDFBlending.js";
+import { 
+  createTemporalMapping, 
+  createSinusoidalMapping,
+  createMapping,
+  identityMapping
+} from "../utils/DistanceMapping.js";
+import { logger } from "../utils/logger.js";
+import * as THREE from "three";
+
+/**
+ * Base class for derived primitives that compose multiple ComplexShape2D instances
+ */
+export class DerivativePrimitive {
+  constructor(params = {}) {
+    this.id = params.id !== undefined ? params.id : nextId();
+    this.type = 'derivative';
+    this.shapes = [];
+    this.color = params.color || { h: 210, s: 0.8, l: 0.6 };
+    this.blendSmoothness = params.blendSmoothness || 8;
+    this.compositeSDF = null;
+
+    // Store reference to stateStore if provided
+    this.stateStore = params.stateStore || null;
+
+    logger.info(`Created DerivativePrimitive with id: ${this.id}`);
+  }
+
+  /**
+   * Calculate SDF value at a given point
+   * @param {Object} point - Point to evaluate (x, y)
+   * @param {Array} callStack - For preventing infinite recursion
+   * @param {number} time - Current time for animations
+   * @param {number} depth - Recursion depth
+   * @returns {number} The SDF value at the given point
+   */
+  computeSDF(point, callStack = [], time = 0, depth = 0) {
+    if (this.shapes.length === 0) {
+      return Infinity;
+    }
+
+    // If only one shape, use its SDF directly
+    if (this.shapes.length === 1) {
+      return this.shapes[0].computeSDF(point, callStack, time, depth);
+    }
+
+    // Otherwise blend all shapes' SDFs
+    let result = this.shapes[0].computeSDF(point, callStack, time, depth);
+    
+    for (let i = 1; i < this.shapes.length; i++) {
+      const shapeSdf = this.shapes[i].computeSDF(point, callStack, time, depth);
+      result = weightedRUnion(result, shapeSdf, this.blendSmoothness);
+    }
+
+    return result;
+  }
+
+  /**
+   * Create a THREE.js group representing this derivative primitive
+   * @param {number} time - Current time for animations
+   * @returns {THREE.Group} Group containing all shapes' THREE.js objects
+   */
+  createObject(time = 0) {
+    const group = new THREE.Group();
+    
+    for (const shape of this.shapes) {
+      const lineObject = shape.createLineObject(time);
+      group.add(lineObject);
+    }
+    
+    return group;
+  }
+
+  /**
+   * Apply a transformation matrix to all shapes
+   * @param {Object} matrix - Transformation matrix
+   * @returns {DerivativePrimitive} This instance for chaining
+   */
+  transform(matrix) {
+    for (const shape of this.shapes) {
+      shape.transform(matrix);
+    }
+    return this;
+  }
+
+  /**
+   * Set the blend smoothness for all shapes
+   * @param {number} smoothness - Blend smoothness value
+   * @returns {DerivativePrimitive} This instance for chaining
+   */
+  setBlendSmoothness(smoothness) {
+    this.blendSmoothness = smoothness;
+    for (const shape of this.shapes) {
+      shape.setBlendParams({ smoothness });
+    }
+    return this;
+  }
+
+  /**
+   * Set the color for all shapes
+   * @param {Object} color - Color object with h, s, l properties
+   * @returns {DerivativePrimitive} This instance for chaining
+   */
+  setColor(color) {
+    this.color = color;
+    for (const shape of this.shapes) {
+      shape.color = color;
+      
+      // Update vertex colors if they exist
+      if (shape.vertices) {
+        for (const vertex of shape.vertices) {
+          vertex.color = color;
+        }
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Register this primitive with the state store
+   * @param {Object} stateStore - The state store to register with
+   * @returns {DerivativePrimitive} This instance for chaining
+   */
+  registerWithStateStore(stateStore) {
+    this.stateStore = stateStore;
+    if (stateStore && typeof stateStore.registerPrimitive === 'function') {
+      stateStore.registerPrimitive(this);
+    }
+    return this;
+  }
+
+  /**
+   * Static method for serializing a derived primitive.
+   * This method extracts common properties and then adds type-specific properties.
+   * @param {DerivativePrimitive} instance - The instance to serialize.
+   * @returns {Object} An object representing the serializable properties.
+   */
+  static getSerializableParameters(instance) {
+    // Common properties for all derived primitives
+    const common = {
+      id: instance.id,
+      type: instance.type,
+      color: instance.color,
+      blendSmoothness: instance.blendSmoothness,
+      // You might include additional common properties here if needed.
+    };
+
+    // Check instance type and extract type-specific properties.
+    if (instance instanceof TrianglePrimitive) {
+      return {
+        ...common,
+        size: instance.size,
+        rotation: instance.rotation,
+        position: instance.position,
+        cornerRounding: instance.cornerRounding,
+        edgeSmoothness: instance.edgeSmoothness
+        // You can also include any additional triangle-specific parameters.
+      };
+    } else if (instance instanceof ArcPrimitive) {
+      return {
+        ...common,
+        radius: instance.radius,
+        startAngle: instance.startAngle,
+        endAngle: instance.endAngle,
+        segments: instance.segments,
+        position: instance.position,
+        thickness: instance.thickness
+        // Additional arc-specific parameters can be added here.
+      };
+    } else {
+      // Fallback: return common properties only.
+      return common;
+    }
+  }
+}
+
+/**
+ * Triangle primitive composed of three line segments
+ * 
+ * This implementation is driven by parameters: if vertices are provided, they are used directly.
+ * Otherwise, an equilateral triangle is computed using a single 'size' parameter.
+ * The GUI can modulate edge length (via size), rotation, and corner rounding.
+ */
+export class TrianglePrimitive extends DerivativePrimitive {
+  constructor(params = {}) {
+    super(params);
+    this.type = 'triangle';
+    
+    // Triangle parameters with defaults
+    this.size = params.size || 1; // Defines the edge length for an equilateral triangle
+    this.rotation = params.rotation || 0;
+    this.position = params.position || { x: 0, y: 0 };
+    this.cornerRounding = params.cornerRounding || 0;
+    // Optionally, user can provide custom vertices:
+    this.verticesInput = params.vertices || null;
+    // Edge-specific smoothness can be modulated via an array [s1, s2, s3]
+    this.edgeSmoothness = params.edgeSmoothness || [0, 0, 0];
+    
+    // Initialize the triangle shapes
+    this._initializeTriangle();
+    
+    logger.info(`Created TrianglePrimitive with id: ${this.id}`);
+    // ── store original params for cloning ─────────────────────
+    this._params = { ...params };    
+  }
+
+  /**
+   * Initialize the triangle shapes based on provided parameters
+   * @private
+   */
+  _initializeTriangle() {
+    // Clear existing shapes
+    this.shapes = [];
+    
+    // Calculate vertices
+    let vertices;
+    if (this.verticesInput && Array.isArray(this.verticesInput) && this.verticesInput.length === 3) {
+      vertices = this.verticesInput;
+    } else {
+      // Compute an equilateral triangle's vertices based on the size parameter
+      vertices = this._createEquilateralVertices();
+    }
+    
+    // Apply position and rotation to vertices
+    vertices = this._transformVertices(vertices);
+    
+    // Create the three edges of the triangle
+    for (let i = 0; i < 3; i++) {
+      const vertexA = new Vertex({ 
+        position: vertices[i], 
+        color: this.color 
+      });
+      
+      const vertexB = new Vertex({ 
+        position: vertices[(i + 1) % 3], 
+        color: this.color 
+      });
+      
+      // Create a distance mapper for the edge if smoothness is applied
+      let distanceMapper = identityMapping;
+      if (this.edgeSmoothness[i] > 0) {
+        distanceMapper = createMapping('sinusoidal', {
+          a: this.edgeSmoothness[i] * 0.1,
+          b: 1,
+          c: 0,
+          e: 0
+        });
+      }
+      
+      // Create the edge shape using ComplexShape2D
+      const edge = new ComplexShape2D({
+        vertices: [vertexA, vertexB],
+        color: this.color,
+        distanceMapper: distanceMapper,
+        smoothness: this.blendSmoothness
+      });
+      
+      this.shapes.push(edge);
+    }
+    
+    // Apply corner rounding if specified
+    if (this.cornerRounding > 0) {
+      this._applyCornerRounding();
+    }
+    
+    // Blend all edges together
+    this._blendEdges();
+  }
+
+  /**
+   * Create vertices for an equilateral triangle centered at origin
+   * @private
+   * @returns {Array} Array of vertex positions
+   */
+  _createEquilateralVertices() {
+    const height = this.size * Math.sqrt(3) / 2;
+    return [
+      { x: 0, y: height * (2/3) },
+      { x: -this.size / 2, y: -height * (1/3) },
+      { x: this.size / 2, y: -height * (1/3) }
+    ];
+  }
+
+  /**
+   * Apply position and rotation transforms to vertices
+   * @private
+   * @param {Array} vertices - Original vertices
+   * @returns {Array} Transformed vertices
+   */
+  _transformVertices(vertices) {
+    // Create rotation matrix
+    const cos = Math.cos(this.rotation);
+    const sin = Math.sin(this.rotation);
+    
+    return vertices.map(v => {
+      // Apply rotation
+      const x = v.x * cos - v.y * sin;
+      const y = v.x * sin + v.y * cos;
+      
+      // Apply translation (position)
+      return {
+        x: x + this.position.x,
+        y: y + this.position.y
+      };
+    });
+  }
+
+  /**
+   * Apply corner rounding by modifying distance mappers of each edge
+   * @private
+   */
+  _applyCornerRounding() {
+    logger.debug(`Applying corner rounding with value ${this.cornerRounding}`);
+    
+    for (let i = 0; i < this.shapes.length; i++) {
+      const shape = this.shapes[i];
+      const currentMapper = shape.distanceMapper || identityMapping;
+      
+      // Create a temporal mapping that applies the rounding effect
+      shape.distanceMapper = createMapping('temporal', {
+        baseMapper: currentMapper,
+        frequency: 0.5,
+        amplitude: this.cornerRounding * 0.1
+      });
+    }
+  }
+
+  /**
+   * Blend all edges together using weighted union
+   * @private
+   */
+  _blendEdges() {
+    if (this.shapes.length > 1) {
+      for (let i = 0; i < this.shapes.length; i++) {
+        const shape = this.shapes[i];
+        // Add all other shapes as blend primitives
+        for (let j = 0; j < this.shapes.length; j++) {
+          if (i !== j) {
+            shape.addBlendPrimitive(this.shapes[j], 'union');
+          }
+        }
+        shape.setBlendParams({ smoothness: this.blendSmoothness });
+      }
+    }
+  }
+
+  /**
+   * Update triangle parameters and reinitialize
+   * @param {Object} params - New parameters
+   * @returns {TrianglePrimitive} This instance for chaining
+   */
+  updateParameters(params = {}) {
+    if (params.size !== undefined) this.size = params.size;
+    if (params.rotation !== undefined) this.rotation = params.rotation;
+    if (params.position !== undefined) this.position = params.position;
+    if (params.edgeSmoothness !== undefined) this.edgeSmoothness = params.edgeSmoothness;
+    if (params.cornerRounding !== undefined) this.cornerRounding = params.cornerRounding;
+    if (params.blendSmoothness !== undefined) this.blendSmoothness = params.blendSmoothness;
+    if (params.color !== undefined) this.color = params.color;
+    if (params.vertices !== undefined) this.verticesInput = params.vertices;
+    
+    // Reinitialize the triangle with updated parameters
+    this._initializeTriangle();
+    
+    logger.info(`Updated TrianglePrimitive ${this.id} with new parameters`);
+    return this;
+  }
+  // ←— INSERT AT END OF CLASS:
+  clone() {
+    const copy = new TrianglePrimitive(this._params);
+    copy.blendSmoothness = this.blendSmoothness;
+    copy.color           = { ...this.color };
+    return copy;
+  }  
+}
+
+/**
+ * Arc primitive composed of multiple line segments along a circular path
+ */
+export class ArcPrimitive extends DerivativePrimitive {
+  constructor(params = {}) {
+    super(params);
+    this.type = 'arc';
+    
+    // Arc parameters with defaults
+    this.radius = params.radius || 1;
+    this.startAngle = params.startAngle || 0;
+    this.endAngle = params.endAngle !== undefined ? params.endAngle : Math.PI;
+    this.segments = params.segments || 8;
+    this.position = params.position || { x: 0, y: 0 };
+    this.thickness = params.thickness || 0;
+    
+    // Initialize the arc shapes
+    this._initializeArc();
+    
+    logger.info(`Created ArcPrimitive with id: ${this.id}, radius: ${this.radius}, segments: ${this.segments}`);
+    // ── store original params for cloning ─────────────────────
+    this._params = { ...params };    
+  }
+
+  /**
+   * Initialize the arc shapes based on parameters
+   * @private
+   */
+  _initializeArc() {
+    // Clear existing shapes
+    this.shapes = [];
+    
+    // Calculate angle step
+    const angleRange = this.endAngle - this.startAngle;
+    const angleStep = angleRange / this.segments;
+    
+    // Create line segments along the arc
+    for (let i = 0; i < this.segments; i++) {
+      const angle1 = this.startAngle + i * angleStep;
+      const angle2 = this.startAngle + (i + 1) * angleStep;
+      
+      // Calculate vertex positions along a circular path
+      const x1 = this.position.x + this.radius * Math.cos(angle1);
+      const y1 = this.position.y + this.radius * Math.sin(angle1);
+      const x2 = this.position.x + this.radius * Math.cos(angle2);
+      const y2 = this.position.y + this.radius * Math.sin(angle2);
+      
+      // Create vertices
+      const vertexA = new Vertex({ 
+        position: { x: x1, y: y1 }, 
+        color: this.color 
+      });
+      
+      const vertexB = new Vertex({ 
+        position: { x: x2, y: y2 }, 
+        color: this.color 
+      });
+      
+      // Create a distance mapper for a thickness effect if specified
+      let distanceMapper = identityMapping;
+      if (this.thickness > 0) {
+        distanceMapper = createMapping('sinusoidal', {
+          a: this.thickness,
+          b: 10,  // Frequency
+          c: 0,   // Phase
+          e: this.thickness  // Vertical shift
+        });
+      }
+      
+      // Create the edge shape
+      const segment = new ComplexShape2D({
+        vertices: [vertexA, vertexB],
+        color: this.color,
+        distanceMapper: distanceMapper,
+        smoothness: this.blendSmoothness
+      });
+      
+      this.shapes.push(segment);
+    }
+    
+    // Blend all segments together
+    this._blendSegments();
+  }
+
+  /**
+   * Blend all segments together using weighted union
+   * @private
+   */
+  _blendSegments() {
+    if (this.shapes.length > 1) {
+      for (let i = 0; i < this.shapes.length; i++) {
+        const shape = this.shapes[i];
+        for (let j = 0; j < this.shapes.length; j++) {
+          if (i !== j) {
+            shape.addBlendPrimitive(this.shapes[j], 'union');
+          }
+        }
+        shape.setBlendParams({ smoothness: this.blendSmoothness });
+      }
+    }
+  }
+
+  /**
+   * Update arc parameters and reinitialize
+   * @param {Object} params - New parameters
+   * @returns {ArcPrimitive} This instance for chaining
+   */
+  updateParameters(params = {}) {
+    if (params.radius !== undefined) this.radius = params.radius;
+    if (params.startAngle !== undefined) this.startAngle = params.startAngle;
+    if (params.endAngle !== undefined) this.endAngle = params.endAngle;
+    if (params.segments !== undefined) this.segments = params.segments;
+    if (params.position !== undefined) this.position = params.position;
+    if (params.thickness !== undefined) this.thickness = params.thickness;
+    if (params.blendSmoothness !== undefined) this.blendSmoothness = params.blendSmoothness;
+    if (params.color !== undefined) this.color = params.color;
+    
+    // Reinitialize the arc with updated parameters
+    this._initializeArc();
+    
+    logger.info(`Updated ArcPrimitive ${this.id} with new parameters`);
+    return this;
+  }
+  clone() {
+    const copy = new ArcPrimitive(this._params);
+    copy.blendSmoothness = this.blendSmoothness;
+    copy.color           = { ...this.color };
+    return copy;
+  }  
+}
+
+/**
+ * Factory function to create derivative primitives
+ * @param {string} type - Type of primitive to create ('triangle' or 'arc')
+ * @param {Object} params - Parameters for the primitive
+ * @returns {DerivativePrimitive} The created primitive
+ */
+export function createDerivativePrimitive(type, params = {}) {
+  switch (type.toLowerCase()) {
+    case 'triangle':
+      return new TrianglePrimitive(params);
+    case 'arc':
+      return new ArcPrimitive(params);
+    default:
+      logger.warn(`Unknown derivative primitive type: ${type}. Defaulting to triangle.`);
+      return new TrianglePrimitive(params);
+  }
+}
+
+// Export all derivative primitive classes and factory function
+export default {
+  DerivativePrimitive,
+  TrianglePrimitive,
+  ArcPrimitive,
+  createDerivativePrimitive
+};
+
+================================================================================
+// FILE: src/Primitives/SchurComposition.js
+================================================================================
+
+// File: src/primitives/SchurComposition.js
+import { logger } from "../utils/logger.js";
+import {
+    composeAffine,
+    invertAffine,
+    makeAffine,
+    applyAffineToVertex,
+    applyAffineToFace,
+    isInvertible
+  } from "../utils/affine.js";
+  import { createBlendedPrimitive } from "../utils/SDFBlending.js";
+  import { DerivativePrimitive } from "./primaryDerivativePrimitives.js";
+  import { ComplexPrimitive2D } from "./ComplexPrimitive2d.js";
+  import { Vertex } from "../Geometry/Vertex.js";
+  import { Face } from "../Geometry/Face.js";
+  import * as THREE from 'three';
+
+  
+  /**
+   * SchurComposition
+   *
+   * Implements a "Schur-style" similarity transform composition:
+   *  1. Forward-transform base primitives into a common blend-space (T)
+   *  2. Blend their SDFs via R-functions in that space
+   *  3. Inverse-transform the result back to world-space (T⁻¹)
+   *
+   * @extends DerivativePrimitive
+   */
+  export class SchurComposition extends DerivativePrimitive {
+    /**
+     * @param {Object} params
+     * @param {ComplexPrimitive2D[]} params.shapes        - Primitives to compose
+     * @param {number}             params.rotation      - Rotation in radians
+     * @param {number}             params.scale         - Uniform scale
+     * @param {{x:number,y:number}} params.position      - Translation vector
+     * @param {string[]}           [params.operations]  - Blend operations (union, intersection, difference)
+     * @param {number[]}           [params.weights]     - Smoothness weights per operation
+     * @param {'sequential'|'balanced'|'nested'} [params.compositeFn] - Blend strategy
+     */
+    constructor(params = {}) {
+      super(params);
+      this.type = 'schur-composition';
+  
+      // Parameters
+      this.baseShapes    = params.shapes       || [];
+      this.rotation      = params.rotation     || 0;
+      this.scale         = params.scale        || 1;
+      this.position      = params.position     || { x: 0, y: 0 };
+      this.operations    = params.operations   || ['union'];
+      this.weights       = params.weights      || [this.blendSmoothness];
+      this.compositeFn        = params.compositeFn  || 'sequential';
+      this._onDependencyUpdate = typeof params.onDependencyUpdate === 'function'
+                                   ? params.onDependencyUpdate
+                                   : null;
+  
+      // Internal
+      this.transformedShapes = [];
+      this._T                = null;
+      this._Tinv             = null;
+      this._needsUpdate      = true;
+      this._scaleFactor      = 1;  // scale of T, kept for logging/debugging
+  
+      // Build composite
+      this._initializeComposition();
+    }
+  
+    /**
+     * Updates transformation parameters and marks for recomposition
+     * @param {Object} params Parameters to update
+     */
+    updateParameters(params = {}) {
+      let changed = false;
+      
+      if (params.rotation !== undefined && params.rotation !== this.rotation) {
+        this.rotation = params.rotation;
+        changed = true;
+      }
+      
+      if (params.scale !== undefined && params.scale !== this.scale) {
+        this.scale = params.scale;
+        changed = true;
+      }
+      
+      if (params.position !== undefined) {
+        if (params.position.x !== this.position.x || params.position.y !== this.position.y) {
+          this.position = params.position;
+          changed = true;
+        }
+      }
+      
+      if (params.operations !== undefined) {
+        this.operations = params.operations;
+        changed = true;
+      }
+      
+      if (params.weights !== undefined) {
+        this.weights = params.weights;
+        changed = true;
+      }
+      
+      if (params.compositeFn !== undefined && params.compositeFn !== this.compositeFn) {
+        this.compositeFn = params.compositeFn;
+        changed = true;
+      }
+      
+      if (params.shapes !== undefined) {
+        this.baseShapes = params.shapes;
+        changed = true;
+      }
+      
+      if (changed) {
+        // Register updated dependencies for cycle detection
+        const childIds = this.baseShapes.map(s => s.id);
+        if (this._onDependencyUpdate) {
+          this._onDependencyUpdate(this.id, childIds);
+        }
+        this._needsUpdate = true;
+        this._initializeComposition();
+      }
+        
+      return changed;
+    }
+  
+    /**
+     * Initializes transforms, clones, blends, and restores.
+     * @private
+     */
+    _initializeComposition() {
+      // Skip if nothing to compose
+      if (this.baseShapes.length === 0) {
+        this.shapes = [];
+        return;
+      }
+      
+      // Skip recomputation if not needed
+      if (!this._needsUpdate && this._T && this._Tinv) {
+        return;
+      }
+  
+      try {
+        // Validate scale to prevent degenerate transformations
+        const safeScale = Math.max(Math.abs(this.scale), 0.0001);
+        
+        logger.info(`[${this.id}] SchurComposition: Initializing composition with ${this.baseShapes.length} shapes`);
+        
+        // 1. Compute forward (T) and inverse (T⁻¹)
+        this._T = makeAffine({ 
+          rotation: this.rotation, 
+          scale: safeScale, 
+          translate: this.position 
+        });
+        
+        // Check matrix invertibility before proceeding
+        if (!isInvertible(this._T)) {
+          logger.warn(`[${this.id}] SchurComposition: Transformation matrix is not invertible. Using identity matrix instead.`);
+          this._T = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+          this._scaleFactor = 1;
+        } else {
+          // Calculate the scale factor from the determinant
+          this._scaleFactor = Math.sqrt(Math.abs(this._T.a * this._T.d - this._T.b * this._T.c));
+          logger.info(`[${this.id}] SchurComposition: Calculated scale factor: ${this._scaleFactor}`);
+        }
+        
+        this._Tinv = invertAffine(this._T);
+  
+        // 2. Clone & transform into blend-space
+        this._cloneAndTransform();
+  
+        // 3. Blend according to strategy
+        const blended = this._blendInBlendSpace();
+        
+        // Validate blending result
+        if (!blended) {
+          logger.warn(`[${this.id}] SchurComposition: Blending operation failed to produce a valid result.`);
+          this.shapes = this.baseShapes.length > 0 ? [this.baseShapes[0].clone()] : [];
+          return;
+        }
+  
+        // 4. Inverse-transform and finalize
+        this._inverseTransform(blended);
+
+        logger.info(`[${this.id}] SchurComposition: Composition completed successfully`);
+        
+        // Reset update flag - only if we reach this point successfully
+        this._needsUpdate = false;
+      } catch (error) {
+        logger.error(`[${this.id}] SchurComposition: Composition error:`, error);
+        // Keep _needsUpdate true so we retry on next call
+        
+        // Set a fallback shape if possible
+        if (this.baseShapes.length > 0) {
+          try {
+            this.shapes = [this.baseShapes[0].clone()];
+          } catch (e) {
+            logger.error(`[${this.id}] SchurComposition: Fallback error:`, e);
+            this.shapes = [];
+          }
+        } else {
+          this.shapes = [];
+        }
+      }
+    }
+  
+    /**
+     * Clone base shapes and apply forward transform.
+     * @private
+     */
+    _cloneAndTransform() {
+      this.transformedShapes = this.baseShapes.map(shape => {
+        if (!shape) return null;
+        
+        try {
+          const copy = shape.clone();
+          
+          // Ensure we have a valid shape with necessary methods
+          if (!copy || !copy.vertices || !Array.isArray(copy.vertices)) {
+            logger.warn(`[${this.id}] SchurComposition: Invalid shape detected during transform`);
+            return null;
+          }
+          
+          // Transform each vertex
+          if (Array.isArray(copy.vertices)) {
+            copy.vertices.forEach(v => applyAffineToVertex(v, this._T));
+          }
+          // Transform face
+          if (copy.face instanceof Face) {
+            applyAffineToFace(copy.face, this._T);
+          }
+          
+          // Ensure SDF is updated after transformation
+          if (typeof copy.updateSDF === 'function') {
+            copy.updateSDF();
+          }
+          
+          return copy;
+        } catch (error) {
+          logger.error(`[${this.id}] SchurComposition: Error during shape transformation:`, error);
+          return null;
+        }
+      }).filter(shape => shape !== null);
+      
+      logger.info(`[${this.id}] SchurComposition: Transformed ${this.transformedShapes.length} shapes`);
+    }
+  
+    /**
+     * Blend shapes in blend-space using the configured strategy.
+     * @returns {ComplexPrimitive2D}
+     * @private
+     */
+    _blendInBlendSpace() {
+      // Handle edge cases
+      if (this.transformedShapes.length === 0) return null;
+      if (this.transformedShapes.length === 1) return this.transformedShapes[0];
+      
+      logger.info(`[${this.id}] SchurComposition: Blending ${this.transformedShapes.length} shapes using ${this.compositeFn} strategy`);
+      
+      switch (this.compositeFn) {
+        case 'balanced':
+          return this._createBalanced(this.transformedShapes, 0, this.transformedShapes.length - 1);
+        case 'nested':
+          return this._createNested(this.transformedShapes);
+        case 'sequential':
+        default:
+          return this._createSequential(this.transformedShapes);
+      }
+    }
+  
+    /**
+     * Sequential blend of shapes: left-to-right.
+     * @param {Array<ComplexPrimitive2D>} shapes - Shapes to blend
+     * @returns {ComplexPrimitive2D} - The blended result
+     * @private
+     */
+    _createSequential(shapes) {
+      if (shapes.length === 0) return null;
+      let result = shapes[0];
+      for (let i = 1, opIdx = 0; i < shapes.length; i++, opIdx++) {
+        const op   = this.operations[opIdx % this.operations.length];
+        const w    = this.weights[opIdx % this.weights.length];
+        
+        // Ensure both shapes are valid
+        if (!result || !shapes[i]) {
+          logger.warn(`[${this.id}] SchurComposition: Invalid shape in sequential blend at index ${i}`);
+          continue;
+        }
+        
+        result = createBlendedPrimitive([result, shapes[i]], {
+          smoothness: w,
+          operation: op,
+          color: this.color
+        });
+        
+        // Ensure SDF is updated after each blend
+        if (result && typeof result.updateSDF === 'function') {
+          result.updateSDF();
+        }
+      }
+      return result;
+    }
+  
+    /**
+     * Balanced binary-tree blend of shapes.
+     * @param {Array<ComplexPrimitive2D>} shapes - Shapes to blend
+     * @param {number} start - Start index
+     * @param {number} end - End index
+     * @returns {ComplexPrimitive2D} - The blended result
+     * @private
+     */
+    _createBalanced(shapes, start, end) {
+      if (start > end) return null;
+      if (start === end) return shapes[start];
+      
+      const mid = Math.floor((start + end) / 2);
+      const left  = this._createBalanced(shapes, start, mid);
+      const right = this._createBalanced(shapes, mid + 1, end);
+      
+      // Handle case where one side is null
+      if (!left) return right;
+      if (!right) return left;
+      
+      const idx   = Math.floor(Math.log2(end - start + 1)) % this.operations.length;
+      const result = createBlendedPrimitive([left, right], {
+        smoothness: this.weights[idx % this.weights.length],
+        operation:  this.operations[idx % this.operations.length],
+        color:      this.color
+      });
+      
+      // Ensure SDF is updated after blend
+      if (result && typeof result.updateSDF === 'function') {
+        result.updateSDF();
+      }
+      
+      return result;
+    }
+  
+    /**
+     * Nested (matryoshka) blend of shapes.
+     * @param {Array<ComplexPrimitive2D>} shapes - Shapes to blend
+     * @returns {ComplexPrimitive2D} - The blended result
+     * @private
+     */
+    _createNested(shapes) {
+      if (shapes.length === 0) return null;
+      let result = shapes[0];
+      for (let i = 1; i < shapes.length; i++) {
+        const idx = (i - 1) % this.operations.length;
+        const op  = this.operations[idx];
+        const w   = this.weights[idx % this.weights.length];
+        // For difference, swap order
+        const pair = op === 'difference' ? [shapes[i], result] : [result, shapes[i]];
+        
+        // Ensure both shapes are valid
+        if (!pair[0] || !pair[1]) {
+          logger.warn(`[${this.id}] SchurComposition: Invalid shape in nested blend at index ${i}`);
+          continue;
+        }
+        
+        result = createBlendedPrimitive(pair, { 
+          smoothness: w, 
+          operation: op, 
+          color: this.color 
+        });
+        
+        // Ensure SDF is updated after each blend
+        if (result && typeof result.updateSDF === 'function') {
+          result.updateSDF();
+        }
+      }
+      return result;
+    }
+  
+    /**
+     * Apply inverse transform, set `shapes`, and update SDF.
+     * @param {ComplexPrimitive2D} blended - The blended shape to transform
+     * @private
+     */
+    _inverseTransform(blended) {
+      if (!blended) {
+        this.shapes = [];
+        return;
+      }
+      
+      try {
+        // Inverse-transform vertices
+        if (Array.isArray(blended.vertices)) {
+          blended.vertices.forEach(v => applyAffineToVertex(v, this._Tinv));
+        }
+        // Inverse-transform face
+        if (blended.face instanceof Face) {
+          applyAffineToFace(blended.face, this._Tinv);
+        }
+        
+        // Special check: attach the scaling factor for SDF adjustments
+        blended._transformScaleFactor = this._scaleFactor;
+        
+        // Finalize
+        // 1️⃣ Inverse-transform the blended ComplexShape2D
+        if (typeof blended.updateCompositeSDF === 'function') {
+          blended.updateCompositeSDF();
+        } else if (typeof blended.updateSDF === 'function') {
+          blended.updateSDF();
+        }
+        
+        // 2️⃣ Now install it as our single output shape
+        this.shapes = [blended];
+        
+        logger.info(`[${this.id}] SchurComposition: Inverse transform complete`);
+      } catch (error) {
+        logger.error(`[${this.id}] SchurComposition: Error during inverse transformation:`, error);
+        this.shapes = [];
+      }
+    }
+
+    /**
+     * Override: create Three.js object for rendering.
+     * @param {number} time - Animation time
+     * @returns {Object} - Three.js object
+     */
+    createObject(time = 0) {
+      if (this._needsUpdate) this._initializeComposition();
+      const shape = (this.shapes && this.shapes[0]);
+      // 1) If it really knows how to render itself:
+      if (shape && typeof shape.createObject === "function") {
+        return shape.createObject(time);
+      }
+      // 2) Otherwise try the "line" fallback:
+      if (shape && typeof shape.createLineObject === "function") {
+        return shape.createLineObject(time);
+      }
+      // 3) Last-ditch: give Three.js an empty container, not null:
+      return new THREE.Group();
+    }
+    
+  
+/**
+ * Override: compute SDF for CPU queries.
+ * @param {Object} point - Point to evaluate
+ * @param {Array} callStack - Call stack for recursion prevention
+ * @param {number} time - Animation time
+ * @param {number} depth - Recursion depth
+ * @returns {number} - SDF value
+ */
+computeSDF(point, callStack = [], time = 0, depth = 0) {
+  if (this._needsUpdate) {
+    this._initializeComposition();
+  }
+
+  if (!this.shapes || this.shapes.length === 0) return Infinity;
+  const shape = this.shapes[0];
+  if (!shape) return Infinity;
+
+  // Prevent infinite recursion — unified array-based guard
+  if (callStack.includes(this.id)) {
+    logger.warn(`[${this.id}] SchurComposition: Detected recursive SDF computation. Returning Infinity.`);
+    return Infinity;
+  }
+
+  callStack.push(this.id);
+  try {
+    // shapes[0] vertices are already in world-space (T⁻¹ was applied in
+    // _inverseTransform), so pass the query point through unchanged.
+    return shape.computeSDF(point, callStack, time, depth);
+  } finally {
+    const idx = callStack.indexOf(this.id);
+    if (idx >= 0) callStack.splice(idx, 1);
+  }
+}
+    /**
+     * Clone this SchurComposition.
+     * @returns {SchurComposition} - A new instance with the same parameters
+     */
+    clone() {
+      // Clone base shapes with careful error handling
+      const clonedShapes = this.baseShapes.map(shape => {
+        if (!shape) return null;
+        
+        try {
+          const clone = shape.clone();
+          
+          // Preserve custom distance mappers if present
+          if (shape.distanceMapper && typeof shape.distanceMapper === 'function') {
+            clone.distanceMapper = shape.distanceMapper;
+          }
+          
+          return clone;
+        } catch (error) {
+          logger.warn(`SchurComposition: Failed to clone shape: ${error.message}`);
+          return null;
+        }
+      }).filter(shape => shape !== null);
+      
+      // Create new instance with same parameters
+      const clone = new SchurComposition({
+        shapes: clonedShapes,
+        rotation: this.rotation,
+        scale: this.scale,
+        position: { x: this.position.x, y: this.position.y },
+        operations: [...this.operations],
+        weights: [...this.weights],
+        compositeFn: this.compositeFn,
+        // Preserve color and other base properties
+        color: { ...this.color },
+        blendSmoothness: this.blendSmoothness
+      });
+      
+      // Preserve internal state for efficiency if valid
+      if (this._T && this._Tinv && !this._needsUpdate) {
+        clone._T = { ...this._T };
+        clone._Tinv = { ...this._Tinv };
+        clone._scaleFactor = this._scaleFactor;
+        clone._needsUpdate = false;
+      } else {
+        // Force update for safety
+        clone._needsUpdate = true;
+      }
+      
+      return clone;
+    }
+  }
+  
+  export default SchurComposition;
+================================================================================
+// FILE: src/rendering/cameraManager.js
+================================================================================
+
+// File: src/rendering/CameraManager.js
+import * as THREE from "three";
+
+export class CameraManager {
+  constructor(params = {}) {
+    // Default perspective camera parameters
+    const fov = params.fov || 75;
+    const aspect = params.aspect || window.innerWidth / window.innerHeight;
+    const near = params.near || 0.1;
+    const far = params.far || 1000;
+
+    this.camera = new THREE.PerspectiveCamera(fov, aspect, near, far);
+    this.camera.position.set(0, 0, 5);
+  }
+
+  getCamera() {
+    return this.camera;
+  }
+
+  updateAspect(width, height) {
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+  }
+}
+
+================================================================================
+// FILE: src/rendering/LightingManager.js
+================================================================================
+
+// File: src/rendering/LightingManager.js
+import * as THREE from "three";
+
+export class LightingManager {
+  constructor(scene) {
+    this.scene = scene;
+
+    // Example: add an ambient light and a directional light
+    this.ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    this.directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+    this.directionalLight.position.set(10, 10, 10);
+
+    this.scene.add(this.ambientLight);
+    this.scene.add(this.directionalLight);
+  }
+
+  setAmbientIntensity(intensity) {
+    this.ambientLight.intensity = intensity;
+  }
+
+  setDirectionalIntensity(intensity) {
+    this.directionalLight.intensity = intensity;
+  }
+}
+
+================================================================================
+// FILE: src/rendering/SceneManager.js
+================================================================================
+
+// File: src/rendering/SceneManager.js
+
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { CameraManager } from "./cameraManager.js";
+import { LightingManager } from "./LightingManager.js";
+import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
+import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
+import { SchurComposition } from "../Primitives/SchurComposition.js";
+import { createPolynomialMapping } from "../utils/DistanceMapping.js";
+import { stateStore } from "../state/stateStore.js";
+import { logger } from "../utils/logger.js";
+import * as meshCreator from "../utils/meshCreator.js";
+
+
+export class SceneManager {
+  constructor(mountElement) {
+    // ── Three.js core ──────────────────────────────────────────────────────
+    this.scene    = new THREE.Scene();
+
+    this.cameraManager = new CameraManager();
+    this.camera   = this.cameraManager.getCamera();
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    mountElement.appendChild(this.renderer.domElement);
+
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.camera.position.set(0, 0, 5);
+    this.controls.update();
+
+    this.lightingManager = new LightingManager(this.scene);
+
+    // ── State ──────────────────────────────────────────────────────────────
+    // Each entry: { instance: <shape>, type: <string>, object: <THREE.Object3D> }
+    this.activePrimitives = [];
+    this.currentSchur     = null;
+
+    // ── Animation ─────────────────────────────────────────────────────────
+    this._startTime    = performance.now();
+    this._animating    = false;
+    this._rafHandle    = null;
+
+    // ── Resize ────────────────────────────────────────────────────────────
+    window.addEventListener("resize", () => this._onResize());
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Public scene-mutation API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Add a primitive of the given type to the scene.
+   * @param {"line"|"triangle"|"arc"} type
+   * @returns {Object} the new primitive entry { instance, type, object }
+   */
+  addPrimitive(type) {
+    let entry = null;
+
+    switch (type.toLowerCase()) {
+      case "line": {
+        const initialPolyCoeffs = [0, 1, 0.5];
+        const polyMapping = createPolynomialMapping(initialPolyCoeffs);
+        const shape = new ComplexShape2D({
+          metric: { center: { x: 0.5, y: 0.5 }, scale: 1, polyCoeffs: initialPolyCoeffs },
+          color: { h: 200, s: 0.8, l: 0.6, a: 1 },
+          distanceMapper: polyMapping
+        });
+        stateStore.addShape(shape);
+        entry = { instance: shape, type: "line" };
+        entry.object = shape.createLineObject();
+        logger.info("Line segment shape instantiated.");
+        break;
+      }
+
+      case "triangle": {
+        const triangle = new TrianglePrimitive({
+          size: 1,
+          rotation: 0,
+          position: { x: -1, y: 0 },
+          cornerRounding: 0,
+          edgeSmoothness: [0, 0, 0],
+          color: { h: 210, s: 0.8, l: 0.6, a: 1 },
+          blendSmoothness: 8
+        });
+        triangle.registerWithStateStore(stateStore);
+        stateStore.addShape(triangle);
+        entry = { instance: triangle, type: "triangle" };
+        entry.object = triangle.createObject();
+        logger.info("Triangle primitive instantiated.");
+        break;
+      }
+
+      case "arc": {
+        const arc = new ArcPrimitive({
+          radius: 1.5,
+          startAngle: 0,
+          endAngle: Math.PI,
+          segments: 8,
+          position: { x: 1, y: 0 },
+          thickness: 0,
+          color: { h: 30, s: 0.9, l: 0.5, a: 1 },
+          blendSmoothness: 8
+        });
+        arc.registerWithStateStore(stateStore);
+        stateStore.addShape(arc);
+        entry = { instance: arc, type: "arc" };
+        entry.object = arc.createObject();
+        logger.info("Arc primitive instantiated.");
+        break;
+      }
+
+      default:
+        logger.warn(`Unknown primitive type "${type}". Defaulting to line.`);
+        return this.addPrimitive("line");
+    }
+
+    this.activePrimitives.push(entry);
+    this._addToScene(entry);
+    return entry;
+  }
+
+  /**
+   * Remove the most recently added primitive from the scene and state store.
+   */
+  removeLast() {
+    if (this.activePrimitives.length === 0) return;
+    const entry = this.activePrimitives.pop();
+    this._removeFromScene(entry);
+    stateStore.removeShape(entry.instance.id);
+    logger.info(`Removed last primitive (id: ${entry.instance.id}, type: ${entry.type})`);
+  }
+
+  /**
+   * Remove all active primitives from the scene and state store.
+   */
+  clearAll() {
+    this.activePrimitives.forEach(p => {
+      this._removeFromScene(p);
+      stateStore.removeShape(p.instance.id);
+    });
+    this.activePrimitives = [];
+    logger.info("Cleared all primitives.");
+  }
+
+  /**
+   * Build a SchurComposition from the given params and render it.
+   * @param {Object} schurParams  - { baseIds, operations, weight, rotation, scale, posX, posY }
+   * @param {Object} renderParams - { method: "contours (2D)"|"fill (2D)"|"arcs"|"surface (3D)" }
+   */
+  compose(schurParams, renderParams) {
+    // Remove previous composition if any
+    if (this.currentSchur) {
+      this._removeFromScene(this.currentSchur);
+      stateStore.removeShape(this.currentSchur.instance.id);
+      this.currentSchur = null;
+    }
+
+    // Resolve base shapes
+    const bases = schurParams.baseIds
+      .map(id => stateStore.getShape(id))
+      .filter(s => !!s);
+
+    if (bases.length < 2) {
+      logger.warn("compose() requires at least 2 selected shapes.");
+      return null;
+    }
+
+    // Build the composition
+    const schur = new SchurComposition({
+      shapes:    bases,
+      operations: schurParams.operations,
+      weights:   [schurParams.weight],
+      rotation:  schurParams.rotation,
+      scale:     schurParams.scale,
+      position:  { x: schurParams.posX, y: schurParams.posY },
+      blendSmoothness: schurParams.weight,
+      color:     { h: 0, s: 0, l: 0.8, a: 1 },
+      onDependencyUpdate: (id, childIds) => stateStore._updateDependencies(id, childIds)
+    });
+
+    stateStore.addShape(schur);
+    stateStore._updateDependencies(schur.id, schurParams.baseIds);
+
+    // Render
+    const threeObj = this._buildSchurObject(schur, renderParams.method);
+    const entry = { instance: schur, type: "schur", object: threeObj };
+    this.currentSchur = entry;
+    this._addToScene(entry);
+
+    logger.info(`SchurComposition created (id: ${schur.id}), rendered as "${renderParams.method}".`);
+    return entry;
+  }
+
+  /**
+   * Return the activePrimitives array (read-only reference).
+   * GUI controllers use this to find the primitive they should edit.
+   */
+  getActivePrimitives() {
+    return this.activePrimitives;
+  }
+
+  /**
+   * Return the most recently added primitive of a given type, or null.
+   * Convenience for GUI slider callbacks.
+   */
+  getLastOfType(type) {
+    const matches = this.activePrimitives.filter(p => p.type === type);
+    return matches.length > 0 ? matches[matches.length - 1] : null;
+  }
+
+  /**
+   * Refresh all line primitives' geometry (called from the animation loop
+   * and from visual-update callbacks).
+   * @param {number} time - seconds since start
+   */
+  updateLineGeometry(time = 0) {
+    this.activePrimitives
+      .filter(p => p.type === "line")
+      .forEach(p => {
+        this._removeFromScene(p);
+        p.object = p.instance.createLineObject(time);
+        this._addToScene(p);
+      });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Visual-pipeline helpers (passed as callbacks to persistence.loadScene)
+  // ---------------------------------------------------------------------------
+
+  /** Remove every visual from the Three.js scene and reset active list. */
+  clearVisuals() {
+    this.scene.children.slice().forEach(obj => this.scene.remove(obj));
+    this.activePrimitives.forEach(p => stateStore.removeShape(p.instance.id));
+    this.activePrimitives = [];
+    if (this.currentSchur) {
+      stateStore.removeShape(this.currentSchur.instance.id);
+      this.currentSchur = null;
+    }
+  }
+
+  /** Build and add the visual for a deserialized shape. */
+  createVisual(shape) {
+    let mesh;
+    if (typeof shape.createObject === 'function') {
+      mesh = shape.createObject();
+    } else if (typeof shape.createLineObject === 'function') {
+      mesh = shape.createLineObject(0);
+    }
+    if (!mesh) {
+      logger.warn(`Shape ${shape.id} could not create a visual.`);
+      return;
+    }
+    shape.object = mesh;
+    this._addToScene({ object: mesh, instance: shape });
+  }
+
+  /** Fire a single render pass (used after scene load). */
+  triggerRender() {
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Expose renderer.domElement for callers that need it. */
+  getDOMElement() {
+    return this.renderer.domElement;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Animation loop
+  // ---------------------------------------------------------------------------
+
+  start() {
+    if (this._animating) return;
+    this._animating = true;
+    this._loop();
+  }
+
+  stop() {
+    this._animating = false;
+    if (this._rafHandle) cancelAnimationFrame(this._rafHandle);
+  }
+
+  _loop() {
+    if (!this._animating) return;
+    this._rafHandle = requestAnimationFrame(() => this._loop());
+
+    const currentTime = (performance.now() - this._startTime) / 1000.0;
+
+    // Update time-driven line geometry
+    if (
+      this.activePrimitives.some(p => p.type === "line") &&
+      ["temporal", "sequential", "blended"].includes(stateStore.selectedMappingType)
+    ) {
+      this.updateLineGeometry(currentTime);
+    }
+
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  _addToScene(entry) {
+    if (!entry.object) {
+      logger.warn(`Entry has no object to add to scene.`);
+      return;
+    }
+    this.scene.add(entry.object);
+    if (entry.instance) entry.instance.rendered = true;
+  }
+
+  _removeFromScene(entry) {
+    if (!entry.object) return;
+    this.scene.remove(entry.object);
+    if (entry.instance) entry.instance.rendered = false;
+  }
+
+  _buildSchurObject(schur, method) {
+    const bounds2D = [-2, -2, 2, 2];
+    const bounds3D = [-2, -2, -2, 2, 2, 2];
+
+    switch (method) {
+      case "contours (2D)": {
+        const loops = meshCreator.marchingSquares(
+          pt => schur.computeSDF(pt), bounds2D, 150
+        );
+        const geometry = meshCreator.buildLineSegments(loops);
+        return new THREE.LineSegments(
+          geometry,
+          new THREE.LineBasicMaterial({ color: 0x3366ff })
+        );
+      }
+      case "fill (2D)": {
+        const loops = meshCreator.marchingSquares(
+          pt => schur.computeSDF(pt), bounds2D, 150
+        );
+        return meshCreator.createContourMesh(loops);
+      }
+      case "arcs": {
+        const loops = meshCreator.marchingSquares(
+          pt => schur.computeSDF(pt), bounds2D, 150
+        );
+        const arcs = meshCreator.fitArcs(loops.flat());
+        return meshCreator.createArcObject(arcs, { segments: 64 });
+      }
+      case "surface (3D)": {
+        return meshCreator.createSDFMesh(
+          schur, bounds3D,
+          { resolution: 50, wireframe: false, isoLevel: 0 }
+        );
+      }
+      default:
+        logger.warn(`Unknown render method: ${method}`);
+        return new THREE.Group();
+    }
+  }
+
+  _onResize() {
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.cameraManager.updateAspect(window.innerWidth, window.innerHeight);
+  }
+}
+================================================================================
+// FILE: src/rendering/TextureLoader.js
+================================================================================
+
+// File: src/rendering/TextureLoader.js
+import * as THREE from "three";
+
+export class TextureLoader {
+  constructor() {
+    this.loader = new THREE.TextureLoader();
+    this.cache = new Map();
+  }
+
+  loadTexture(url) {
+    if (this.cache.has(url)) {
+      return this.cache.get(url);
+    }
+    const texture = this.loader.load(url);
+    this.cache.set(url, texture);
+    return texture;
+  }
+}
+
+================================================================================
+// FILE: src/state/stateStore.js
+================================================================================
+
+// File: src/state/stateStore.js
+
+import { 
+  createBlendedPrimitive, 
+  weightedRUnion, 
+  weightedRIntersection, 
+  weightedRDifference 
+} from "../utils/SDFBlending.js";
+import { 
+  distanceMappingRegistry, 
+  identityMapping, 
+  createMapping 
+} from "../utils/DistanceMapping.js";
+import { logger } from "../utils/logger.js";
+import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
+import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
+import { ComplexPrimitive2D } from "../Primitives/ComplexPrimitive2d.js";
+
+
+export class StateStore {
+  constructor() {
+    // Use a Set for sessionShapes for fast insertion, deletion, and uniqueness.
+    this.sessionShapes = new Set();
+    // Storage for visual update callbacks
+    this.visualUpdateCallbacks = [];
+    this.dependencyMap = new Map();
+
+    // Mapping configuration properties
+    this.selectedMappingType = "polynomial";
+    this.baseMapping = identityMapping;
+    this.blendFactor = 0.5;
+    this.timeFrequency = 1.0;
+    this.recursionLimit = 3;
+    this.amplitude = 1.0;
+    this.mappingParams = {};
+  }
+
+  // — Helpers for dependency tracking —
+  _updateDependencies(shapeId, childIds = []) {
+    this.dependencyMap.set(shapeId, childIds);
+  }
+
+  _hasCycle(startId, visited = new Set(), stack = new Set()) {
+    if (stack.has(startId)) return true;
+    if (visited.has(startId)) return false;
+    visited.add(startId);
+    stack.add(startId);
+    for (const childId of this.dependencyMap.get(startId) || []) {
+      if (this._hasCycle(childId, visited, stack)) return true;
+    }
+    stack.delete(startId);
+    return false;
+  }
+
+  // Dynamic distance mapping based on current configuration.
+  get distanceMapping() {
+    return createMapping(this.selectedMappingType, {
+      baseMapper: this.baseMapping,
+      baseMappers: [this.baseMapping, identityMapping],
+      blendFactor: this.blendFactor,
+      frequency: this.timeFrequency,
+      amplitude: this.amplitude,
+      iterations: this.recursionLimit,
+      polyCoeffs: [0, 1, 0],
+      a: 1,
+      b: 1,
+      c: 0,
+      e: 0
+    });
+  }
+
+  // Method to update mapping configuration.
+  updateMappingConfig(config = {}) {
+    const {
+      mappingType,
+      baseMapper,
+      secondaryMapper,
+      blendFactor,
+      frequency,
+      recursionLimit,
+      polyCoeffs,
+      a, b, c, e,
+      amplitude = 1.0
+    } = config;
+
+    if (mappingType) this.selectedMappingType = mappingType;
+    if (baseMapper) this.baseMapping = baseMapper;
+    if (blendFactor !== undefined) this.blendFactor = blendFactor;
+    if (frequency !== undefined) this.timeFrequency = frequency;
+    if (recursionLimit !== undefined) this.recursionLimit = recursionLimit;
+    if (amplitude !== undefined) this.amplitude = amplitude;
+
+    this.mappingParams = {
+      ...this.mappingParams,
+      polyCoeffs: polyCoeffs || [0, 1, 0],
+      a: a !== undefined ? a : 1,
+      b: b !== undefined ? b : 1,
+      c: c !== undefined ? c : 0,
+      e: e !== undefined ? e : 0,
+      secondaryMapper: secondaryMapper || identityMapping
+    };
+
+    logger.debug(`Updated mapping configuration: ${this.selectedMappingType}`);
+    return this.distanceMapping;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shape management.
+  // ---------------------------------------------------------------------------
+
+  // Add a shape to sessionShapes.
+  addShape(shape) {
+    shape.active = true;
+    shape.createdAt = Date.now();
+    shape.rendered = true;
+
+    this.sessionShapes.add(shape);
+    console.log(
+      `Shape added - id: ${shape.id}, active: ${shape.active}, rendered: ${shape.rendered}, createdAt: ${shape.createdAt}. ` +
+      `Total shapes in session: ${this.sessionShapes.size}`
+    );
+    return shape.id;
+  }
+
+  // Retrieve a shape by its id from sessionShapes.
+  getShape(shapeId) {
+    for (let shape of this.sessionShapes) {
+      if (shape.id === shapeId) return shape;
+    }
+    return undefined;
+  }
+
+  // Return all shapes as an array.
+  getShapes() {
+    return Array.from(this.sessionShapes);
+  }
+
+  // Remove a shape from sessionShapes by its id.
+  removeShape(shapeId) {
+    let removedShape = null;
+    for (let shape of this.sessionShapes) {
+      if (shape.id === shapeId) {
+        removedShape = shape;
+        break;
+      }
+    }
+    if (removedShape) {
+      this.sessionShapes.delete(removedShape);
+      console.log(`Shape with id ${shapeId} removed. Total shapes in session: ${this.sessionShapes.size}`);
+      return removedShape;
+    }
+    return null;
+  }
+
+  // Clear all shapes from sessionShapes.
+  clear() {
+    this.sessionShapes.clear();
+    console.log("State store cleared.");
+  }
+
+  onVisualUpdate(callback) {
+    if (typeof callback === 'function') {
+      this.visualUpdateCallbacks.push(callback);
+      logger.debug(`Visual update callback registered. Total callbacks: ${this.visualUpdateCallbacks.length}`);
+      return true;
+    }
+    logger.warn("Attempted to register invalid visual update callback");
+    return false;
+  }
+
+  triggerVisualUpdate(shapeId) {
+    // Cycle guard
+    if (this._hasCycle(shapeId)) {
+      console.error(`Cycle detected in dependencies of shape ${shapeId}; update aborted.`);
+      return;
+    }
+    logger.debug(`Triggering visual update for shape ${shapeId}`);
+    this.visualUpdateCallbacks.forEach(callback => {
+      try {
+        callback(shapeId);
+      } catch (error) {
+        logger.error(`Error in visual update callback: ${error.message}`);
+      }
+    });
+  }
+
+  updateShapeMapper(shapeId, mapperName, mapperParams) {
+    const shape = this.getShape(shapeId);
+    if (shape) {
+      if (mapperName && typeof mapperName === 'string') {
+        if (distanceMappingRegistry[mapperName]) {
+          if (typeof distanceMappingRegistry[mapperName] === 'function' &&
+              distanceMappingRegistry[mapperName].length > 0) {
+            shape.distanceMapper = distanceMappingRegistry[mapperName](
+              mapperParams.a, mapperParams.b, mapperParams.c, mapperParams.e
+            );
+          } else {
+            shape.distanceMapper = distanceMappingRegistry[mapperName];
+          }
+        } else {
+          console.warn(`Mapper "${mapperName}" not found. Using identity mapping.`);
+          shape.distanceMapper = identityMapping;
+        }
+        if (typeof shape.updateCompositeSDF === 'function') {
+          shape.updateCompositeSDF();
+        }
+        console.log(`Updated shape ${shape.id} mapper to ${mapperName} with params:`, mapperParams);
+        this.triggerVisualUpdate(shape.id);
+      }
+    }
+  }
+
+  setShapeBlendParams(shapeId, blendParams) {
+    const shape = this.getShape(shapeId);
+    if (shape && typeof shape.setBlendParams === 'function') {
+      shape.setBlendParams(blendParams);
+      console.log(`Updated blend params for shape ${shapeId}:`, blendParams);
+      this.triggerVisualUpdate(shape.id);
+      return true;
+    }
+    return false;
+  }
+
+  addBlendPrimitive(shapeId, primitiveId, operation = null) {
+    const shape = this.getShape(shapeId);
+    const primitive = this.getShape(primitiveId);
+
+    if (shape && primitive && typeof shape.addBlendPrimitive === 'function') {
+      if (shapeId === primitiveId) {
+        console.warn("Cannot add a shape to its own blend list");
+        return false;
+      }
+
+      shape.addBlendPrimitive(primitive, operation);
+      console.log(`Added primitive ${primitiveId} to shape ${shapeId} with operation: ${operation || 'current'}`);
+      this._updateDependencies(
+        shapeId,
+        shape.blendParams.primitives.map(p => p.id)
+      );
+      this.triggerVisualUpdate(shape.id);
+      return true;
+    }
+    return false;
+  }
+
+  removeBlendPrimitive(shapeId, primitiveId) {
+    const shape = this.getShape(shapeId);
+    if (shape && shape.blendParams && shape.blendParams.primitives) {
+      const index = shape.blendParams.primitives.findIndex(p => p.id === primitiveId);
+      if (index >= 0) {
+        shape.blendParams.primitives.splice(index, 1);
+        shape.updateCompositeSDF();
+        console.log(`Removed primitive ${primitiveId} from shape ${shapeId}`);
+        this._updateDependencies(
+          shapeId,
+          shape.blendParams.primitives.map(p => p.id)
+        );
+        this.triggerVisualUpdate(shape.id);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  clearBlendPrimitives(shapeId) {
+    const shape = this.getShape(shapeId);
+    if (shape && typeof shape.clearBlendPrimitives === 'function') {
+      shape.clearBlendPrimitives();
+      console.log(`Cleared all blend primitives from shape ${shapeId}`);
+      this._updateDependencies(shapeId, []);
+      this.triggerVisualUpdate(shape.id);
+      return true;
+    }
+    return false;
+  }
+
+  createBlendedShape(primitiveIds, params = {}) {
+    const primitivesToBlend = primitiveIds
+      .map(id => this.getShape(id))
+      .filter(shape => shape !== undefined);
+
+    if (primitivesToBlend.length === 0) {
+      console.warn("No valid primitives found for blending");
+      return null;
+    }
+
+    const blendedShape = createBlendedPrimitive(primitivesToBlend, params);
+    this.sessionShapes.add(blendedShape);
+    console.log(`Created blended shape with ${primitivesToBlend.length} primitives. Total shapes in session: ${this.sessionShapes.size}`);
+    this.triggerVisualUpdate(blendedShape.id);
+    return blendedShape;
+  }
+
+  setBasePrimitive(shapeId, primitiveId) {
+    const shape = this.getShape(shapeId);
+    const primitive = this.getShape(primitiveId);
+
+    if (shape && primitive && typeof shape.setBasePrimitive === 'function') {
+      shape.setBasePrimitive(primitive);
+      console.log(`Set ${primitiveId} as base primitive for shape ${shapeId}`);
+      const deps = [primitiveId, ...shape.blendParams.primitives.map(p => p.id)];
+      this._updateDependencies(shapeId, deps);
+      this.triggerVisualUpdate(shapeId);
+      return true;
+    }
+    return false;
+  }
+
+  // Apply the current global mapping configuration to a specific shape.
+  applyGlobalMappingToShape(shapeId) {
+    const shape = this.getShape(shapeId);
+    if (shape) {
+      shape.distanceMapper = this.distanceMapping;
+      if (typeof shape.updateCompositeSDF === 'function') {
+        shape.updateCompositeSDF();
+      }
+      logger.debug(`Applied global mapping (${this.selectedMappingType}) to shape ${shapeId}`);
+      this.triggerVisualUpdate(shapeId);
+      return true;
+    }
+    return false;
+  }
+
+  // **************** Hybrid Garbage Collection ****************
+  runGarbageCollection() {
+    const now = Date.now();
+    const MIN_AGE = 5 * 60 * 1000;
+
+    for (let shape of this.sessionShapes) {
+      if ((now - shape.createdAt) > MIN_AGE && !shape.rendered) {
+        this.sessionShapes.delete(shape);
+      }
+    }
+    console.log(`Garbage Collection complete. Remaining shapes in session: ${this.sessionShapes.size}`);
+  }
+
+  /**
+   * createShapeFromSerialized
+   * Uses a switch statement to choose the appropriate constructor.
+   * Returns null and logs a warning for unknown types.
+   */
+  createShapeFromSerialized(type, data) {
+    let shape = null;
+
+    logger.info(`Deserializing shape of type: "${type}" with data: ${JSON.stringify(data)}`);
+
+    try {
+      switch (type.toLowerCase()) {
+        case "triangle":
+          logger.debug(`Creating TrianglePrimitive with data: ${JSON.stringify(data)}`);
+          shape = new TrianglePrimitive(data);
+          break;
+
+        case "arc":
+          logger.debug(`Creating ArcPrimitive with data: ${JSON.stringify(data)}`);
+          shape = new ArcPrimitive(data);
+          break;
+
+        case "line":
+          logger.debug(`Creating ComplexShape2D (line) with data: ${JSON.stringify(data)}`);
+          shape = new ComplexShape2D(data);
+          break;
+
+        case "complexshape":
+          logger.debug(`Creating ComplexShape2D (complex) with data: ${JSON.stringify(data)}`);
+          shape = new ComplexShape2D(data);
+          break;
+
+        case "complexprimitive":
+          logger.debug(`Creating ComplexPrimitive2D with data: ${JSON.stringify(data)}`);
+          shape = new ComplexPrimitive2D(data);
+          break;
+
+        case "composite":
+          logger.debug(`Creating Composite shape with data: ${JSON.stringify(data)}`);
+          shape = new ComplexShape2D(data);
+          break;
+
+        default:
+          logger.warn(`Unknown shape type during deserialization: "${type}". Cannot create shape.`);
+          break;
+      }
+
+      if (shape) {
+        if (data?.id) {
+          shape.id = data.id;
+          logger.info(`Shape rehydrated successfully with ID: ${data.id}`);
+        } else {
+          logger.info(`Shape rehydrated successfully without ID`);
+        }
+
+        if (data?.distanceMapperName) {
+          const mapperName = data.distanceMapperName;
+          const entry = distanceMappingRegistry[mapperName];
+          // Guard against 'createMapping', which is a factory, not a mapper function.
+          if (entry && typeof entry === 'function' && mapperName !== 'createMapping') {
+            shape.distanceMapper = entry;
+            logger.debug(`Attached distance mapper: ${mapperName}`);
+          } else {
+            logger.warn(`Distance mapper "${mapperName}" not in registry; using identity.`);
+            shape.distanceMapper = identityMapping;
+          }
+        }
+      }
+
+    } catch (error) {
+      logger.error(`Error deserializing shape of type "${type}": ${error.message}`);
+      shape = null;
+    }
+
+    return shape;
+  }
+}
+
+// Singleton export — all existing import sites require no changes.
+export const stateStore = new StateStore();
+================================================================================
+// FILE: src/utils/affine.js
+================================================================================
+
+/*
+ * utils/affine.js
+ * 
+ * A utility module for 2D affine transformations, compatible with ComplexPrimitive2D,
+ * ComplexShape2D, Face, and Vertex classes. No external dependencies.
+ */
+
+/**
+ * @typedef {Object} Affine
+ * @prop {number} a  - Scale and rotation component (row 1, col 1)
+ * @prop {number} b  - Rotation and shear component (row 1, col 2)
+ * @prop {number} c  - Rotation and shear component (row 2, col 1)
+ * @prop {number} d  - Scale and rotation component (row 2, col 2)
+ * @prop {number} tx - Translation X
+ * @prop {number} ty - Translation Y
+ */
+
+/**
+ * Returns the identity matrix
+ * @returns {Affine}
+ */
+export function identity() {
+    return { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Compute the determinant of an affine matrix: det = a * d - b * c
+   * @param {Affine} M
+   * @returns {number}
+   */
+  export function determinant(M) {
+    return M.a * M.d - M.b * M.c;
+  }
+  
+  /**
+   * Check if an affine transform is invertible (det ≠ 0)
+   * @param {Affine} M
+   * @returns {boolean}
+   */
+  export function isInvertible(M) {
+    return Math.abs(determinant(M)) > Number.EPSILON;
+  }
+  
+  /**
+   * Invert an affine transform. Throws if singular.
+   * @param {Affine} M
+   * @returns {Affine}
+   */
+  export function invertAffine(M) {
+    const det = determinant(M);
+    if (Math.abs(det) < Number.EPSILON) {
+      throw new Error("Cannot invert singular affine matrix");
+    }
+    const invDet = 1 / det;
+    return {
+      a:  M.d * invDet,
+      b: -M.b * invDet,
+      c: -M.c * invDet,
+      d:  M.a * invDet,
+      tx: (M.b * M.ty - M.d * M.tx) * invDet,
+      ty: (M.c * M.tx - M.a * M.ty) * invDet
+    };
+  }
+  
+  /**
+   * Compose two affines: apply M1 then M2 (M2 ∘ M1).
+   * @param {Affine} M2
+   * @param {Affine} M1
+   * @returns {Affine}
+   */
+  export function composeAffine(M2, M1) {
+    return {
+      a:  M2.a * M1.a + M2.b * M1.c,
+      b:  M2.a * M1.b + M2.b * M1.d,
+      c:  M2.c * M1.a + M2.d * M1.c,
+      d:  M2.c * M1.b + M2.d * M1.d,
+      tx: M2.a * M1.tx + M2.b * M1.ty + M2.tx,
+      ty: M2.c * M1.tx + M2.d * M1.ty + M2.ty
+    };
+  }
+  
+  /**
+   * Create a translation affine.
+   * @param {number} x
+   * @param {number} y
+   * @returns {Affine}
+   */
+  export function translate(x = 0, y = 0) {
+    return { a: 1, b: 0, c: 0, d: 1, tx: x, ty: y };
+  }
+  
+  /**
+   * Create a scale affine.
+   * @param {number} sx
+   * @param {number} [sy=sx]
+   * @returns {Affine}
+   */
+  export function scale(sx = 1, sy = sx) {
+    return { a: sx, b: 0, c: 0, d: sy, tx: 0,  ty: 0 };
+  }
+  
+  /**
+   * Create a rotation affine (around origin).
+   * @param {number} theta  Rotation angle in radians
+   * @returns {Affine}
+   */
+  export function rotate(theta = 0) {
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    return { a: cos, b: -sin, c: sin, d: cos, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a horizontal shear affine.
+   * @param {number} shx  Horizontal shear factor
+   * @returns {Affine}
+   */
+  export function shearX(shx = 0) {
+    return { a: 1, b: shx, c: 0, d: 1, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a vertical shear affine.
+   * @param {number} shy  Vertical shear factor
+   * @returns {Affine}
+   */
+  export function shearY(shy = 0) {
+    return { a: 1, b: 0, c: shy, d: 1, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a horizontal reflection (flip around Y axis).
+   * @returns {Affine}
+   */
+  export function reflectX() {
+    return { a: -1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a vertical reflection (flip around X axis).
+   * @returns {Affine}
+   */
+  export function reflectY() {
+    return { a: 1, b: 0, c: 0, d: -1, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a reflection across a line through the origin with the given angle.
+   * @param {number} theta  Angle of the reflection line in radians
+   * @returns {Affine}
+   */
+  export function reflect(theta = 0) {
+    const cos2 = Math.cos(2 * theta);
+    const sin2 = Math.sin(2 * theta);
+    return { a: cos2, b: sin2, c: sin2, d: -cos2, tx: 0, ty: 0 };
+  }
+  
+  /**
+   * Create a combined affine from rotation, uniform scale, and translation.
+   * @param {Object} opts
+   * @param {number} [opts.rotation=0]
+   * @param {number} [opts.scale=1]
+   * @param {{x:number,y:number}} [opts.translate={x:0,y:0}]
+   * @returns {Affine}
+   */
+  export function makeAffine({ rotation = 0, scale: s = 1, translate: { x = 0, y = 0 } = {} } = {}) {
+    const cos = Math.cos(rotation) * s;
+    const sin = Math.sin(rotation) * s;
+    return { a: cos, b: -sin, c: sin, d: cos, tx: x, ty: y };
+  }
+  
+  /**
+   * Apply affine to a point.
+   * @param {{x:number,y:number}} pt
+   * @param {Affine} M
+   * @returns {{x:number,y:number}}
+   */
+  export function applyAffineToPoint(pt, M) {
+    return {
+      x: M.a * pt.x + M.b * pt.y + M.tx,
+      y: M.c * pt.x + M.d * pt.y + M.ty
+    };
+  }
+  
+  /**
+   * Apply affine transform to a Vertex instance in-place.
+   * @param {import("../Geometry/Vertex.js").Vertex} vertex
+   * @param {Affine} M
+   */
+  export function applyAffineToVertex(vertex, M) {
+    const { x, y } = vertex.position;
+    const p = applyAffineToPoint({ x, y }, M);
+    vertex.position.x = p.x;
+    vertex.position.y = p.y;
+  }
+  
+  /**
+   * Apply affine transform to a Face (all its vertices) in-place.
+   * @param {import("../geometry/Face.js").Face} face
+   * @param {Affine} M
+   */
+  export function applyAffineToFace(face, M) {
+    face.vertices.forEach(v => applyAffineToVertex(v, M));
+  }
+  
+  /**
+   * Apply affine transform to an array of points in-place.
+   * @param {Array<{x:number,y:number}>} points
+   * @param {Affine} M
+   */
+  export function applyAffineToPoints(points, M) {
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const newP = applyAffineToPoint(p, M);
+      p.x = newP.x;
+      p.y = newP.y;
+    }
+  }
+  
+  /**
+   * Serialize an affine into an array [a,b,c,d,tx,ty]
+   * @param {Affine} M
+   * @returns {number[]}
+   */
+  export function matrixToArray(M) {
+    return [M.a, M.b, M.c, M.d, M.tx, M.ty];
+  }
+  
+  /**
+   * Deserialize an array into an affine.
+   * @param {number[]} arr  [a, b, c, d, tx, ty]
+   * @returns {Affine}
+   */
+  export function arrayToMatrix(arr) {
+    const [a, b, c, d, tx, ty] = arr;
+    return { a, b, c, d, tx, ty };
+  }
+================================================================================
+// FILE: src/utils/DistanceMapping.js
+================================================================================
+
+// File: src/utils/DistanceMapping.js
+
+/**
+ * Identity mapping: returns the raw distance unchanged.
+ * @param {number} d - Raw distance.
+ * @returns {number}
+ */
+export const identityMapping = d => d;
+
+/**
+ * Creates a polynomial mapping function based on provided coefficients.
+ * For a polynomial f(d) = c0 + c1*d + c2*d^2 + ...
+ * @param {number[]} polyCoeffs - Array of coefficients.
+ * @returns {Function} A function that maps a raw distance.
+ */
+export function createPolynomialMapping(polyCoeffs) {
+  return function(d, t = 0, depth = 0) {
+    return polyCoeffs.reduce((acc, coeff, i) => acc + coeff * Math.pow(d, i), 0);
+  };
+}
+
+/**
+ * Creates an exponential mapping function.
+ * f(d) = a * exp(b * d) + c
+ * @param {number} a - Scaling factor.
+ * @param {number} b - Exponent factor.
+ * @param {number} c - Offset.
+ * @returns {Function} A function that maps a raw distance.
+ */
+export function createExponentialMapping(a = 1, b = 1, c = 0) {
+  return function(d, t = 0, depth = 0) {
+    return a * Math.exp(b * d) + c;
+  };
+}
+
+/**
+ * Creates a logarithmic mapping function.
+ * f(d) = a * log(b * d + c) + e
+ * Prevents log(0) by ensuring argument is positive.
+ * @param {number} a - Scaling factor.
+ * @param {number} b - Internal scaling.
+ * @param {number} c - Prevents log(0) for d=0.
+ * @param {number} e - Offset.
+ * @returns {Function} A function that maps a raw distance.
+ */
+export function createLogarithmicMapping(a = 1, b = 1, c = 1, e = 0) {
+  return function(d, t = 0, depth = 0) {
+    const arg = b * d + c;
+    return arg > 0 ? a * Math.log(arg) + e : e;
+  };
+}
+
+/**
+ * Creates a sinusoidal mapping function.
+ * f(d) = a * sin(b * d + c) + e
+ * @param {number} a - Amplitude.
+ * @param {number} b - Frequency.
+ * @param {number} c - Phase shift.
+ * @param {number} e - Vertical shift.
+ * @returns {Function} A function that maps a raw distance.
+ */
+export function createSinusoidalMapping(a = 1, b = 1, c = 0, e = 0) {
+  return function(d, t = 0, depth = 0) {
+    return a * Math.sin(b * d + c) + e;
+  };
+}
+
+/**
+ * Creates a power mapping function.
+ * f(d) = a * d^b + c
+ * @param {number} a - Scaling factor.
+ * @param {number} b - Power.
+ * @param {number} c - Offset.
+ * @returns {Function} A function that maps a raw distance.
+ */
+export function createPowerMapping(a = 1, b = 2, c = 0) {
+  return function(d, t = 0, depth = 0) {
+    return a * Math.pow(d, b) + c;
+  };
+}
+
+/**
+ * Common easing functions for smooth transitions.
+ */
+export const easingFunctions = {
+  // Quadratic easing
+  easeInQuad: (d, t = 0, depth = 0) => d * d,
+  easeOutQuad: (d, t = 0, depth = 0) => d * (2 - d),
+  easeInOutQuad: (d, t = 0, depth = 0) => d < 0.5 ? 2 * d * d : -1 + (4 - 2 * d) * d,
+  
+  // Cubic easing
+  easeInCubic: (d, t = 0, depth = 0) => d * d * d,
+  easeOutCubic: (d, t = 0, depth = 0) => (--d) * d * d + 1,
+  easeInOutCubic: (d, t = 0, depth = 0) => d < 0.5 ? 4 * d * d * d : (d - 1) * (2 * d - 2) * (2 * d - 2) + 1,
+  
+  // Elastic
+  easeInElastic: (d, t = 0, depth = 0) => {
+    const c4 = (2 * Math.PI) / 3;
+    return d === 0 ? 0 : d === 1 ? 1 : -Math.pow(2, 10 * d - 10) * Math.sin((d * 10 - 10.75) * c4);
+  },
+  easeOutElastic: (d, t = 0, depth = 0) => {
+    const c4 = (2 * Math.PI) / 3;
+    return d === 0 ? 0 : d === 1 ? 1 : Math.pow(2, -10 * d) * Math.sin((d * 10 - 0.75) * c4) + 1;
+  },
+  
+  // Bounce
+  easeOutBounce: (d, t = 0, depth = 0) => {
+    const n1 = 7.5625;
+    const d1 = 2.75;
+    
+    if (d < 1 / d1) {
+      return n1 * d * d;
+    } else if (d < 2 / d1) {
+      return n1 * (d -= 1.5 / d1) * d + 0.75;
+    } else if (d < 2.5 / d1) {
+      return n1 * (d -= 2.25 / d1) * d + 0.9375;
+    } else {
+      return n1 * (d -= 2.625 / d1) * d + 0.984375;
+    }
+  }
+};
+
+/**
+ * Creates a composite distance mapper by combining two mapping functions.
+ * @param {Function} mapperA - First distance mapper.
+ * @param {Function} mapperB - Second distance mapper.
+ * @param {Function} combiner - Function that combines the two mapped distances.
+ * @returns {Function} A composite mapping function.
+ */
+export function createCompositeMapping(mapperA, mapperB, combiner) {
+  return function(d, t = 0, depth = 0) {
+    const resultA = mapperA(d, t, depth);
+    const resultB = mapperB(d, t, depth);
+    return combiner(resultA, resultB, t);
+  };
+}
+
+/**
+ * Common combining functions for composite mappers.
+ */
+export const combiningFunctions = {
+  add: (a, b) => a + b,
+  subtract: (a, b) => a - b,
+  multiply: (a, b) => a * b,
+  divide: (a, b) => b !== 0 ? a / b : a,
+  min: (a, b) => Math.min(a, b),
+  max: (a, b) => Math.max(a, b),
+  average: (a, b) => (a + b) / 2,
+  smoothMin: (a, b, k = 1) => {
+    const h = Math.max(k - Math.abs(a - b), 0) / k;
+    return Math.min(a, b) - h * h * h * k * (1/6);
+  },
+  // New timed combiner that transitions between two values based on time
+  lerp: (a, b, t) => (1 - t) * a + t * b
+};
+
+/**
+ * Creates a periodic mapping function using mod operation.
+ * @param {Function} baseMapper - Base distance mapper to apply periodically.
+ * @param {number} period - The period length.
+ * @returns {Function} A periodic mapping function.
+ */
+export function createPeriodicMapping(baseMapper, period = 1) {
+  return function(d, t = 0, depth = 0) {
+    return baseMapper(d % period, t, depth);
+  };
+}
+
+/**
+ * Creates a temporal mapping function that changes with time parameter.
+ * @param {Function} baseMapper - Base distance mapper to apply.
+ * @param {number} frequency - Frequency of temporal oscillation.
+ * @param {number} amplitude - Amplitude of temporal effect.
+ * @returns {Function} A time-varying mapping function.
+ */
+export function createTemporalMapping(baseMapper, frequency = 1, amplitude = 1) {
+  return function(d, t = 0, depth = 0) {
+    const timeFactor = Math.sin(t * frequency * 2 * Math.PI);
+    const base = baseMapper(d, t, depth);
+    const result = base * (1 + timeFactor * amplitude);
+
+    // console.log(`[TemporalMapping] d=${d}, t=${t.toFixed(2)}, base=${base.toFixed(3)}, timeFactor=${timeFactor.toFixed(3)}, result=${result.toFixed(3)}`);
+
+    return result;
+  };
+}
+
+
+/**
+ * Creates a recursive mapping function that applies the mapper to its own output.
+ * @param {Function} baseMapper - Base distance mapper to apply recursively.
+ * @param {number} iterations - Number of recursive iterations.
+ * @param {number} strength - Strength factor to control recursive effect.
+ * @returns {Function} A recursive mapping function.
+ */
+export function createRecursiveMapping(baseMapper, iterations = 2, strength = 0.5) {
+  return function(d, t = 0, depth = 0) {
+    let result = d;
+    for (let i = 0; i < iterations; i++) {
+      result = baseMapper(result, t, depth + 1) * strength + (1 - strength) * result;
+    }
+    return result;
+  };
+}
+
+/**
+ * Creates a sequential mapping function that cycles through an array of mappers.
+ * @param {Function[]} mappers - Array of mapping functions to cycle through.
+ * @param {number} frequency - Frequency of cycling (cycles per time unit).
+ * @returns {Function} A sequential mapping function.
+ */
+export function createSequentialMapping(mappers, frequency = 1) {
+  return function(d, t = 0, depth = 0) {
+    const index = Math.floor((t * frequency) % mappers.length);
+    return mappers[index](d, t, depth);
+  };
+}
+
+/**
+ * Creates a blended mapping function that interpolates between two mappers.
+ * @param {Function} mapperA - First distance mapper.
+ * @param {Function} mapperB - Second distance mapper.
+ * @param {number|Function} blendFactor - Static blend factor or time-based function.
+ * @returns {Function} A blended mapping function.
+ */
+export function createBlendedMapping(mapperA, mapperB, blendFactor = 0.5) {
+  return function(d, t = 0, depth = 0) {
+    const blend = typeof blendFactor === 'function' ? blendFactor(t) : blendFactor;
+    const resultA = mapperA(d, t, depth);
+    const resultB = mapperB(d, t, depth);
+    return (1 - blend) * resultA + blend * resultB;
+  };
+}
+
+/**
+ * Dynamic mapping factory function that creates mappings based on type and options.
+ * @param {string} mappingType - Type of mapping to create.
+ * @param {Object} options - Configuration options for the mapping.
+ * @returns {Function} A distance mapping function.
+ */
+export function createMapping(mappingType, options = {}) {
+  const { 
+    baseMapper, 
+    baseMappers = [], 
+    blendFactor = 0.5, 
+    frequency = 1, 
+    amplitude = 0.5,
+    iterations = 2,
+    strength = 0.5,
+    polyCoeffs = [0, 1, 0],  // Default to linear
+    a = 1, 
+    b = 1, 
+    c = 0, 
+    e = 0,
+    period = 1,
+    combiner = combiningFunctions.add
+  } = options;
+
+  switch (mappingType.toLowerCase()) {
+    case "identity":
+      return identityMapping;
+      
+    case "polynomial":
+      return createPolynomialMapping(polyCoeffs);
+      
+    case "exponential":
+      return createExponentialMapping(a, b, c);
+      
+    case "logarithmic":
+      return createLogarithmicMapping(a, b, c, e);
+      
+    case "sinusoidal":
+      return createSinusoidalMapping(a, b, c, e);
+      
+    case "power":
+      return createPowerMapping(a, b, c);
+      
+    case "composite":
+      if (!baseMappers[0] || !baseMappers[1]) {
+        console.warn("Missing mappers for composite mapping. Using identity.");
+        return identityMapping;
+      }
+      return createCompositeMapping(baseMappers[0], baseMappers[1], combiner);
+      
+    case "periodic":
+      if (!baseMapper) {
+        console.warn("Missing base mapper for periodic mapping. Using identity.");
+        return identityMapping;
+      }
+      return createPeriodicMapping(baseMapper, period);
+      
+    case "temporal":
+      if (!baseMapper) {
+        console.warn("Missing base mapper for temporal mapping. Using identity.");
+        return identityMapping;
+      }
+      return createTemporalMapping(baseMapper, frequency, amplitude);
+      
+    case "recursive":
+      if (!baseMapper) {
+        console.warn("Missing base mapper for recursive mapping. Using identity.");
+        return identityMapping;
+      }
+      return createRecursiveMapping(baseMapper, iterations, strength);
+      
+    case "sequential":
+      if (baseMappers.length === 0) {
+        console.warn("No mappers provided for sequential mapping. Using identity.");
+        return identityMapping;
+      }
+      return createSequentialMapping(baseMappers, frequency);
+      
+    case "blended":
+      if (!baseMappers[0] || !baseMappers[1]) {
+        console.warn("Missing mappers for blended mapping. Using identity.");
+        return identityMapping;
+      }
+      return createBlendedMapping(baseMappers[0], baseMappers[1], blendFactor);
+      
+    default:
+      console.warn(`Unknown mapping type: ${mappingType}. Using identity mapping.`);
+      return identityMapping;
+  }
+}
+
+/**
+ * Registry of available distance mapping functions.
+ */
+export const distanceMappingRegistry = {
+  identity: identityMapping,
+  polynomial: createPolynomialMapping([0, 1, 0]),  // Linear by default
+  exponential: createExponentialMapping(),
+  logarithmic: createLogarithmicMapping(),
+  sinusoidal: createSinusoidalMapping(),
+  power: createPowerMapping(),
+  easeInQuad: easingFunctions.easeInQuad,
+  easeOutQuad: easingFunctions.easeOutQuad,
+  easeInOutQuad: easingFunctions.easeInOutQuad,
+  easeInCubic: easingFunctions.easeInCubic,
+  easeOutCubic: easingFunctions.easeOutCubic,
+  easeInOutCubic: easingFunctions.easeInOutCubic,
+  easeInElastic: easingFunctions.easeInElastic,
+  easeOutElastic: easingFunctions.easeOutElastic,
+  easeOutBounce: easingFunctions.easeOutBounce,
+  
+  // Add the dynamic mapping creator to the registry
+  createMapping: createMapping
+};
+================================================================================
+// FILE: src/utils/logger.js
+================================================================================
+
+// File: src/utils/logger.js
+
+export const logger = {
+    info(message) {
+      console.info(`[INFO] ${message}`);
+    },
+    debug(message) {
+      console.debug(`[DEBUG] ${message}`);
+    },
+    warn(message) {
+      console.warn(`[WARN] ${message}`);
+    },
+    error(message) {
+      console.error(`[ERROR] ${message}`);
+    }
+  };
+  
+================================================================================
+// FILE: src/utils/meshCreator.js
+================================================================================
+
+// File: src/utils/meshCreator.js
+// A unified mesh-generation utility: 2D isolines, 3D isosurfaces, Delaunay, and curve/arc fitting
+
+import * as THREE from 'three';
+// instead of objects/…
+import { MarchingCubes } from 'three/examples/jsm/objects/MarchingCubes.js';
+
+
+import Delaunator from 'delaunator';
+import { logger } from './logger.js';
+
+/**
+ * Marching Squares: extract 2D contour lines from an SDF function
+ * @param {Function} sdfFn  -- (point:{x,y}) → signed distance
+ * @param {Array<number>} bounds -- [xmin,ymin,xmax,ymax]
+ * @param {number} resolution -- number of cells per axis
+ * @returns {Array<Array<{x:number,y:number}>>} array of contour loops
+ */
+export function marchingSquares(sdfFn, bounds, resolution = 100) {
+  logger.info(`Starting marching squares with resolution: ${resolution}`);
+  logger.debug(`Bounds: [${bounds.join(', ')}]`);
+  
+  const [xmin, ymin, xmax, ymax] = bounds;
+  const dx = (xmax - xmin) / resolution;
+  const dy = (ymax - ymin) / resolution;
+  
+  // Precompute grid of SDF values
+  logger.debug('Computing SDF grid...');
+  const grid = [];
+  let minSDF = Infinity;
+  let maxSDF = -Infinity;
+  
+  for (let j = 0; j <= resolution; j++) {
+    const row = [];
+    const y = ymin + j * dy;
+    for (let i = 0; i <= resolution; i++) {
+      const x = xmin + i * dx;
+      const value = sdfFn({ x, y });
+      
+      // Track min/max for debugging
+      minSDF = Math.min(minSDF, value);
+      maxSDF = Math.max(maxSDF, value);
+      
+      row.push(value);
+    }
+    grid.push(row);
+  }
+  
+  logger.debug(`Grid computation complete. Size: ${grid.length}x${grid[0].length}`);
+  logger.debug(`SDF value range: [${minSDF.toFixed(4)}, ${maxSDF.toFixed(4)}]`);
+  
+  // If all values are on the same side of the contour, we won't find any contours
+  if ((minSDF >= 0 && maxSDF >= 0) || (minSDF <= 0 && maxSDF <= 0)) {
+    logger.warn('All SDF values are on the same side of zero. No contours will be found.');
+    return [];
+  }
+
+  // All possible marching squares edge configurations
+  // Each entry maps to the edges that the contour passes through
+  // Format: [start_edge, end_edge] where edges are numbered 0-3:
+  // 0: bottom edge, 1: right edge, 2: top edge, 3: left edge
+  const edgeTable = {
+    1: [[3, 0]], // Bottom-left corner is inside
+    2: [[0, 1]], // Bottom-right corner is inside
+    3: [[3, 1]], // Bottom edge is inside
+    4: [[1, 2]], // Top-right corner is inside
+    5: [[3, 2], [1, 0]], // Ambiguous case - diagonal (bottom-left and top-right)
+    6: [[0, 2]], // Right edge is inside
+    7: [[3, 2]], // Everything except top-left is inside
+    8: [[2, 3]], // Top-left corner is inside
+    9: [[2, 0]], // Left edge is inside
+    10: [[2, 1], [3, 0]], // Ambiguous case - diagonal (top-left and bottom-right)
+    11: [[2, 1]], // Everything except top-right is inside
+    12: [[1, 3]], // Top edge is inside
+    13: [[1, 0]], // Everything except bottom-right is inside
+    14: [[0, 3]], // Everything except bottom-left is inside
+    // 0 and 15 are not in the table (all outside or all inside)
+  };
+
+  // Calculate linear interpolation along an edge
+  function interpolate(edge, i, j, value1, value2) {
+    const t = value1 / (value1 - value2); // Linear interpolation factor
+    
+    // Calculate position based on which edge we're on
+    switch(edge) {
+      case 0: // Bottom edge: (i,j) to (i+1,j)
+        return { 
+          x: xmin + (i + t) * dx, 
+          y: ymin + j * dy 
+        };
+      case 1: // Right edge: (i+1,j) to (i+1,j+1)
+        return { 
+          x: xmin + (i + 1) * dx, 
+          y: ymin + (j + t) * dy 
+        };
+      case 2: // Top edge: (i+1,j+1) to (i,j+1)
+        return { 
+          x: xmin + (i + 1 - t) * dx, 
+          y: ymin + (j + 1) * dy 
+        };
+      case 3: // Left edge: (i,j+1) to (i,j)
+        return { 
+          x: xmin + i * dx, 
+          y: ymin + (j + 1 - t) * dy 
+        };
+    }
+  }
+
+  // Generate a lookup table for all cells and their edge crossings
+  const cellCrossings = [];
+  
+  for (let j = 0; j < resolution; j++) {
+    cellCrossings[j] = [];
+    for (let i = 0; i < resolution; i++) {
+      // Get the values at the four corners of the cell
+      const values = [
+        grid[j][i],       // Bottom-left
+        grid[j][i+1],     // Bottom-right
+        grid[j+1][i+1],   // Top-right
+        grid[j+1][i]      // Top-left
+      ];
+      
+      // Calculate the cell case (0-15)
+      let caseIndex = 0;
+      for (let k = 0; k < 4; k++) {
+        if (values[k] < 0) {
+          caseIndex |= (1 << k);
+        }
+      }
+      
+      // Store the cell's case index and interpolated edge positions
+      const cell = { 
+        caseIndex,
+        edges: []
+      };
+      
+      // Look up the edge crossings for this case
+      const edgePairs = edgeTable[caseIndex];
+      if (edgePairs) {
+        // For each edge pair, calculate the crossing points
+        for (const [edge1, edge2] of edgePairs) {
+          // Calculate each edge's interpolated point
+          const edgeCorners = [[0, 1], [1, 2], [2, 3], [3, 0]];
+          
+          const [c1, c2] = edgeCorners[edge1];
+          const pt1 = interpolate(
+            edge1, i, j, 
+            values[c1], values[c2]
+          );
+          
+          const [c3, c4] = edgeCorners[edge2];
+          const pt2 = interpolate(
+            edge2, i, j,
+            values[c3], values[c4]
+          );
+          
+          cell.edges.push([pt1, pt2, edge1, edge2]);
+        }
+      }
+      
+      cellCrossings[j][i] = cell;
+    }
+  }
+  
+  logger.debug('Cell crossings computed');
+  
+  // Count cells with contour crossings
+  let cellsWithCrossings = 0;
+  for (let j = 0; j < resolution; j++) {
+    for (let i = 0; i < resolution; i++) {
+      if (cellCrossings[j][i].edges.length > 0) {
+        cellsWithCrossings++;
+      }
+    }
+  }
+  
+  logger.debug(`Cells with contour crossings: ${cellsWithCrossings}`);
+  
+  // If we have no crossings, return empty result
+  if (cellsWithCrossings === 0) {
+    logger.info('No contour crossings found in grid');
+    return [];
+  }
+  
+  // ── Contour tracing ───────────────────────────────────────────────────────
+  //
+  // Each interior grid edge is shared by exactly two cells.  Given a segment
+  // that exits through edge N of cell (ci, cj), the continuation is always
+  // found in a specific neighbour at a specific entry edge:
+  //
+  //   exit edge 0 (bottom) → cell (ci,   cj-1), entry edge 2 (top)
+  //   exit edge 1 (right)  → cell (ci+1, cj),   entry edge 3 (left)
+  //   exit edge 2 (top)    → cell (ci,   cj+1), entry edge 0 (bottom)
+  //   exit edge 3 (left)   → cell (ci-1, cj),   entry edge 1 (right)
+  //
+  // This is O(1) per step and works in all four cardinal directions.
+
+  // [di, dj, entryEdge]
+  const NEXT = {
+    0: [ 0, -1, 2],
+    1: [ 1,  0, 3],
+    2: [ 0,  1, 0],
+    3: [-1,  0, 1]
+  };
+
+  const contours = [];
+  // visited key: `${i},${j},${segmentIndex}`
+  const visited = new Set();
+
+  for (let j = 0; j < resolution; j++) {
+    for (let i = 0; i < resolution; i++) {
+      const cell = cellCrossings[j][i];
+      if (cell.edges.length === 0) continue;
+
+      for (let e = 0; e < cell.edges.length; e++) {
+        const startKey = `${i},${j},${e}`;
+        if (visited.has(startKey)) continue;
+
+        // Start a new contour from this unvisited segment
+        const contour = [];
+        visited.add(startKey);
+
+        const [pt1, pt2, , exitEdge0] = cell.edges[e];
+        contour.push(pt1, pt2);
+
+        let ci       = i;
+        let cj       = j;
+        let exitEdge = exitEdge0;
+
+        // Follow the chain until we close the loop or hit a boundary
+        const MAX_STEPS = resolution * resolution * 2;
+        for (let step = 0; step < MAX_STEPS; step++) {
+          const [di, dj, entryEdge] = NEXT[exitEdge];
+          const ni = ci + di;
+          const nj = cj + dj;
+
+          // Out of bounds → open contour, stop
+          if (ni < 0 || ni >= resolution || nj < 0 || nj >= resolution) break;
+
+          const neighbour = cellCrossings[nj][ni];
+          if (neighbour.edges.length === 0) break;
+
+          // Find the segment in the neighbour whose entry edge matches
+          let found = false;
+          for (let ne = 0; ne < neighbour.edges.length; ne++) {
+            const nKey = `${ni},${nj},${ne}`;
+            const [, , neighbourEntry, neighbourExit] = neighbour.edges[ne];
+
+            if (neighbourEntry !== entryEdge) continue;
+
+            // Loop closed — the exit point connects back to our start
+            if (visited.has(nKey)) {
+              // Only close if this really is our start cell
+              if (ni === i && nj === j && ne === e) {
+                contour.push(contour[0]); // close the loop
+              }
+              found = true;
+              break;
+            }
+
+            visited.add(nKey);
+            contour.push(neighbour.edges[ne][1]); // push pt2
+            exitEdge = neighbourExit;
+            ci = ni;
+            cj = nj;
+            found = true;
+            break;
+          }
+
+          if (!found) break; // boundary or saddle dead-end
+        }
+
+        if (contour.length > 2) {
+          contours.push(contour);
+        }
+      }
+    }
+  }
+
+  logger.info(`Marching squares completed. Found ${contours.length} contours.`);
+  return contours;
+}
+
+/**
+ * Marching Cubes: extract 3D isosurface from a volumetric SDF
+ * @param {Function} sdfFn3D -- (pt:{x,y,z})→number
+ * @param {Array<number>} bounds3D -- [xmin,ymin,zmin,xmax,ymax,zmax]
+ * @param {number} resolution -- grid resolution per axis
+ * @param {Object} options -- additional options
+ * @param {number} [options.isoLevel=0] -- the isovalue to extract (0 for surface)
+ * @param {boolean} [options.useThreeMC=true] -- use Three.js MarchingCubes or custom impl
+ * @returns {THREE.Mesh|{vertices:Float32Array, indices:Uint32Array}} mesh or buffer data
+ */
+export function marchingCubes(sdfFn3D, bounds3D, resolution = 50, options = {}) {
+  logger.info(`Starting marching cubes with resolution: ${resolution}`);
+  logger.debug(`Bounds: [${bounds3D.join(', ')}]`);
+  logger.debug(`Options: ${JSON.stringify(options)}`);
+  
+  const [xmin, ymin, zmin, xmax, ymax, zmax] = bounds3D;
+  const isoLevel = options.isoLevel !== undefined ? options.isoLevel : 0;
+  const useThreeMC = options.useThreeMC !== undefined ? options.useThreeMC : true;
+  
+  // Use Three.js MarchingCubes implementation if requested (default)
+  if (useThreeMC) {
+    logger.debug('Using Three.js MarchingCubes implementation');
+    // Create a MarchingCubes object with the resolution
+    const size = Math.max(xmax - xmin, ymax - ymin, zmax - zmin);
+    const mc = new MarchingCubes(resolution, new THREE.MeshBasicMaterial(), true, true);
+    
+    // Position and scale the marching cubes object to match the bounds
+    mc.position.set(
+      (xmin + xmax) / 2,
+      (ymin + ymax) / 2,
+      (zmin + zmax) / 2
+    );
+    mc.scale.set(size / 2, size / 2, size / 2);
+    
+    // Fill mc.field — Three.js MarchingCubes indexes as: k*size² + j*size + i
+    const size2 = resolution * resolution;
+    logger.debug('Filling grid with SDF values...');
+    
+    let minSDF = Infinity;
+    let maxSDF = -Infinity;
+    
+    for (let k = 0; k < resolution; k++) {
+      const z = zmin + (k / (resolution - 1)) * (zmax - zmin);
+      for (let j = 0; j < resolution; j++) {
+        const y = ymin + (j / (resolution - 1)) * (ymax - ymin);
+        for (let i = 0; i < resolution; i++) {
+          const x = xmin + (i / (resolution - 1)) * (xmax - xmin);
+          const value = sdfFn3D({ x, y, z });
+          minSDF = Math.min(minSDF, value);
+          maxSDF = Math.max(maxSDF, value);
+          mc.field[k * size2 + j * resolution + i] = value;
+        }
+      }
+    }
+    
+    logger.debug(`SDF value range: [${minSDF.toFixed(4)}, ${maxSDF.toFixed(4)}]`);
+    
+    mc.isolation = isoLevel;
+    mc.update();
+    logger.info(`Marching cubes completed.`);
+    
+    return mc;
+  } 
+  
+  // Alternative: Use web-worker compatible implementation
+  // This code would be used if Three.js MarchingCubes is not available or desired
+  else {
+    logger.debug('Using custom marching cubes implementation');
+    // Create a grid of SDF values
+    const dx = (xmax - xmin) / resolution;
+    const dy = (ymax - ymin) / resolution;
+    const dz = (zmax - zmin) / resolution;
+    
+    const grid = new Float32Array((resolution + 1) * (resolution + 1) * (resolution + 1));
+    
+    // Fill the grid with SDF values
+    logger.debug('Filling grid with SDF values...');
+    for (let i = 0; i <= resolution; i++) {
+      const x = xmin + i * dx;
+      for (let j = 0; j <= resolution; j++) {
+        const y = ymin + j * dy;
+        for (let k = 0; k <= resolution; k++) {
+          const z = zmin + k * dz;
+          const idx = i + j * (resolution + 1) + k * (resolution + 1) * (resolution + 1);
+          grid[idx] = sdfFn3D({ x, y, z });
+        }
+      }
+    }
+    
+    logger.debug('Grid computation complete');
+    
+    // Use a simple marching cubes implementation
+    // This is a simplified version - in production use a more robust implementation
+    // or a library like isosurface or regl-iso-surface
+    
+    // Pre-allocate memory for vertices and indices
+    const vertices = [];
+    const indices = [];
+    
+    logger.debug('Processing grid cells to extract isosurface...');
+    // Process each cube in the grid
+    for (let i = 0; i < resolution; i++) {
+      for (let j = 0; j < resolution; j++) {
+        for (let k = 0; k < resolution; k++) {
+          // Get the 8 corners of the cube
+          const v = [];
+          for (let l = 0; l < 8; l++) {
+            const ii = i + ((l & 1) > 0 ? 1 : 0);
+            const jj = j + ((l & 2) > 0 ? 1 : 0);
+            const kk = k + ((l & 4) > 0 ? 1 : 0);
+            const idx = ii + jj * (resolution + 1) + kk * (resolution + 1) * (resolution + 1);
+            v.push(grid[idx]);
+          }
+          
+          // Determine which edges have the isosurface crossing them
+          // This is where we would use the edge table lookup in a full implementation
+          
+          // Process cube based on the configuration (simplified)
+          // In production, use the full marching cubes tables here
+        }
+      }
+    }
+    
+    logger.info(`Custom marching cubes completed. Generated ${vertices.length / 3} vertices.`);
+    
+    // Return raw buffer data
+    return {
+      vertices: new Float32Array(vertices),
+      indices: new Uint32Array(indices)
+    };
+  }
+}
+
+/**
+ * Delaunay triangulation using Delaunator library
+ * @param {Array<{x:number,y:number}>} points
+ * @returns {{ vertices: Float32Array, indices: Uint32Array }} flat buffer data ready for Three.js
+ */
+export function delaunayTriangulation(points) {
+  logger.info(`Starting Delaunay triangulation with ${points?.length || 0} points`);
+  
+  if (!points || points.length < 3) {
+    logger.error('Delaunay triangulation requires at least 3 points');
+    throw new Error('Delaunay triangulation requires at least 3 points');
+  }
+  
+  // Format points for Delaunator (flat array [x0, y0, x1, y1, ...])
+  const coords = [];
+  for (const pt of points) {
+    coords.push(pt.x, pt.y);
+  }
+  
+  // Compute Delaunay triangulation
+  logger.debug('Computing Delaunay triangulation...');
+  const delaunay = Delaunator.from(coords);
+  
+  logger.debug(`Triangulation completed. Generated ${delaunay.triangles.length / 3} triangles.`);
+  
+  // Extract vertices and triangle indices
+  const vertices = new Float32Array(coords.length + points.length); // x,y,z for each vertex
+  for (let i = 0; i < points.length; i++) {
+    vertices[i * 3] = points[i].x;     // x
+    vertices[i * 3 + 1] = points[i].y; // y
+    vertices[i * 3 + 2] = 0;           // z (assuming 2D, set to 0)
+  }
+  
+  logger.info('Delaunay triangulation completed successfully');
+  
+  // Return vertices and triangulation indices
+  return {
+    vertices,
+    indices: new Uint32Array(delaunay.triangles)
+  };
+}
+
+/**
+ * Creates a THREE.BufferGeometry from Delaunay triangulation
+ * @param {Array<{x:number,y:number}>} points
+ * @returns {THREE.BufferGeometry}
+ */
+export function createDelaunayGeometry(points) {
+  logger.info(`Creating Delaunay geometry from ${points?.length || 0} points`);
+  
+  const { vertices, indices } = delaunayTriangulation(points);
+  
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  
+  // Compute normals for proper lighting
+  logger.debug('Computing vertex normals...');
+  geometry.computeVertexNormals();
+  
+  logger.info('Delaunay geometry created successfully');
+  return geometry;
+}
+
+/**
+ * Curve fitting & arc reconstruction
+ * @param {Array<{x:number,y:number}>} points  points along a smooth curve
+ * @param {Object} options - Additional options
+ * @param {number} [options.minArcRadius=1e-6] - Minimum radius to consider valid
+ * @param {number} [options.maxArcRadius=1e6] - Maximum radius to consider valid
+ * @returns {Array<{cx:number,cy:number,r:number,start:number,end:number}>} arcs
+ */
+export function fitArcs(points, options = {}) {
+  logger.info(`Starting arc fitting with ${points?.length || 0} points`);
+  logger.debug(`Options: ${JSON.stringify(options)}`);
+  
+  if (!points || points.length < 3) {
+    logger.warn('Insufficient points for arc fitting (minimum 3 required)');
+    return [];
+  }
+  
+  const minArcRadius = options.minArcRadius || 1e-6;
+  const maxArcRadius = options.maxArcRadius || 1e6;
+  
+  const arcs = [];
+  // Process points in groups of 3 to fit circular arcs
+  logger.debug('Processing point triplets to fit arcs...');
+  
+  let skippedCollinear = 0;
+  let skippedRadiusLimit = 0;
+  let arcsFitted = 0;
+  
+  for (let i = 0; i + 2 < points.length; i += 2) {
+    const A = points[i], B = points[i+1], C = points[i+2];
+    
+    // Calculate the circumcircle of these three points
+    const a = B.x - A.x, b = B.y - A.y;
+    const c = C.x - A.x, d = C.y - A.y;
+    const e = a*(A.x+B.x) + b*(A.y+B.y);
+    const f = c*(A.x+C.x) + d*(A.y+C.y);
+    const g = 2*(a*(C.y-B.y) - b*(C.x-B.x));
+    
+    // Skip if the points are nearly collinear (g is close to zero)
+    if (Math.abs(g) < 1e-6) {
+      skippedCollinear++;
+      continue;
+    }
+    
+    // Calculate center and radius
+    const cx = (d*e - b*f)/g;
+    const cy = (a*f - c*e)/g;
+    const r = Math.hypot(A.x-cx, A.y-cy);
+    
+    // Skip arcs with extreme radii
+    if (r < minArcRadius || r > maxArcRadius) {
+      skippedRadiusLimit++;
+      continue;
+    }
+    
+    // Calculate start and end angles
+    const start = Math.atan2(A.y-cy, A.x-cx);
+    const end = Math.atan2(C.y-cy, C.x-cx);
+    
+    // Check that B is actually on this arc between A and C
+    const angleB = Math.atan2(B.y-cy, B.x-cx);
+    
+    // Determine if the arc goes clockwise or counterclockwise
+    let isOnArc = false;
+    if (start < end) {
+      isOnArc = (start < angleB && angleB < end);
+    } else {
+      isOnArc = (start < angleB || angleB < end);
+    }
+    
+    if (isOnArc) {
+      arcs.push({ cx, cy, r, start, end });
+      arcsFitted++;
+    }
+  }
+  
+  logger.debug(`Arc fitting statistics: ${arcsFitted} arcs fitted, ${skippedCollinear} skipped (collinear), ${skippedRadiusLimit} skipped (radius limits)`);
+  logger.info(`Arc fitting completed. Generated ${arcs.length} arcs.`);
+  
+  return arcs;
+}
+
+/**
+ * Creates a THREE.Line or LineSegments from arcs
+ * @param {Array<{cx:number,cy:number,r:number,start:number,end:number}>} arcs
+ * @param {Object} options - Rendering options
+ * @param {number} [options.segments=32] - Segments per arc
+ * @param {THREE.Material} [options.material] - Material to use
+ * @returns {THREE.Object3D} Line segments or curve
+ */
+export function createArcObject(arcs, options = {}) {
+  logger.info(`Creating arc object with ${arcs?.length || 0} arcs`);
+  logger.debug(`Options: segments=${options.segments || 32}`);
+  
+  const segments = options.segments || 32;
+  const material = options.material || new THREE.LineBasicMaterial({ color: 0xffffff });
+  
+  const points = [];
+  
+  arcs.forEach(arc => {
+    let startAngle = arc.start;
+    let endAngle = arc.end;
+    
+    // Ensure proper winding - always go counterclockwise
+    if (endAngle < startAngle) {
+      endAngle += Math.PI * 2;
+    }
+    
+    // Generate points along the arc
+    for (let i = 0; i <= segments; i++) {
+      const angle = startAngle + (endAngle - startAngle) * (i / segments);
+      const x = arc.cx + arc.r * Math.cos(angle);
+      const y = arc.cy + arc.r * Math.sin(angle);
+      points.push(new THREE.Vector3(x, y, 0));
+    }
+  });
+  
+  logger.debug(`Generated ${points.length} points for arc visualization`);
+  
+  // Create geometry from points
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  logger.info('Arc object created successfully');
+  
+  return new THREE.Line(geometry, material);
+}
+
+/**
+ * Three.js helper: build a LineSegments geometry from 2D contours
+ * @param {Array<Array<{x:number,y:number}>>} contours
+ * @param {Object} options - Additional options
+ * @param {boolean} [options.close=false] - Whether to close each contour loop
+ * @returns {THREE.BufferGeometry}
+ */
+export function buildLineSegments(contours, options = {}) {
+  logger.info(`Building line segments from ${contours?.length || 0} contours`);
+  
+  const close = options.close !== undefined ? options.close : false;
+  logger.debug(`Options: close=${close}`);
+  
+  // Convert contours to flat array of vertices
+  let verts = [];
+  
+  contours.forEach((loop, idx) => {
+    if (loop.length < 2) {
+      logger.debug(`Skipping contour #${idx} with insufficient points (${loop.length})`);
+      return;
+    }
+    
+    const startingVertCount = verts.length / 3;
+    
+    // Add line segments between consecutive points
+    for (let i = 0; i < loop.length - 1; i++) {
+      verts.push(loop[i].x, loop[i].y, 0);
+      verts.push(loop[i+1].x, loop[i+1].y, 0);
+    }
+    
+    // Optionally close the loop
+    if (close && loop.length > 2) {
+      verts.push(loop[loop.length-1].x, loop[loop.length-1].y, 0);
+      verts.push(loop[0].x, loop[0].y, 0);
+    }
+    
+    logger.debug(`Contour #${idx}: Added ${(verts.length/3 - startingVertCount)/2} line segments`);
+  });
+  
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  
+  logger.info(`Line segments built successfully with ${verts.length/3} vertices (${verts.length/6} segments)`);
+  return geometry;
+}
+
+/**
+ * Creates a filled mesh from 2D contours using triangulation
+ * @param {Array<Array<{x:number,y:number}>>} contours
+ * @returns {THREE.Mesh} Triangulated mesh
+ */
+export function createContourMesh(contours) {
+  logger.info(`Creating contour mesh from ${contours?.length || 0} contours`);
+  
+  // Flatten all contours into a single list of points
+  const allPoints = [];
+  contours.forEach((loop, idx) => {
+    logger.debug(`Contour #${idx}: ${loop.length} points`);
+    allPoints.push(...loop);
+  });
+  
+  logger.debug(`Total points for triangulation: ${allPoints.length}`);
+  
+  // If we have enough points, triangulate
+  if (allPoints.length >= 3) {
+    logger.debug('Creating Delaunay geometry from contour points');
+    const geometry = createDelaunayGeometry(allPoints);
+    
+    logger.info('Contour mesh created successfully');
+    return new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ 
+      color: 0x3366ff,
+      side: THREE.DoubleSide
+    }));
+  }
+  
+  // Fallback for insufficient points
+  logger.warn('Insufficient points for triangulation, creating empty mesh');
+  return new THREE.Mesh(
+    new THREE.PlaneGeometry(0, 0),
+    new THREE.MeshBasicMaterial()
+  );
+}
+
+/**
+ * Create a 3D mesh from a SchurComposition or other SDF primitive
+ * @param {Object} sdfObject - Object with computeSDF method
+ * @param {Array<number>} bounds - Bounds [xmin,ymin,zmin,xmax,ymax,zmax]
+ * @param {Object} options - Additional options
+ * @param {number} [options.resolution=32] - Grid resolution
+ * @param {boolean} [options.wireframe=false] - Show wireframe
+ * @param {number} [options.isoLevel=0] - Isosurface level
+ * @returns {THREE.Mesh} 3D mesh representing the isosurface
+ */
+export function createSDFMesh(sdfObject, bounds, options = {}) {
+  logger.info('Creating SDF mesh');
+  logger.debug(`Bounds: [${bounds.join(', ')}]`);
+  logger.debug(`Options: ${JSON.stringify(options)}`);
+  
+  const resolution = options.resolution || 32;
+  const wireframe = options.wireframe !== undefined ? options.wireframe : false;
+  const isoLevel = options.isoLevel !== undefined ? options.isoLevel : 0;
+  
+  // Create SDF function wrapper
+  const sdfFn = (pt) => {
+    // Use the object's computeSDF method
+    if (sdfObject && typeof sdfObject.computeSDF === 'function') {
+      return sdfObject.computeSDF(pt);
+    }
+    // Or use a direct function
+    else if (typeof sdfObject === 'function') {
+      return sdfObject(pt);
+    }
+    
+    return Infinity;
+  };
+  
+  // Generate 3D mesh
+  logger.debug(`Generating 3D mesh with resolution: ${resolution}, isoLevel: ${isoLevel}`);
+  const mesh = marchingCubes(sdfFn, bounds, resolution, { isoLevel });
+  
+  // Configure material
+  if (mesh instanceof THREE.Mesh) {
+    mesh.material.wireframe = wireframe;
+    mesh.material.flatShading = true;
+    
+    // If the SDF object has a color, use it
+    if (sdfObject && sdfObject.color) {
+      logger.debug('Applying SDF object color to mesh');
+      mesh.material.color = new THREE.Color(
+        sdfObject.color.r || 0.5,
+        sdfObject.color.g || 0.5,
+        sdfObject.color.b || 0.5
+      );
+    }
+  }
+  
+  logger.info('SDF mesh created successfully');
+  return mesh;
+}
+
+/**
+ * Create a 2D visualization of an SDF function
+ * @param {Object} sdfObject - Object with computeSDF method
+ * @param {Array<number>} bounds - [xmin,ymin,xmax,ymax]
+ * @param {Object} options - Additional options
+ * @param {number} [options.resolution=100] - Grid resolution
+ * @param {boolean} [options.fill=true] - Create filled region
+ * @param {boolean} [options.outline=true] - Create outline
+ * @returns {THREE.Group} Group containing visualizations
+ */
+export function visualizeSDFContours(sdfObject, bounds, options = {}) {
+  logger.info('Visualizing SDF contours');
+  logger.debug(`Bounds: [${bounds.join(', ')}]`);
+  logger.debug(`Options: ${JSON.stringify(options)}`);
+  
+  const resolution = options.resolution || 100;
+  const fill = options.fill !== undefined ? options.fill : true;
+  const outline = options.outline !== undefined ? options.outline : true;
+  
+  // Create SDF function wrapper
+  const sdfFn = (pt) => {
+    // Use the object's computeSDF method
+    if (sdfObject && typeof sdfObject.computeSDF === 'function') {
+      return sdfObject.computeSDF(pt);
+    }
+    // Or use a direct function
+    else if (typeof sdfObject === 'function') {
+      return sdfObject(pt);
+    }
+    
+    return Infinity;
+  };
+  
+  // Extract contours
+  logger.debug(`Extracting contours with resolution: ${resolution}`);
+  const contours = marchingSquares(sdfFn, bounds, resolution);
+  
+  // Create group to hold all visualizations
+  const group = new THREE.Group();
+  
+  // Add filled mesh if requested
+  if (fill && contours.length > 0) {
+    logger.debug('Creating filled mesh from contours');
+    const mesh = createContourMesh(contours);
+    group.add(mesh);
+  }
+  
+  // Add outline if requested
+  if (outline && contours.length > 0) {
+    logger.debug('Creating outline from contours');
+    const lineGeometry = buildLineSegments(contours, { close: true });
+    const lineMaterial = new THREE.LineBasicMaterial({ 
+      color: 0xffffff,
+      linewidth: 1
+    });
+    const lines = new THREE.LineSegments(lineGeometry, lineMaterial);
+    group.add(lines);
+  }
+  
+  logger.info(`SDF visualization created with ${contours.length} contours`);
+  return group;
+}
+================================================================================
+// FILE: src/utils/SDFBlending.js
+================================================================================
+
+// File: src/utils/SDFBlending.js
+
+/**
+ * Module for smooth blending of Signed Distance Functions (SDFs).
+ * Provides methods for R-function based blending and velocity field evolution.
+ */
+
+/**
+ * Computes a smooth union of two SDF values using a weighted R-function.
+ * @param {number} sdf1 - First SDF value.
+ * @param {number} sdf2 - Second SDF value.
+ * @param {number} p - Smoothness parameter (higher = smoother blend).
+ * @returns {number} - The smoothly blended SDF value.
+ */
+export function weightedRUnion(sdf1, sdf2, p = 8) {
+    if (p <= 0) return Math.min(sdf1, sdf2); // Fallback to regular min
+    return sdf1 + sdf2 - Math.pow(Math.pow(Math.abs(sdf1), p) + Math.pow(Math.abs(sdf2), p), 1/p);
+  }
+  
+  /**
+   * Computes a smooth intersection of two SDF values using a weighted R-function.
+   * @param {number} sdf1 - First SDF value.
+   * @param {number} sdf2 - Second SDF value.
+   * @param {number} p - Smoothness parameter (higher = smoother blend).
+   * @returns {number} - The smoothly blended SDF value.
+   */
+  export function weightedRIntersection(sdf1, sdf2, p = 8) {
+    if (p <= 0) return Math.max(sdf1, sdf2); // Fallback to regular max
+    return sdf1 + sdf2 + Math.pow(Math.pow(Math.abs(sdf1), p) + Math.pow(Math.abs(sdf2), p), 1/p);
+  }
+  
+  /**
+   * Computes a smooth subtraction of two SDF values.
+   * @param {number} sdf1 - Base SDF value.
+   * @param {number} sdf2 - SDF value to subtract.
+   * @param {number} p - Smoothness parameter.
+   * @returns {number} - The smoothly subtracted SDF value.
+   */
+  export function weightedRDifference(sdf1, sdf2, p = 8) {
+    return weightedRIntersection(sdf1, -sdf2, p);
+  }
+  
+  /**
+   * Computes the gradient of an SDF at a point using central differences.
+   * @param {Function} sdfFunc - Function that computes the SDF value at a point.
+   * @param {Object} point - The point {x, y} where to compute the gradient.
+   * @param {number} epsilon - Step size for numerical differentiation.
+   * @returns {Object} - The gradient vector {x, y}.
+   */
+  export function computeGradient(sdfFunc, point, epsilon = 0.001) {
+    const center = sdfFunc(point);
+    const dx = (sdfFunc({x: point.x + epsilon, y: point.y}) - 
+               sdfFunc({x: point.x - epsilon, y: point.y})) / (2 * epsilon);
+    const dy = (sdfFunc({x: point.x, y: point.y + epsilon}) - 
+               sdfFunc({x: point.x, y: point.y - epsilon})) / (2 * epsilon);
+    
+    return { x: dx, y: dy };
+  }
+  
+  /**
+   * Computes the mean curvature of an SDF at a point.
+   * @param {Function} sdfFunc - Function that computes the SDF value at a point.
+   * @param {Object} point - The point {x, y} to compute the curvature at.
+   * @param {number} epsilon - Step size for numerical differentiation.
+   * @returns {number} - The mean curvature.
+   */
+  export function computeCurvature(sdfFunc, point, epsilon = 0.001) {
+    // Compute second derivatives
+    const f = sdfFunc(point);
+    
+    // First derivatives
+    const fx = (sdfFunc({x: point.x + epsilon, y: point.y}) - 
+               sdfFunc({x: point.x - epsilon, y: point.y})) / (2 * epsilon);
+    const fy = (sdfFunc({x: point.x, y: point.y + epsilon}) - 
+               sdfFunc({x: point.x, y: point.y - epsilon})) / (2 * epsilon);
+    
+    // Second derivatives
+    const fxx = (sdfFunc({x: point.x + epsilon, y: point.y}) - 
+                2 * f + 
+                sdfFunc({x: point.x - epsilon, y: point.y})) / (epsilon * epsilon);
+    
+    const fyy = (sdfFunc({x: point.x, y: point.y + epsilon}) - 
+                2 * f + 
+                sdfFunc({x: point.x, y: point.y - epsilon})) / (epsilon * epsilon);
+    
+    const fxy = (sdfFunc({x: point.x + epsilon, y: point.y + epsilon}) - 
+                sdfFunc({x: point.x + epsilon, y: point.y - epsilon}) - 
+                sdfFunc({x: point.x - epsilon, y: point.y + epsilon}) + 
+                sdfFunc({x: point.x - epsilon, y: point.y - epsilon})) / (4 * epsilon * epsilon);
+    
+    // Compute mean curvature (div(∇f/|∇f|))
+    const gradMagnitudeSq = fx * fx + fy * fy;
+    if (gradMagnitudeSq < 1e-10) return 0;
+    
+    const gradMagnitude = Math.sqrt(gradMagnitudeSq);
+    const term1 = (fxx * (fy * fy) - 2 * fxy * fx * fy + fyy * (fx * fx)) / (gradMagnitudeSq * gradMagnitude);
+    
+    return term1;
+  }
+  
+  /**
+   * Computes the velocity field for SDF evolution based on the target blended SDF.
+   * @param {number} currentSDF - Current SDF value at a point.
+   * @param {number} targetSDF - Target (blended) SDF value.
+   * @param {Object} gradient - Gradient vector {x, y} of the current SDF.
+   * @param {number} alpha - Speed factor for the evolution.
+   * @param {number} curvature - Optional curvature value for curvature-aware evolution.
+   * @returns {Object} - The velocity vector {x, y}.
+   */
+  export function computeVelocity(currentSDF, targetSDF, gradient, alpha = 0.5, curvature = null) {
+    // Direction of evolution: if current > target, we need to decrease, and vice versa
+    const diff = currentSDF - targetSDF;
+    
+    // Normalize the gradient
+    const gradMagnitude = Math.sqrt(gradient.x * gradient.x + gradient.y * gradient.y);
+    if (gradMagnitude < 1e-10) return { x: 0, y: 0 };
+    
+    const normGrad = {
+      x: gradient.x / gradMagnitude,
+      y: gradient.y / gradMagnitude
+    };
+    
+    // Apply curvature-aware modulation if provided
+    let speed = alpha * diff;
+    if (curvature !== null) {
+      // Scale with curvature - areas with high curvature evolve slower
+      const curvatureWeight = 1 / (1 + Math.abs(curvature));
+      speed *= curvatureWeight;
+    }
+    
+    // Return velocity vector (scaled normal)
+    return {
+      x: -speed * normGrad.x,
+      y: -speed * normGrad.y
+    };
+  }
+  
+  /**
+   * Updates an SDF grid using velocity field evolution.
+   * @param {Array<Array<number>>} sdfGrid - 2D grid of current SDF values.
+   * @param {Array<Array<number>>} targetGrid - 2D grid of target (blended) SDF values.
+   * @param {number} deltaTime - Time step for the evolution.
+   * @param {number} alpha - Speed factor.
+   * @param {boolean} useCurvature - Whether to use curvature-aware evolution.
+   * @returns {Array<Array<number>>} - The updated SDF grid.
+   */
+  export function updateSDF(sdfGrid, targetGrid, deltaTime = 0.1, alpha = 0.5, useCurvature = false) {
+    const rows = sdfGrid.length;
+    const cols = sdfGrid[0].length;
+    const newGrid = Array(rows).fill().map(() => Array(cols).fill(0));
+    
+    // Helper function to get SDF value at grid position
+    const getSDF = (grid, i, j) => {
+      if (i < 0) i = 0;
+      if (j < 0) j = 0;
+      if (i >= rows) i = rows - 1;
+      if (j >= cols) j = cols - 1;
+      return grid[i][j];
+    };
+    
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        const currentSDF = sdfGrid[i][j];
+        const targetSDF = targetGrid[i][j];
+        
+        // Compute gradient using central differences
+        const gradient = {
+          x: (getSDF(sdfGrid, i, j+1) - getSDF(sdfGrid, i, j-1)) / 2,
+          y: (getSDF(sdfGrid, i+1, j) - getSDF(sdfGrid, i-1, j)) / 2
+        };
+        
+        // Compute curvature if needed
+        let curvature = null;
+        if (useCurvature) {
+          const fxx = getSDF(sdfGrid, i, j+1) - 2*currentSDF + getSDF(sdfGrid, i, j-1);
+          const fyy = getSDF(sdfGrid, i+1, j) - 2*currentSDF + getSDF(sdfGrid, i-1, j);
+          const fxy = (getSDF(sdfGrid, i+1, j+1) - getSDF(sdfGrid, i+1, j-1) - 
+                      getSDF(sdfGrid, i-1, j+1) + getSDF(sdfGrid, i-1, j-1)) / 4;
+          
+          const gradMagnitudeSq = gradient.x * gradient.x + gradient.y * gradient.y;
+          if (gradMagnitudeSq > 1e-10) {
+            const gradMagnitude = Math.sqrt(gradMagnitudeSq);
+            curvature = (fxx * (gradient.y * gradient.y) - 2 * fxy * gradient.x * gradient.y + 
+                        fyy * (gradient.x * gradient.x)) / (gradMagnitudeSq * gradMagnitude);
+          }
+        }
+        
+        // Compute velocity
+        const velocity = computeVelocity(currentSDF, targetSDF, gradient, alpha, curvature);
+        
+        // Update SDF using Euler integration
+        const gradMagnitude = Math.sqrt(gradient.x * gradient.x + gradient.y * gradient.y);
+        newGrid[i][j] = currentSDF - deltaTime * (velocity.x * gradient.x + velocity.y * gradient.y);
+      }
+    }
+    
+    return newGrid;
+  }
+  
+  /**
+   * Creates a blended SDF function from multiple primitive SDFs.
+   * @param {Array<Function>} sdfFuncs - Array of SDF functions to blend.
+   * @param {number} p - Smoothness parameter for R-function.
+   * @returns {Function} - The blended SDF function.
+   */
+  export function blendMultipleSDFs(sdfFuncs, p = 8) {
+    return function(point) {
+      if (sdfFuncs.length === 0) return Infinity;
+      if (sdfFuncs.length === 1) return sdfFuncs[0](point);
+      
+      let result = sdfFuncs[0](point);
+      for (let i = 1; i < sdfFuncs.length; i++) {
+        result = weightedRUnion(result, sdfFuncs[i](point), p);
+      }
+      return result;
+    };
+  }
+  
+  /**
+   * Creates a composite SDF from a list of ComplexPrimitive2D instances.
+   * @param {Array<ComplexPrimitive2D>} primitives - Array of primitive objects.
+   * @param {number} p - Smoothness parameter.
+   * @param {string} operation - Type of operation: 'union', 'intersection', or 'difference'.
+   * @returns {Function} - A function that computes the composite SDF at any point.
+   */
+  export function createCompositeSDF(primitives, p = 8, operation = 'union') {
+    // Select the appropriate R-function based on the operation
+    let combineFunc;
+    switch (operation.toLowerCase()) {
+      case 'intersection':
+        combineFunc = weightedRIntersection;
+        break;
+      case 'difference':
+        combineFunc = weightedRDifference;
+        break;
+      case 'union':
+      default:
+        combineFunc = weightedRUnion;
+        break;
+    }
+    
+    // Return a function that computes the composite SDF
+    return function(point) {
+      if (primitives.length === 0) return Infinity;
+      if (primitives.length === 1) return primitives[0].computeSDF(point);
+      
+      let result = primitives[0].computeSDF(point);
+      for (let i = 1; i < primitives.length; i++) {
+        // For difference operation, only the first primitive is the base
+        if (operation.toLowerCase() === 'difference' && i > 1) {
+          const nextSDF = primitives[i].computeSDF(point);
+          result = combineFunc(result, nextSDF, p);
+        } else if (operation.toLowerCase() !== 'difference') {
+          const nextSDF = primitives[i].computeSDF(point);
+          result = combineFunc(result, nextSDF, p);
+        }
+      }
+      return result;
+    };
+  }
+  
+  /**
+   * A factory function to create a ComplexPrimitive2D that represents a composite of multiple primitives.
+   * This integrates with the existing system without modifying its structure.
+   * @param {Array<ComplexPrimitive2D>} primitives - Array of primitive objects.
+   * @param {Object} params - Additional parameters including blend settings.
+   * @returns {Object} - A ComplexPrimitive2D-compatible object that represents the composite.
+   */
+  export function createBlendedPrimitive(primitives, params = {}) {
+    const blendParams = {
+      smoothness: params.smoothness || 8,
+      operation: params.operation || 'union',
+      evolutionSteps: params.evolutionSteps || 0,
+      deltaTime: params.deltaTime || 0.1,
+      alpha: params.alpha || 0.5,
+      useCurvature: params.useCurvature || false
+    };
+    
+    // Create the composite SDF function
+    const compositeSDF = createCompositeSDF(primitives, blendParams.smoothness, blendParams.operation);
+    
+    // Get color properties from the first primitive or use provided color
+    const color = params.color || (primitives.length > 0 ? primitives[0].color : { h: 0, s: 1, l: 0.5, a: 1 });
+    
+    // Create a primitive-like object that conforms to ComplexPrimitive2D interface
+    return {
+      metric: {
+        center: params.center || { x: 0, y: 0 },
+        scale: params.scale || 1
+      },
+      color: color,
+      distanceMapper: params.distanceMapper || primitives[0]?.distanceMapper || ((d) => d),
+      
+      // Implement the ComplexPrimitive2D interface methods
+      getRawDistance: function(point) {
+        // For composite primitives, raw distance is less meaningful,
+        // but we'll approximate it as the distance to the "average" center
+        let avgX = 0, avgY = 0;
+        primitives.forEach(p => {
+          avgX += p.metric.center.x;
+          avgY += p.metric.center.y;
+        });
+        avgX /= primitives.length;
+        avgY /= primitives.length;
+        
+        const dx = point.x - avgX;
+        const dy = point.y - avgY;
+        return Math.sqrt(dx * dx + dy * dy);
+      },
+      
+      getMetricDistance: function(point) {
+        return this.distanceMapper(this.getRawDistance(point));
+      },
+      
+      computeSDF: function(point) {
+        return compositeSDF(point);
+      },
+      
+      getColor: function(sdfValue) {
+        const intensity = Math.exp(-Math.abs(sdfValue));
+        return {
+          h: this.color.h,
+          s: this.color.s,
+          l: this.color.l * intensity,
+          a: this.color.a * intensity,
+        };
+      },
+      
+      transform: function(matrix) {
+        // Transform each primitive individually
+        primitives.forEach(p => p.transform(matrix));
+        
+        // Update the center of this composite primitive
+        if (this.metric.center) {
+          const { x, y } = this.metric.center;
+          const newX = matrix.a * x + matrix.b * y + (matrix.tx || 0);
+          const newY = matrix.c * x + matrix.d * y + (matrix.ty || 0);
+          this.metric.center = { x: newX, y: newY };
+        }
+        
+        // Adjust the scale if the matrix includes uniform scaling
+        this.metric.scale *= Math.sqrt((matrix.a ** 2 + matrix.d ** 2) / 2);
+      }
+    };
+  }
+================================================================================
+// FILE: src/utils/transformStack.js
+================================================================================
+
+/*
+ * utils/TransformStack.js
+ * 
+ * A minimal utility module for managing a stack of affine transformations.
+ * Allows pushing, popping, and applying sequences of transformations.
+ * Depends on affine.js for the underlying transformation operations.
+ */
+
+import { identity, composeAffine } from './affine.js';
+
+/**
+ * A stack-based manager for sequential 2D affine transformations.
+ */
+export class TransformStack {
+  /**
+   * Create a new transform stack, initialized with identity matrix
+   */
+  constructor() {
+    this.stack = [identity()];
+    this.current = 0;
+  }
+
+  /**
+   * Get the current composite transformation
+   * @returns {import('./affine.js').Affine} The current transformation
+   */
+  get() {
+    return this.stack[this.current];
+  }
+
+  /**
+   * Push a new transformation onto the stack, combining it with the current transform
+   * @param {import('./affine.js').Affine} transform - The transformation to add
+   * @returns {TransformStack} This instance for chaining
+   */
+  push(transform) {
+    const combined = composeAffine(transform, this.stack[this.current]);
+    this.current++;
+    this.stack[this.current] = combined;
+    // Truncate the stack if we're not at the end (handles case of push after pop)
+    if (this.current < this.stack.length - 1) {
+      this.stack.length = this.current + 1;
+    }
+    return this;
+  }
+
+  /**
+   * Move back one step in the transformation stack
+   * @returns {TransformStack} This instance for chaining
+   * @throws {Error} If attempting to pop beyond the bottom of the stack
+   */
+  pop() {
+    if (this.current <= 0) {
+      throw new Error("Cannot pop beyond the bottom of the transform stack");
+    }
+    this.current--;
+    return this;
+  }
+
+  /**
+   * Reset to the bottom of the stack (identity transform)
+   * @returns {TransformStack} This instance for chaining
+   */
+  reset() {
+    this.current = 0;
+    return this;
+  }
+
+  /**
+   * Save the current state by marking the current position
+   * without creating a new transform
+   * @returns {number} The saved position index
+   */
+  save() {
+    return this.current;
+  }
+
+  /**
+   * Restore to a previously saved position
+   * @param {number} position - Position index from a previous save() call
+   * @returns {TransformStack} This instance for chaining
+   * @throws {Error} If the position is invalid
+   */
+  restore(position) {
+    if (position < 0 || position > this.stack.length - 1) {
+      throw new Error("Invalid stack position");
+    }
+    this.current = position;
+    return this;
+  }
+
+  /**
+   * Apply the current transformation to a point
+   * @param {{x:number,y:number}} point - The point to transform
+   * @returns {{x:number,y:number}} The transformed point
+   */
+  applyToPoint(point) {
+    const transform = this.stack[this.current];
+    return {
+      x: transform.a * point.x + transform.b * point.y + transform.tx,
+      y: transform.c * point.x + transform.d * point.y + transform.ty
+    };
+  }
+  
+  /**
+   * Apply the current transformation to a vertex in-place
+   * @param {import('../Geometry/Vertex.js').Vertex} vertex - The vertex to transform
+   */
+  applyToVertex(vertex) {
+    const transform = this.stack[this.current];
+    const { x, y } = vertex.position;
+    vertex.position.x = transform.a * x + transform.b * y + transform.tx;
+    vertex.position.y = transform.c * x + transform.d * y + transform.ty;
+  }
+  
+  /**
+   * Apply the current transformation to all vertices in a face in-place
+   * @param {import('../geometry/Face.js').Face} face - The face to transform
+   */
+  applyToFace(face) {
+    const vertices = face.vertices;
+    for (let i = 0; i < vertices.length; i++) {
+      this.applyToVertex(vertices[i]);
+    }
+  }
+}

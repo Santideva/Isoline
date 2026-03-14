@@ -14,7 +14,7 @@
  */
 export function weightedRUnion(sdf1, sdf2, p = 8) {
     if (p <= 0) return Math.min(sdf1, sdf2); // Fallback to regular min
-    return sdf1 + sdf2 - Math.pow(Math.pow(sdf1, p) + Math.pow(sdf2, p), 1/p);
+    return sdf1 + sdf2 - Math.pow(Math.pow(Math.abs(sdf1), p) + Math.pow(Math.abs(sdf2), p), 1/p);
   }
   
   /**
@@ -26,7 +26,7 @@ export function weightedRUnion(sdf1, sdf2, p = 8) {
    */
   export function weightedRIntersection(sdf1, sdf2, p = 8) {
     if (p <= 0) return Math.max(sdf1, sdf2); // Fallback to regular max
-    return sdf1 + sdf2 + Math.pow(Math.pow(sdf1, p) + Math.pow(sdf2, p), 1/p);
+    return sdf1 + sdf2 + Math.pow(Math.pow(Math.abs(sdf1), p) + Math.pow(Math.abs(sdf2), p), 1/p);
   }
   
   /**

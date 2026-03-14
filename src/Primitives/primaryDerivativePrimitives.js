@@ -1,5 +1,5 @@
 // File: src/primitives/primaryDerivativePrimitives.js
-import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
+import { ComplexShape2D, nextId } from "../Geometry/ComplexShape2d.js";
 import { Vertex } from "../Geometry/Vertex.js";
 import { Edge } from "../Geometry/Edge.js";
 import { 
@@ -21,7 +21,7 @@ import * as THREE from "three";
  */
 export class DerivativePrimitive {
   constructor(params = {}) {
-    this.id = params.id || `derivative-${Math.floor(Math.random() * 10000)}`;
+    this.id = params.id !== undefined ? params.id : nextId();
     this.type = 'derivative';
     this.shapes = [];
     this.color = params.color || { h: 210, s: 0.8, l: 0.6 };
@@ -270,9 +270,6 @@ export class TrianglePrimitive extends DerivativePrimitive {
     if (this.cornerRounding > 0) {
       this._applyCornerRounding();
     }
-    
-    // Blend all edges together
-    this._blendEdges();
   }
 
   /**
@@ -341,13 +338,11 @@ export class TrianglePrimitive extends DerivativePrimitive {
     if (this.shapes.length > 1) {
       for (let i = 0; i < this.shapes.length; i++) {
         const shape = this.shapes[i];
-        // Add all other shapes as blend primitives
-        for (let j = 0; j < this.shapes.length; j++) {
-          if (i !== j) {
-            shape.addBlendPrimitive(this.shapes[j], 'union');
-          }
-        }
-        shape.setBlendParams({ smoothness: this.blendSmoothness });
+        // Set primitives directly — skip per-call updateCompositeSDF
+        shape.blendParams.primitives = this.shapes.filter((_, j) => j !== i);
+        shape.blendParams.operation  = 'union';
+        shape.blendParams.smoothness = this.blendSmoothness;
+        shape.updateCompositeSDF(); // one call per edge, not n-1
       }
     }
   }
@@ -461,9 +456,6 @@ export class ArcPrimitive extends DerivativePrimitive {
       
       this.shapes.push(segment);
     }
-    
-    // Blend all segments together
-    this._blendSegments();
   }
 
   /**
@@ -474,12 +466,10 @@ export class ArcPrimitive extends DerivativePrimitive {
     if (this.shapes.length > 1) {
       for (let i = 0; i < this.shapes.length; i++) {
         const shape = this.shapes[i];
-        for (let j = 0; j < this.shapes.length; j++) {
-          if (i !== j) {
-            shape.addBlendPrimitive(this.shapes[j], 'union');
-          }
-        }
-        shape.setBlendParams({ smoothness: this.blendSmoothness });
+        shape.blendParams.primitives = this.shapes.filter((_, j) => j !== i);
+        shape.blendParams.operation  = 'union';
+        shape.blendParams.smoothness = this.blendSmoothness;
+        shape.updateCompositeSDF();
       }
     }
   }
