@@ -1,5 +1,6 @@
 // File: src/primitives/primaryDerivativePrimitives.js
-import { ComplexShape2D, nextId } from "../Geometry/ComplexShape2d.js";
+import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
+import { nextId } from "../utils/idGenerator.js";
 import { Vertex } from "../Geometry/Vertex.js";
 import { Edge } from "../Geometry/Edge.js";
 import { 

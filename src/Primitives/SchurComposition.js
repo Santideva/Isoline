@@ -114,9 +114,20 @@ export class SchurComposition extends DerivativePrimitive {
     if (params.rotation  !== undefined && params.rotation  !== this.rotation)  { this.rotation  = params.rotation;  changed = true; }
     if (params.scale     !== undefined && params.scale     !== this.scale)     { this.scale     = params.scale;     changed = true; }
     if (params.operations !== undefined)                                        { this.operations = params.operations; changed = true; }
+    // Accept singular 'operation' string as well as 'operations' array
+    if (params.operation !== undefined)                                         { this.operations = [params.operation]; changed = true; }
     if (params.weights   !== undefined)                                        { this.weights   = params.weights;   changed = true; }
+    if (params.smoothness !== undefined)                                       { this.weights   = [params.smoothness]; this.blendSmoothness = params.smoothness; changed = true; }
+    if (params.isoOffset !== undefined && params.isoOffset !== this.isoOffset) { this.isoOffset = params.isoOffset; changed = true; }
     if (params.compositeFn !== undefined && params.compositeFn !== this.compositeFn) { this.compositeFn = params.compositeFn; changed = true; }
     if (params.shapes    !== undefined)                                        { this.baseShapes = params.shapes;   changed = true; }
+    if (params.posX      !== undefined || params.posY !== undefined) {
+      this.position = {
+        x: params.posX !== undefined ? params.posX : this.position.x,
+        y: params.posY !== undefined ? params.posY : this.position.y
+      };
+      changed = true;
+    }
     if (params.position  !== undefined) {
       if (params.position.x !== this.position.x || params.position.y !== this.position.y) {
         this.position = params.position;
@@ -163,7 +174,7 @@ export class SchurComposition extends DerivativePrimitive {
 
       // Evaluate each base shape at the transformed point
       const sdfValues = this.baseShapes.map(shape =>
-        shape.computeSDF(tp, [...callStack], time, depth)
+        shape.computeSDF(tp, [...callStack], time, depth) - this.isoOffset
       );
 
       // Blend according to the configured strategy and operations
@@ -180,9 +191,8 @@ export class SchurComposition extends DerivativePrimitive {
         }
       }
 
-      // Convert blend-space distance → world-space distance, then subtract
-      // isoOffset so points near the geometry cross zero.
-      return result / this._scaleFactor - this.isoOffset;
+    // Convert blend-space distance → world-space distance
+      return result / this._scaleFactor;
 
     } finally {
       const idx = callStack.indexOf(this.id);

@@ -9,10 +9,9 @@ import {
   weightedRDifference 
 } from "../utils/SDFBlending.js";
 import { logger } from "../utils/logger.js";
+import { nextId } from "../utils/idGenerator.js";
+export { nextId };
 import * as THREE from "three";
-
-let shapeCounter = 0;
-export function nextId() { return ++shapeCounter; }
 
 export class ComplexShape2D extends ComplexPrimitive2D {
   constructor(params = {}) {
@@ -61,7 +60,12 @@ export class ComplexShape2D extends ComplexPrimitive2D {
   }
 
   calculateBaseSDF(point, time = 0, depth = 0) {
-    return this.edges.length > 0 ? this.distanceToEdge(this.edges[0], point, time, depth) : Infinity;
+    if (this.edges.length === 0) return Infinity;
+    const raw = this.distanceToEdge(this.edges[0], point, time, depth);
+    if (this.distanceMapper && typeof this.distanceMapper === 'function') {
+      return this.distanceMapper(raw);
+    }
+    return raw;
   }
 
   distanceToEdge(edge, point, time = 0, depth = 0) {
@@ -193,6 +197,27 @@ export class ComplexShape2D extends ComplexPrimitive2D {
       console.error(`Error computing composite SDF: ${error}`);
       return Infinity;
     }
+  }
+
+  updateParameters(params = {}) {
+    if (params.position !== undefined) {
+      // Translate both vertices by the delta from current centre
+      const current = {
+        x: (this.vertices[0].position.x + this.vertices[1].position.x) / 2,
+        y: (this.vertices[0].position.y + this.vertices[1].position.y) / 2,
+      };
+      const dx = params.position.x - current.x;
+      const dy = params.position.y - current.y;
+      this.vertices[0].position.x += dx;
+      this.vertices[0].position.y += dy;
+      this.vertices[1].position.x += dx;
+      this.vertices[1].position.y += dy;
+    }
+    if (params.x1 !== undefined) this.vertices[0].position.x = params.x1;
+    if (params.y1 !== undefined) this.vertices[0].position.y = params.y1;
+    if (params.x2 !== undefined) this.vertices[1].position.x = params.x2;
+    if (params.y2 !== undefined) this.vertices[1].position.y = params.y2;
+    return true;
   }
 
   createLineObject(time = 0) {

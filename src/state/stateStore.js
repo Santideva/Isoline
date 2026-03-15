@@ -1,28 +1,38 @@
 // File: src/state/stateStore.js
 
-import { 
-  createBlendedPrimitive, 
-  weightedRUnion, 
-  weightedRIntersection, 
-  weightedRDifference 
+import {
+  createBlendedPrimitive,
+  weightedRUnion,
+  weightedRIntersection,
+  weightedRDifference
 } from "../utils/SDFBlending.js";
-import { 
-  distanceMappingRegistry, 
-  identityMapping, 
-  createMapping 
+import {
+  distanceMappingRegistry,
+  identityMapping,
+  createMapping
 } from "../utils/DistanceMapping.js";
 import { logger } from "../utils/logger.js";
 import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
 import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
 import { ComplexPrimitive2D } from "../Primitives/ComplexPrimitive2d.js";
+import { NodeGraph } from "../graph/NodeGraph.js";
 
 
 export class StateStore {
   constructor() {
-    // Use a Set for sessionShapes for fast insertion, deletion, and uniqueness.
-    this.sessionShapes = new Set();
-    // Storage for visual update callbacks
+    // Phase 1: sessionShapes is now a Map<id, instance> instead of a Set.
+    // This gives O(1) lookup for getShape() and makes nodeGraph mirroring clean.
+    this.sessionShapes = new Map();
+
+    // Node graph — the ground-truth data model for scene structure.
+    // sessionShapes is the instance cache; nodeGraph is the serialisable record.
+    this.nodeGraph = new NodeGraph();
+
+    // Visual update callbacks
     this.visualUpdateCallbacks = [];
+
+    // Dependency map — kept for cycle detection during triggerVisualUpdate.
+    // Will be removed in Phase 3 once the canvas UI replaces dat.GUI.
     this.dependencyMap = new Map();
 
     // Mapping configuration properties
@@ -35,7 +45,10 @@ export class StateStore {
     this.mappingParams = {};
   }
 
-  // — Helpers for dependency tracking —
+  // ---------------------------------------------------------------------------
+  // Dependency tracking (legacy — delegates to dependencyMap)
+  // ---------------------------------------------------------------------------
+
   _updateDependencies(shapeId, childIds = []) {
     this.dependencyMap.set(shapeId, childIds);
   }
@@ -52,43 +65,36 @@ export class StateStore {
     return false;
   }
 
-  // Dynamic distance mapping based on current configuration.
+  // ---------------------------------------------------------------------------
+  // Distance mapping
+  // ---------------------------------------------------------------------------
+
   get distanceMapping() {
     return createMapping(this.selectedMappingType, {
-      baseMapper: this.baseMapping,
+      baseMapper:  this.baseMapping,
       baseMappers: [this.baseMapping, identityMapping],
       blendFactor: this.blendFactor,
-      frequency: this.timeFrequency,
-      amplitude: this.amplitude,
-      iterations: this.recursionLimit,
-      polyCoeffs: [0, 1, 0],
-      a: 1,
-      b: 1,
-      c: 0,
-      e: 0
+      frequency:   this.timeFrequency,
+      amplitude:   this.amplitude,
+      iterations:  this.recursionLimit,
+      polyCoeffs:  [0, 1, 0],
+      a: 1, b: 1, c: 0, e: 0
     });
   }
 
-  // Method to update mapping configuration.
   updateMappingConfig(config = {}) {
     const {
-      mappingType,
-      baseMapper,
-      secondaryMapper,
-      blendFactor,
-      frequency,
-      recursionLimit,
-      polyCoeffs,
-      a, b, c, e,
-      amplitude = 1.0
+      mappingType, baseMapper, secondaryMapper,
+      blendFactor, frequency, recursionLimit, polyCoeffs,
+      a, b, c, e, amplitude = 1.0
     } = config;
 
-    if (mappingType) this.selectedMappingType = mappingType;
-    if (baseMapper) this.baseMapping = baseMapper;
-    if (blendFactor !== undefined) this.blendFactor = blendFactor;
-    if (frequency !== undefined) this.timeFrequency = frequency;
+    if (mappingType)             this.selectedMappingType = mappingType;
+    if (baseMapper)              this.baseMapping         = baseMapper;
+    if (blendFactor !== undefined) this.blendFactor       = blendFactor;
+    if (frequency   !== undefined) this.timeFrequency     = frequency;
     if (recursionLimit !== undefined) this.recursionLimit = recursionLimit;
-    if (amplitude !== undefined) this.amplitude = amplitude;
+    if (amplitude   !== undefined) this.amplitude         = amplitude;
 
     this.mappingParams = {
       ...this.mappingParams,
@@ -105,63 +111,75 @@ export class StateStore {
   }
 
   // ---------------------------------------------------------------------------
-  // Shape management.
+  // Shape management — all methods now use Map instead of Set
   // ---------------------------------------------------------------------------
 
-  // Add a shape to sessionShapes.
   addShape(shape) {
-    shape.active = true;
+    shape.active    = true;
     shape.createdAt = Date.now();
-    shape.rendered = true;
+    shape.rendered  = true;
 
-    this.sessionShapes.add(shape);
+    // Instance cache
+    this.sessionShapes.set(shape.id, shape);
+
+    // Mirror to nodeGraph
+    const nodeType = this._inferNodeType(shape);
+    if (nodeType) {
+      const params = this._extractNodeParams(shape);
+      try {
+        this.nodeGraph.addNode(nodeType, params, { x: 0, y: 0 }, shape.id);
+      } catch (e) {
+        // Node with this id already exists (e.g. during recompose) — update params
+        this.nodeGraph.nodes.get(shape.id) && Object.assign(
+          this.nodeGraph.nodes.get(shape.id).params, params
+        );
+      }
+    }
+
     console.log(
-      `Shape added - id: ${shape.id}, active: ${shape.active}, rendered: ${shape.rendered}, createdAt: ${shape.createdAt}. ` +
-      `Total shapes in session: ${this.sessionShapes.size}`
+      `Shape added - id: ${shape.id}, type: ${shape.type || shape.constructor.name}. ` +
+      `Total shapes: ${this.sessionShapes.size}`
     );
     return shape.id;
   }
 
-  // Retrieve a shape by its id from sessionShapes.
   getShape(shapeId) {
-    for (let shape of this.sessionShapes) {
-      if (shape.id === shapeId) return shape;
-    }
-    return undefined;
+    return this.sessionShapes.get(shapeId);
   }
 
-  // Return all shapes as an array.
   getShapes() {
-    return Array.from(this.sessionShapes);
+    return Array.from(this.sessionShapes.values());
   }
 
-  // Remove a shape from sessionShapes by its id.
   removeShape(shapeId) {
-    let removedShape = null;
-    for (let shape of this.sessionShapes) {
-      if (shape.id === shapeId) {
-        removedShape = shape;
-        break;
+    const shape = this.sessionShapes.get(shapeId);
+    if (shape) {
+      this.sessionShapes.delete(shapeId);
+      // Mirror removal to nodeGraph
+      if (this.nodeGraph.nodes.has(shapeId)) {
+        this.nodeGraph.removeNode(shapeId);
       }
-    }
-    if (removedShape) {
-      this.sessionShapes.delete(removedShape);
-      console.log(`Shape with id ${shapeId} removed. Total shapes in session: ${this.sessionShapes.size}`);
-      return removedShape;
+      console.log(`Shape ${shapeId} removed. Total shapes: ${this.sessionShapes.size}`);
+      return shape;
     }
     return null;
   }
 
-  // Clear all shapes from sessionShapes.
   clear() {
     this.sessionShapes.clear();
+    this.nodeGraph = new NodeGraph();
+    this.dependencyMap.clear();
     console.log("State store cleared.");
   }
+
+  // ---------------------------------------------------------------------------
+  // Visual update callbacks
+  // ---------------------------------------------------------------------------
 
   onVisualUpdate(callback) {
     if (typeof callback === 'function') {
       this.visualUpdateCallbacks.push(callback);
-      logger.debug(`Visual update callback registered. Total callbacks: ${this.visualUpdateCallbacks.length}`);
+      logger.debug(`Visual update callback registered. Total: ${this.visualUpdateCallbacks.length}`);
       return true;
     }
     logger.warn("Attempted to register invalid visual update callback");
@@ -169,52 +187,47 @@ export class StateStore {
   }
 
   triggerVisualUpdate(shapeId) {
-    // Cycle guard
     if (this._hasCycle(shapeId)) {
       console.error(`Cycle detected in dependencies of shape ${shapeId}; update aborted.`);
       return;
     }
-    logger.debug(`Triggering visual update for shape ${shapeId}`);
     this.visualUpdateCallbacks.forEach(callback => {
-      try {
-        callback(shapeId);
-      } catch (error) {
-        logger.error(`Error in visual update callback: ${error.message}`);
-      }
+      try { callback(shapeId); }
+      catch (error) { logger.error(`Error in visual update callback: ${error.message}`); }
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Shape mapper and blend operations
+  // ---------------------------------------------------------------------------
+
   updateShapeMapper(shapeId, mapperName, mapperParams) {
     const shape = this.getShape(shapeId);
-    if (shape) {
-      if (mapperName && typeof mapperName === 'string') {
-        if (distanceMappingRegistry[mapperName]) {
-          if (typeof distanceMappingRegistry[mapperName] === 'function' &&
-              distanceMappingRegistry[mapperName].length > 0) {
-            shape.distanceMapper = distanceMappingRegistry[mapperName](
-              mapperParams.a, mapperParams.b, mapperParams.c, mapperParams.e
-            );
-          } else {
-            shape.distanceMapper = distanceMappingRegistry[mapperName];
-          }
-        } else {
-          console.warn(`Mapper "${mapperName}" not found. Using identity mapping.`);
-          shape.distanceMapper = identityMapping;
-        }
-        if (typeof shape.updateCompositeSDF === 'function') {
-          shape.updateCompositeSDF();
-        }
-        console.log(`Updated shape ${shape.id} mapper to ${mapperName} with params:`, mapperParams);
-        this.triggerVisualUpdate(shape.id);
+    if (!shape) return;
+    if (!mapperName || typeof mapperName !== 'string') return;
+
+    if (distanceMappingRegistry[mapperName]) {
+      if (typeof distanceMappingRegistry[mapperName] === 'function' &&
+          distanceMappingRegistry[mapperName].length > 0) {
+        shape.distanceMapper = distanceMappingRegistry[mapperName](
+          mapperParams.a, mapperParams.b, mapperParams.c, mapperParams.e
+        );
+      } else {
+        shape.distanceMapper = distanceMappingRegistry[mapperName];
       }
+    } else {
+      console.warn(`Mapper "${mapperName}" not found. Using identity.`);
+      shape.distanceMapper = identityMapping;
     }
+
+    if (typeof shape.updateCompositeSDF === 'function') shape.updateCompositeSDF();
+    this.triggerVisualUpdate(shape.id);
   }
 
   setShapeBlendParams(shapeId, blendParams) {
     const shape = this.getShape(shapeId);
     if (shape && typeof shape.setBlendParams === 'function') {
       shape.setBlendParams(blendParams);
-      console.log(`Updated blend params for shape ${shapeId}:`, blendParams);
       this.triggerVisualUpdate(shape.id);
       return true;
     }
@@ -222,25 +235,15 @@ export class StateStore {
   }
 
   addBlendPrimitive(shapeId, primitiveId, operation = null) {
-    const shape = this.getShape(shapeId);
+    const shape     = this.getShape(shapeId);
     const primitive = this.getShape(primitiveId);
+    if (!shape || !primitive || typeof shape.addBlendPrimitive !== 'function') return false;
+    if (shapeId === primitiveId) { console.warn("Cannot add shape to its own blend list"); return false; }
 
-    if (shape && primitive && typeof shape.addBlendPrimitive === 'function') {
-      if (shapeId === primitiveId) {
-        console.warn("Cannot add a shape to its own blend list");
-        return false;
-      }
-
-      shape.addBlendPrimitive(primitive, operation);
-      console.log(`Added primitive ${primitiveId} to shape ${shapeId} with operation: ${operation || 'current'}`);
-      this._updateDependencies(
-        shapeId,
-        shape.blendParams.primitives.map(p => p.id)
-      );
-      this.triggerVisualUpdate(shape.id);
-      return true;
-    }
-    return false;
+    shape.addBlendPrimitive(primitive, operation);
+    this._updateDependencies(shapeId, shape.blendParams.primitives.map(p => p.id));
+    this.triggerVisualUpdate(shape.id);
+    return true;
   }
 
   removeBlendPrimitive(shapeId, primitiveId) {
@@ -250,11 +253,7 @@ export class StateStore {
       if (index >= 0) {
         shape.blendParams.primitives.splice(index, 1);
         shape.updateCompositeSDF();
-        console.log(`Removed primitive ${primitiveId} from shape ${shapeId}`);
-        this._updateDependencies(
-          shapeId,
-          shape.blendParams.primitives.map(p => p.id)
-        );
+        this._updateDependencies(shapeId, shape.blendParams.primitives.map(p => p.id));
         this.triggerVisualUpdate(shape.id);
         return true;
       }
@@ -266,7 +265,6 @@ export class StateStore {
     const shape = this.getShape(shapeId);
     if (shape && typeof shape.clearBlendPrimitives === 'function') {
       shape.clearBlendPrimitives();
-      console.log(`Cleared all blend primitives from shape ${shapeId}`);
       this._updateDependencies(shapeId, []);
       this.triggerVisualUpdate(shape.id);
       return true;
@@ -275,29 +273,20 @@ export class StateStore {
   }
 
   createBlendedShape(primitiveIds, params = {}) {
-    const primitivesToBlend = primitiveIds
-      .map(id => this.getShape(id))
-      .filter(shape => shape !== undefined);
+    const primitives = primitiveIds.map(id => this.getShape(id)).filter(Boolean);
+    if (primitives.length === 0) { console.warn("No valid primitives for blending"); return null; }
 
-    if (primitivesToBlend.length === 0) {
-      console.warn("No valid primitives found for blending");
-      return null;
-    }
-
-    const blendedShape = createBlendedPrimitive(primitivesToBlend, params);
-    this.sessionShapes.add(blendedShape);
-    console.log(`Created blended shape with ${primitivesToBlend.length} primitives. Total shapes in session: ${this.sessionShapes.size}`);
-    this.triggerVisualUpdate(blendedShape.id);
-    return blendedShape;
+    const blended = createBlendedPrimitive(primitives, params);
+    this.sessionShapes.set(blended.id, blended);
+    this.triggerVisualUpdate(blended.id);
+    return blended;
   }
 
   setBasePrimitive(shapeId, primitiveId) {
-    const shape = this.getShape(shapeId);
+    const shape     = this.getShape(shapeId);
     const primitive = this.getShape(primitiveId);
-
     if (shape && primitive && typeof shape.setBasePrimitive === 'function') {
       shape.setBasePrimitive(primitive);
-      console.log(`Set ${primitiveId} as base primitive for shape ${shapeId}`);
       const deps = [primitiveId, ...shape.blendParams.primitives.map(p => p.id)];
       this._updateDependencies(shapeId, deps);
       this.triggerVisualUpdate(shapeId);
@@ -306,109 +295,141 @@ export class StateStore {
     return false;
   }
 
-  // Apply the current global mapping configuration to a specific shape.
   applyGlobalMappingToShape(shapeId) {
     const shape = this.getShape(shapeId);
     if (shape) {
       shape.distanceMapper = this.distanceMapping;
-      if (typeof shape.updateCompositeSDF === 'function') {
-        shape.updateCompositeSDF();
-      }
-      logger.debug(`Applied global mapping (${this.selectedMappingType}) to shape ${shapeId}`);
+      if (typeof shape.updateCompositeSDF === 'function') shape.updateCompositeSDF();
       this.triggerVisualUpdate(shapeId);
       return true;
     }
     return false;
   }
 
-  // **************** Hybrid Garbage Collection ****************
-  runGarbageCollection() {
-    const now = Date.now();
-    const MIN_AGE = 5 * 60 * 1000;
+  // ---------------------------------------------------------------------------
+  // Garbage collection
+  // ---------------------------------------------------------------------------
 
-    for (let shape of this.sessionShapes) {
+  runGarbageCollection() {
+    const now     = Date.now();
+    const MIN_AGE = 5 * 60 * 1000;
+    for (const [id, shape] of this.sessionShapes) {
       if ((now - shape.createdAt) > MIN_AGE && !shape.rendered) {
-        this.sessionShapes.delete(shape);
+        this.sessionShapes.delete(id);
+        if (this.nodeGraph.nodes.has(id)) this.nodeGraph.removeNode(id);
       }
     }
-    console.log(`Garbage Collection complete. Remaining shapes in session: ${this.sessionShapes.size}`);
+    console.log(`GC complete. Remaining shapes: ${this.sessionShapes.size}`);
   }
 
-  /**
-   * createShapeFromSerialized
-   * Uses a switch statement to choose the appropriate constructor.
-   * Returns null and logs a warning for unknown types.
-   */
+  // ---------------------------------------------------------------------------
+  // Deserialisation (for persistence.loadScene)
+  // ---------------------------------------------------------------------------
+
   createShapeFromSerialized(type, data) {
     let shape = null;
-
-    logger.info(`Deserializing shape of type: "${type}" with data: ${JSON.stringify(data)}`);
+    logger.info(`Deserializing shape of type: "${type}"`);
 
     try {
       switch (type.toLowerCase()) {
-        case "triangle":
-          logger.debug(`Creating TrianglePrimitive with data: ${JSON.stringify(data)}`);
-          shape = new TrianglePrimitive(data);
-          break;
-
-        case "arc":
-          logger.debug(`Creating ArcPrimitive with data: ${JSON.stringify(data)}`);
-          shape = new ArcPrimitive(data);
-          break;
-
+        case "triangle":    shape = new TrianglePrimitive(data);   break;
+        case "arc":         shape = new ArcPrimitive(data);        break;
         case "line":
-          logger.debug(`Creating ComplexShape2D (line) with data: ${JSON.stringify(data)}`);
-          shape = new ComplexShape2D(data);
-          break;
-
         case "complexshape":
-          logger.debug(`Creating ComplexShape2D (complex) with data: ${JSON.stringify(data)}`);
-          shape = new ComplexShape2D(data);
-          break;
-
-        case "complexprimitive":
-          logger.debug(`Creating ComplexPrimitive2D with data: ${JSON.stringify(data)}`);
-          shape = new ComplexPrimitive2D(data);
-          break;
-
-        case "composite":
-          logger.debug(`Creating Composite shape with data: ${JSON.stringify(data)}`);
-          shape = new ComplexShape2D(data);
-          break;
-
+        case "composite":   shape = new ComplexShape2D(data);      break;
+        case "complexprimitive": shape = new ComplexPrimitive2D(data); break;
         default:
-          logger.warn(`Unknown shape type during deserialization: "${type}". Cannot create shape.`);
-          break;
+          logger.warn(`Unknown shape type: "${type}"`);
       }
 
       if (shape) {
-        if (data?.id) {
-          shape.id = data.id;
-          logger.info(`Shape rehydrated successfully with ID: ${data.id}`);
-        } else {
-          logger.info(`Shape rehydrated successfully without ID`);
-        }
+        if (data?.id) { shape.id = data.id; }
 
         if (data?.distanceMapperName) {
-          const mapperName = data.distanceMapperName;
-          const entry = distanceMappingRegistry[mapperName];
-          // Guard against 'createMapping', which is a factory, not a mapper function.
-          if (entry && typeof entry === 'function' && mapperName !== 'createMapping') {
+          const entry = distanceMappingRegistry[data.distanceMapperName];
+          if (entry && typeof entry === 'function' && data.distanceMapperName !== 'createMapping') {
             shape.distanceMapper = entry;
-            logger.debug(`Attached distance mapper: ${mapperName}`);
           } else {
-            logger.warn(`Distance mapper "${mapperName}" not in registry; using identity.`);
             shape.distanceMapper = identityMapping;
           }
         }
       }
-
     } catch (error) {
       logger.error(`Error deserializing shape of type "${type}": ${error.message}`);
       shape = null;
     }
 
     return shape;
+  }
+
+  // ---------------------------------------------------------------------------
+  // NodeGraph mirroring helpers (private)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Map a shape instance to its NodeSpec type string.
+   * Returns null for types that don't have a node spec (inner edges etc.).
+   */
+  _inferNodeType(shape) {
+    if (!shape) return null;
+    if (shape.type === 'triangle')           return 'triangle';
+    if (shape.type === 'arc')                return 'arc';
+    if (shape.type === 'schur-composition')  return 'schurBlend';
+    if (shape instanceof ComplexShape2D)     return 'lineSegment';
+    return null;
+  }
+
+  /**
+   * Extract serialisable params from a shape instance so the corresponding
+   * node in nodeGraph stays in sync.
+   */
+  _extractNodeParams(shape) {
+    if (!shape) return {};
+
+    if (shape.type === 'triangle') {
+      return {
+        size:           shape.size           || 1,
+        rotation:       shape.rotation       || 0,
+        posX:           shape.position?.x    || 0,
+        posY:           shape.position?.y    || 0,
+        cornerRounding: shape.cornerRounding || 0
+      };
+    }
+
+    if (shape.type === 'arc') {
+      return {
+        radius:     shape.radius              || 1.5,
+        startAngle: shape.startAngle          || 0,
+        endAngle:   shape.endAngle !== undefined ? shape.endAngle : Math.PI,
+        segments:   shape.segments            || 8,
+        posX:       shape.position?.x         || 0,
+        posY:       shape.position?.y         || 0,
+        thickness:  shape.thickness           || 0
+      };
+    }
+
+    if (shape.type === 'schur-composition') {
+      return {
+        operation:  shape.operations?.[0]  || 'union',
+        smoothness: shape.blendSmoothness  || 8,
+        rotation:   shape.rotation         || 0,
+        scale:      shape.scale            || 1,
+        posX:       shape.position?.x      || 0,
+        posY:       shape.position?.y      || 0,
+        isoOffset:  shape.isoOffset        || 0.15
+      };
+    }
+
+    if (shape instanceof ComplexShape2D) {
+      return {
+        x1: shape.vertices?.[0]?.position?.x ?? 0,
+        y1: shape.vertices?.[0]?.position?.y ?? 0,
+        x2: shape.vertices?.[1]?.position?.x ?? 1,
+        y2: shape.vertices?.[1]?.position?.y ?? 0
+      };
+    }
+
+    return {};
   }
 }
 

@@ -11,6 +11,7 @@ import { createPolynomialMapping } from "../utils/DistanceMapping.js";
 import { stateStore } from "../state/stateStore.js";
 import { logger } from "../utils/logger.js";
 import * as meshCreator from "../utils/meshCreator.js";
+import { NodeEvaluator } from "../graph/NodeEvaluator.js";
 
 
 export class SceneManager {
@@ -32,9 +33,11 @@ export class SceneManager {
     this.lightingManager = new LightingManager(this.scene);
 
     // ── State ──────────────────────────────────────────────────────────────
-    // Each entry: { instance: <shape>, type: <string>, object: <THREE.Object3D> }
     this.activePrimitives = [];
     this.currentSchur     = null;
+
+    // ── Node graph evaluator ───────────────────────────────────────────────
+    this.evaluator = new NodeEvaluator(stateStore.nodeGraph);
 
     // ── Animation ─────────────────────────────────────────────────────────
     this._startTime    = performance.now();
@@ -60,6 +63,7 @@ export class SceneManager {
 
     switch (type.toLowerCase()) {
       case "line": {
+        const lineCount = this.activePrimitives.filter(p => p.type === 'line').length;
         const initialPolyCoeffs = [0, 1, 0.5];
         const polyMapping = createPolynomialMapping(initialPolyCoeffs);
         const shape = new ComplexShape2D({
@@ -75,10 +79,14 @@ export class SceneManager {
       }
 
       case "triangle": {
+        const triangleCount = this.activePrimitives.filter(p => p.type === 'triangle').length;
         const triangle = new TrianglePrimitive({
           size: 1,
-          rotation: 0,
-          position: { x: -1, y: 0 },
+          rotation: triangleCount * 0.4,
+          position: {
+            x: -1 + (triangleCount % 3) * 1.2,
+            y: Math.floor(triangleCount / 3) * 1.5
+          },
           cornerRounding: 0,
           edgeSmoothness: [0, 0, 0],
           color: { h: 210, s: 0.8, l: 0.6, a: 1 },
@@ -93,12 +101,16 @@ export class SceneManager {
       }
 
       case "arc": {
+        const arcCount = this.activePrimitives.filter(p => p.type === 'arc').length;
         const arc = new ArcPrimitive({
           radius: 1.5,
           startAngle: 0,
           endAngle: Math.PI,
           segments: 8,
-          position: { x: 1, y: 0 },
+          position: {
+            x: 1 + (arcCount % 3) * 1.8,
+            y: Math.floor(arcCount / 3) * 1.5
+          },
           thickness: 0,
           color: { h: 30, s: 0.9, l: 0.5, a: 1 },
           blendSmoothness: 8
@@ -183,6 +195,10 @@ export class SceneManager {
 
     stateStore.addShape(schur);
     stateStore._updateDependencies(schur.id, schurParams.baseIds);
+
+    // Wire the graph BEFORE rendering so getRootSDF() finds the correct edges.
+    this._wireCompositionGraph(schur, bases);
+    this.evaluator.invalidate();
 
     // Render
     const threeObj = this._buildSchurObject(schur, renderParams.method);
@@ -304,7 +320,11 @@ export class SceneManager {
 
     const currentTime = (performance.now() - this._startTime) / 1000.0;
 
-    // Update time-driven line geometry
+    // Drive the evaluator's time — only temporal nodes lose their cache.
+    this.evaluator.setTime(currentTime);
+    this.evaluator.invalidateTemporalNodes();
+
+    // Update time-driven line geometry (existing instance-based path)
     if (
       this.activePrimitives.some(p => p.type === "line") &&
       ["temporal", "sequential", "blended"].includes(stateStore.selectedMappingType)
@@ -335,14 +355,25 @@ export class SceneManager {
     if (entry.instance) entry.instance.rendered = false;
   }
 
-  _buildSchurObject(schur, method) {
+  _buildSchurObject(schur, method, sdfOverride = null) {
     const bounds2D = [-4, -4, 4, 4];
     const bounds3D = [-4, -4, -4, 4, 4, 4];
+
+    // sdfOverride lets callers (e.g. NodeCanvas cascade compose) bypass
+    // the evaluator and supply the SDF function directly.
+    let sdfFn;
+    if (sdfOverride) {
+      sdfFn = sdfOverride;
+    } else {
+      this.evaluator.invalidate();
+      const rootSDF = this.evaluator.getRootSDF();
+      sdfFn = rootSDF || (pt => schur.computeSDF(pt));
+    }
 
     switch (method) {
       case "contours (2D)": {
         const loops = meshCreator.marchingSquares(
-          pt => schur.computeSDF(pt), bounds2D, 150
+          sdfFn, bounds2D, 150
         );
         const geometry = meshCreator.buildLineSegments(loops);
         return new THREE.LineSegments(
@@ -352,20 +383,20 @@ export class SceneManager {
       }
       case "fill (2D)": {
         const loops = meshCreator.marchingSquares(
-          pt => schur.computeSDF(pt), bounds2D, 150
+          sdfFn, bounds2D, 150
         );
         return meshCreator.createContourMesh(loops);
       }
       case "arcs": {
         const loops = meshCreator.marchingSquares(
-          pt => schur.computeSDF(pt), bounds2D, 150
+          sdfFn, bounds2D, 150
         );
         const arcs = meshCreator.fitArcs(loops.flat());
         return meshCreator.createArcObject(arcs, { segments: 64 });
       }
       case "surface (3D)": {
         return meshCreator.createSDFMesh(
-          schur, bounds3D,
+          { computeSDF: sdfFn }, bounds3D,
           { resolution: 50, wireframe: false, isoLevel: 0 }
         );
       }
@@ -378,5 +409,69 @@ export class SceneManager {
   _onResize() {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.cameraManager.updateAspect(window.innerWidth, window.innerHeight);
+  }
+
+  /**
+   * Re-render the current SchurComposition without rebuilding it.
+   * Used when params change on an existing composition so the cascade
+   * structure is preserved.
+   * @param {string} method  render method string
+   * @param {Function} sdfOverride  optional direct SDF function
+   */
+  rerender(method, sdfOverride = null) {
+    if (!this.currentSchur) return;
+
+    this._removeFromScene(this.currentSchur);
+
+    const threeObj = this._buildSchurObject(
+      this.currentSchur.instance,
+      method,
+      sdfOverride
+    );
+    this.currentSchur.object = threeObj;
+    this._addToScene(this.currentSchur);
+  }
+
+  _ensureOutputNode() {
+    let outputNode = null;
+    stateStore.nodeGraph.nodes.forEach(node => {
+      if (node.type === 'outputNode') outputNode = node;
+    });
+    if (!outputNode) {
+      outputNode = stateStore.nodeGraph.addNode('outputNode', {
+        renderMethod: 'contours (2D)',
+        resolution:   150,
+        boundsMin:    -4,
+        boundsMax:     4
+      });
+    }
+    return outputNode;
+  }
+
+  _wireCompositionGraph(schur, bases) {
+    try {
+      const outputNode = this._ensureOutputNode();
+
+      const getOutPort = (shape) =>
+        shape.type === 'schur-composition' ? 'result' : 'sdf';
+
+      if (bases[0]) {
+        stateStore.nodeGraph.addEdge(
+          bases[0].id, getOutPort(bases[0]),
+          schur.id, 'sdfA'
+        );
+      }
+      if (bases[1]) {
+        stateStore.nodeGraph.addEdge(
+          bases[1].id, getOutPort(bases[1]),
+          schur.id, 'sdfB'
+        );
+      }
+      stateStore.nodeGraph.addEdge(schur.id, 'result', outputNode.id, 'sdf');
+
+      logger.info(`NodeGraph wired: ${bases.map(b => b.id).join(',')} → ${schur.id} → output`);
+    } catch (e) {
+      logger.warn(`NodeGraph wiring skipped: ${e.message}`);
+    }
   }
 }
