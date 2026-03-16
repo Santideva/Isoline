@@ -36,6 +36,7 @@ import { PORT_COLORS,
          CATEGORY_COLORS,
          CATEGORY_TEXT_COLORS }  from './portColors.js';
 import { drawMapperCurve }       from './previewRenderer.js';
+import { PolygonEditor }         from './PolygonEditor.js';
 
 // Card dimensions — must match CARD_WIDTH/CARD_HEIGHT in layouts.js
 const CARD_W     = 220;
@@ -190,6 +191,7 @@ export class NodeCard {
       'lineSegment','triangle','arc','circle','regularPolygon',
       'rUnion','rIntersection','rDifference','schurBlend','ifsBlend',
     ]);
+    const EDITOR_TYPES = new Set(['polytope']);
     const MAPPER_TYPES = new Set([
       'identityMapper','polynomialMapper','sinusoidalMapper','exponentialMapper',
       'logarithmicMapper','powerMapper','periodicMapper','temporalMapper',
@@ -251,6 +253,17 @@ export class NodeCard {
       wrapper.appendChild(canvas);
       setTimeout(() => this._renderMapperPreview(), 50);
       return wrapper;
+    }
+
+    if (EDITOR_TYPES.has(this.node.type)) {
+      const editor = new PolygonEditor(
+        this.node,
+        this.nodeGraph,
+        (vertices) => {
+          this._handleParamChange('vertices', JSON.stringify(vertices));
+        }
+      );
+      return editor.el;
     }
 
     return null;

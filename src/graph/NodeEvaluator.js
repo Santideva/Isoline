@@ -26,6 +26,7 @@ import {
 } from '../utils/affine.js';
 import { ComplexShape2D } from '../Geometry/ComplexShape2d.js';
 import { TrianglePrimitive, ArcPrimitive } from '../Primitives/primaryDerivativePrimitives.js';
+import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from '../Primitives/regionPrimitives.js';
 
 /**
  * NodeEvaluator takes a NodeGraph and a query point, walks the graph
@@ -153,24 +154,39 @@ export class NodeEvaluator {
       case 'circle': {
         const mapper = this._resolveMapper(node, 'mapper');
         const { radius, posX, posY } = node.params;
-        const sdfFn = (pt) => {
-          const d = Math.sqrt((pt.x - posX) ** 2 + (pt.y - posY) ** 2) - radius;
-          return mapper ? mapper(d) : d;
-        };
-        return { sdf: sdfFn };
+        const prim = new CirclePrimitive({
+          radius,
+          posX,
+          posY,
+          distanceMapper: mapper || undefined,
+        });
+        return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) };
+      }
+
+      case 'polytope': {
+        const mapper = this._resolveMapper(node, 'mapper');
+        const { vertices, posX, posY, rotation } = node.params;
+        const prim = new PolytopePrimitive({
+          vertices,
+          posX,
+          posY,
+          rotation,
+          distanceMapper: mapper || undefined,
+        });
+        return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) };
       }
 
       case 'regularPolygon': {
         const mapper = this._resolveMapper(node, 'mapper');
         const { sides, size, rotation, posX, posY } = node.params;
-        // Build as N line segments, blend with R-union
-        const prim = new TrianglePrimitive({
-          size, rotation,
-          position: { x: posX, y: posY },
+        const prim = new RegularPolygonPrimitive({
+          sides,
+          size,
+          rotation,
+          posX,
+          posY,
+          distanceMapper: mapper || undefined,
         });
-        // For now delegate to TrianglePrimitive for n=3,
-        // generalised polygon evaluator to be added in Phase 4
-        if (mapper) prim.shapes.forEach(s => { s.distanceMapper = mapper; });
         return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) };
       }
 
@@ -214,13 +230,26 @@ export class NodeEvaluator {
           ? Math.sqrt(Math.abs(T.a * T.d - T.b * T.c))
           : 1;
 
+        // Resolve the base shape instances so we can check their family
+        const shapeA = this.graph.nodes.get(
+          this.graph.getIncomingEdge(node.id, 'sdfA')?.fromNode
+        );
+        const shapeB = this.graph.nodes.get(
+          this.graph.getIncomingEdge(node.id, 'sdfB')?.fromNode
+        );
+        const REGION_TYPES = new Set([
+          'circle','regularPolygon','polytope','ellipse'
+        ]);
+        const aIsRegion = shapeA && REGION_TYPES.has(shapeA.type);
+        const bIsRegion = shapeB && REGION_TYPES.has(shapeB.type);
+
         const sdfFn = (pt, cs = [], t = 0) => {
           const tp = {
             x: T.a * pt.x + T.b * pt.y + T.tx,
             y: T.c * pt.x + T.d * pt.y + T.ty,
           };
-          const dA = sdfA(tp, cs, t) - isoOffset;
-          const dB = sdfB(tp, cs, t) - isoOffset;
+          const dA = sdfA(tp, cs, t) - (aIsRegion ? 0 : isoOffset);
+          const dB = sdfB(tp, cs, t) - (bIsRegion ? 0 : isoOffset);
           let result;
           if (operation === 'intersection') {
             result = weightedRIntersection(dA, dB, smoothness);
@@ -324,7 +353,80 @@ export class NodeEvaluator {
         return { mapper: createCompositeMapping(mA, mB, fn) };
       }
 
-      // ── Transform ─────────────────────────────────────────────────────────
+      // ── Transform ─────────────────────────────────────────────────────────────
+
+      case 'tilingNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+
+        const { lattice, periodX, periodY, offsetX, offsetY } = node.params;
+
+        const foldSquare = (pt) => {
+          const x  = pt.x - offsetX;
+          const y  = pt.y - offsetY;
+          const tx = ((x + periodX / 2) % periodX + periodX) % periodX - periodX / 2;
+          const ty = ((y + periodY / 2) % periodY + periodY) % periodY - periodY / 2;
+          return { x: tx, y: ty };
+        };
+
+        const foldHexagonal = (pt) => {
+          const x   = pt.x - offsetX;
+          const y   = pt.y - offsetY;
+          const p   = periodX;
+          const a1x = p,       a1y = 0;
+          const a2x = p * 0.5, a2y = p * Math.sqrt(3) / 2;
+          const det = a1x * a2y - a1y * a2x;
+          const u   = ( a2y * x - a2x * y) / det;
+          const v   = (-a1y * x + a1x * y) / det;
+          const ru  = Math.round(u);
+          const rv  = Math.round(v);
+          return {
+            x: x - (ru * a1x + rv * a2x),
+            y: y - (ru * a1y + rv * a2y)
+          };
+        };
+
+        const foldTriangular = (pt) => {
+          // Triangular lattice uses a denser hex lattice with period/sqrt(3)
+          // No reflection — pure lattice folding preserves shape orientation
+          const x   = pt.x - offsetX;
+          const y   = pt.y - offsetY;
+          const p   = periodX / Math.sqrt(3);
+          const a1x = p,       a1y = 0;
+          const a2x = p * 0.5, a2y = p * Math.sqrt(3) / 2;
+          const det = a1x * a2y - a1y * a2x;
+          const u   = ( a2y * x - a2x * y) / det;
+          const v   = (-a1y * x + a1x * y) / det;
+          const ru  = Math.round(u);
+          const rv  = Math.round(v);
+          return {
+            x: x - (ru * a1x + rv * a2x),
+            y: y - (ru * a1y + rv * a2y)
+          };
+        };
+
+        const fold = lattice === 'hexagonal'  ? foldHexagonal
+                   : lattice === 'triangular' ? foldTriangular
+                   : foldSquare;
+
+        // Detect if the base shape is a curve primitive (SDF always >= 0)
+        // by checking the node type of the connected shape
+        const baseNode = this.graph.nodes.get(
+          this.graph.getIncomingEdge(node.id, 'sdf')?.fromNode
+        );
+        const CURVE_TYPES = new Set([
+          'lineSegment','triangle','arc'
+        ]);
+        const isCurve  = baseNode && CURVE_TYPES.has(baseNode.type);
+        const { isoOffset = 0.15 } = node.params;
+
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const d = baseSDF(fold(pt), cs, t);
+            return isCurve ? d - isoOffset : d;
+          }
+        };
+      }
 
       case 'affineTransform': {
         const { rotation, scale, posX, posY } = node.params;

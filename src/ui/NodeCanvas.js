@@ -48,13 +48,13 @@
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
-    'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon',
+    'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
     'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
     'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
     'exponentialMapper', 'logarithmicMapper', 'powerMapper',
     'periodicMapper', 'temporalMapper', 'recursiveMapper',
     'blendedMapper', 'compositeMapper',
-    'affineTransform',
+    'affineTransform', 'tilingNode',
     'timeNode', 'oscillatorNode',
     'outputNode',
     ]);
@@ -174,7 +174,7 @@
         font-size: 11px;
         padding: 2px 6px;
         `;
-        ['Line', 'Triangle', 'Arc'].forEach(t => {
+        ['Line', 'Triangle', 'Arc', 'Circle', 'Polygon', 'Polytope'].forEach(t => {
         const o = document.createElement('option');
         o.value = t.toLowerCase();
         o.textContent = t;
@@ -705,8 +705,8 @@
 
     _compose() {
         const GEOM_TYPES = new Set([
-        'triangle','arc','lineSegment','circle','regularPolygon'
-        ]);
+      'triangle','arc','lineSegment','circle','regularPolygon','polytope'
+    ]);
 
         // Collect base shape instances
         const bases = [];

@@ -374,6 +374,9 @@ export class StateStore {
     if (!shape) return null;
     if (shape.type === 'triangle')           return 'triangle';
     if (shape.type === 'arc')                return 'arc';
+    if (shape.type === 'circle')             return 'circle';
+    if (shape.type === 'regularPolygon')     return 'regularPolygon';
+    if (shape.type === 'polytope')           return 'polytope';
     if (shape.type === 'schur-composition')  return 'schurBlend';
     if (shape instanceof ComplexShape2D)     return 'lineSegment';
     return null;
@@ -405,6 +408,33 @@ export class StateStore {
         posX:       shape.position?.x         || 0,
         posY:       shape.position?.y         || 0,
         thickness:  shape.thickness           || 0
+      };
+    }
+
+    if (shape.type === 'circle') {
+      return {
+        radius: shape.radius !== undefined ? shape.radius : 1,
+        posX:   shape.posX   !== undefined ? shape.posX   : 0,
+        posY:   shape.posY   !== undefined ? shape.posY   : 0,
+      };
+    }
+
+    if (shape.type === 'regularPolygon') {
+      return {
+        sides:    shape.sides    !== undefined ? shape.sides    : 6,
+        size:     shape.size     !== undefined ? shape.size     : 1,
+        rotation: shape.rotation !== undefined ? shape.rotation : 0,
+        posX:     shape.posX     !== undefined ? shape.posX     : 0,
+        posY:     shape.posY     !== undefined ? shape.posY     : 0,
+      };
+    }
+
+    if (shape.type === 'polytope') {
+      return {
+        vertices: JSON.stringify(shape.vertices || [[-1,-1],[1,-1],[1,1],[-1,1]]),
+        posX:     shape.posX     !== undefined ? shape.posX     : 0,
+        posY:     shape.posY     !== undefined ? shape.posY     : 0,
+        rotation: shape.rotation !== undefined ? shape.rotation : 0,
       };
     }
 

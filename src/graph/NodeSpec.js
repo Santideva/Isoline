@@ -127,6 +127,23 @@ export const NODE_TYPES = {
     ],
   },
 
+  polytope: {
+    type: 'polytope',
+    category: 'geometry',
+    label: 'Polytope',
+    timeVarying: false,
+    ports: [
+      { name: 'mapper', type: PortType.MAPPER, dir: PortDirection.IN,  required: false, default: null },
+      { name: 'sdf',    type: PortType.SDF,    dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'vertices', type: 'string',  default: '[[-1,-1],[1,-1],[1,1],[-1,1]]' },
+      { name: 'posX',     type: 'number',  default: 0, min: -10, max: 10, step: 0.01 },
+      { name: 'posY',     type: 'number',  default: 0, min: -10, max: 10, step: 0.01 },
+      { name: 'rotation', type: 'number',  default: 0, min: 0, max: 6.28, step: 0.01 },
+    ],
+  },
+
   regularPolygon: {
     type: 'regularPolygon',
     category: 'geometry',
@@ -399,6 +416,26 @@ export const NODE_TYPES = {
         options: ['add', 'subtract', 'multiply', 'divide', 'min', 'max'] },
     ],
   },
+
+  tilingNode: {
+    type: 'tilingNode',
+    category: 'transform',
+    label: 'Tiling',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'lattice',  type: 'select', default: 'square',
+        options: ['square', 'hexagonal', 'triangular'] },
+      { name: 'periodX',  type: 'number', default: 3,   min: 0.1, max: 20, step: 0.1 },
+      { name: 'periodY',  type: 'number', default: 3,   min: 0.1, max: 20, step: 0.1 },
+      { name: 'offsetX',  type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'offsetY',  type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'isoOffset', type: 'number', default: 0.15, min: 0, max: 2, step: 0.01 },
+    ],
+  }, 
 
   // ── Transform ─────────────────────────────────────────────────────────────
 

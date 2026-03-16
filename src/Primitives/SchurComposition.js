@@ -101,7 +101,15 @@ export class SchurComposition extends DerivativePrimitive {
     this._Tinv        = invertAffine(this._T);
     this._needsUpdate = false;
 
-    logger.info(`[${this.id}] SchurComposition ready. Scale factor: ${this._scaleFactor.toFixed(4)}`);
+    // A composition is a region if ALL its base shapes are regions.
+    // Mixed compositions (region + curve) behave as curve since the
+    // overall field still needs isoOffset for the curve components.
+    this.family = this.baseShapes.length > 0 &&
+      this.baseShapes.every(s => s.family === 'region')
+      ? 'region'
+      : 'curve';
+
+    logger.info(`[${this.id}] SchurComposition ready. Scale factor: ${this._scaleFactor.toFixed(4)}, family: ${this.family}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -169,13 +177,18 @@ export class SchurComposition extends DerivativePrimitive {
       const T = this._T;
       const tp = {
         x: T.a * point.x + T.b * point.y + T.tx,
-        y: T.c * point.x + T.d * point.y + T.ty
+        y: T.c * point.x + T.d * point.y + T.ty,
       };
 
-      // Evaluate each base shape at the transformed point
-      const sdfValues = this.baseShapes.map(shape =>
-        shape.computeSDF(tp, [...callStack], time, depth) - this.isoOffset
-      );
+      // Evaluate each base shape at the transformed point.
+      // isoOffset is only applied to curve primitives (family === 'curve')
+      // which have no natural zero crossing. Region primitives (circle,
+      // regularPolygon etc.) have genuine inside/outside semantics —
+      // their zero crossing IS the boundary, no offset needed.
+      const sdfValues = this.baseShapes.map(shape => {
+        const d = shape.computeSDF(tp, [...callStack], time, depth);
+        return shape.family === 'region' ? d : d - this.isoOffset;
+      });
 
       // Blend according to the configured strategy and operations
       let result = sdfValues[0];

@@ -6,6 +6,7 @@ import { CameraManager } from "./cameraManager.js";
 import { LightingManager } from "./LightingManager.js";
 import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
 import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
+import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from "../Primitives/regionPrimitives.js";
 import { SchurComposition } from "../Primitives/SchurComposition.js";
 import { createPolynomialMapping } from "../utils/DistanceMapping.js";
 import { stateStore } from "../state/stateStore.js";
@@ -120,6 +121,54 @@ export class SceneManager {
         entry = { instance: arc, type: "arc" };
         entry.object = arc.createObject();
         logger.info("Arc primitive instantiated.");
+        break;
+      }
+
+      case "polytope": {
+        const polytopeCount = this.activePrimitives.filter(p => p.type === 'polytope').length;
+        const polytope = new PolytopePrimitive({
+          vertices: '[[-1,-1],[1,-1],[1,1],[-1,1]]',
+          posX: (polytopeCount % 3) * 3,
+          posY: Math.floor(polytopeCount / 3) * 3,
+          color: { h: 280, s: 0.7, l: 0.55, a: 1 },
+        });
+        stateStore.addShape(polytope);
+        entry = { instance: polytope, type: 'polytope' };
+        entry.object = polytope.createObject();
+        logger.info("Polytope primitive instantiated.");
+        break;
+      }
+
+      case "regularpolygon":
+      case "polygon": {
+        const polyCount = this.activePrimitives.filter(p => p.type === 'regularPolygon').length;
+        const poly = new RegularPolygonPrimitive({
+          sides:    6,
+          size:     1,
+          rotation: 0,
+          posX: (polyCount % 3) * 2.5,
+          posY: Math.floor(polyCount / 3) * 2.5,
+          color: { h: 120, s: 0.7, l: 0.55, a: 1 },
+        });
+        stateStore.addShape(poly);
+        entry = { instance: poly, type: 'regularPolygon' };
+        entry.object = poly.createObject();
+        logger.info(`RegularPolygon primitive instantiated (${poly.sides} sides).`);
+        break;
+      }
+
+      case "circle": {
+        const circleCount = this.activePrimitives.filter(p => p.type === 'circle').length;
+        const circle = new CirclePrimitive({
+          radius: 1,
+          posX: (circleCount % 3) * 2.5,
+          posY: Math.floor(circleCount / 3) * 2.5,
+          color: { h: 160, s: 0.8, l: 0.5, a: 1 },
+        });
+        stateStore.addShape(circle);
+        entry = { instance: circle, type: 'circle' };
+        entry.object = circle.createObject();
+        logger.info("Circle primitive instantiated.");
         break;
       }
 
@@ -359,15 +408,13 @@ export class SceneManager {
     const bounds2D = [-4, -4, 4, 4];
     const bounds3D = [-4, -4, -4, 4, 4, 4];
 
-    // sdfOverride lets callers (e.g. NodeCanvas cascade compose) bypass
-    // the evaluator and supply the SDF function directly.
     let sdfFn;
     if (sdfOverride) {
       sdfFn = sdfOverride;
     } else {
       this.evaluator.invalidate();
       const rootSDF = this.evaluator.getRootSDF();
-      sdfFn = rootSDF || (pt => schur.computeSDF(pt));
+      sdfFn = rootSDF || (schur ? (pt => schur.computeSDF(pt)) : () => Infinity);
     }
 
     switch (method) {
@@ -418,6 +465,25 @@ export class SceneManager {
    * @param {string} method  render method string
    * @param {Function} sdfOverride  optional direct SDF function
    */
+
+  /**
+   * Render any SDF function directly to the scene without requiring
+   * a currentSchur composition. Used for tiling, transform nodes etc.
+   * Stores the result in this.currentSchur so rerender() works afterwards.
+   */
+  renderSDF(sdfFn, method = 'contours (2D)') {
+    // Remove previous render if any
+    if (this.currentSchur) {
+      this._removeFromScene(this.currentSchur);
+      this.currentSchur = null;
+    }
+
+    const threeObj = this._buildSchurObject(null, method, sdfFn);
+    const entry    = { instance: { computeSDF: sdfFn, family: 'region' }, type: 'schur', object: threeObj };
+    this.currentSchur = entry;
+    this._addToScene(entry);
+  }
+
   rerender(method, sdfOverride = null) {
     if (!this.currentSchur) return;
 

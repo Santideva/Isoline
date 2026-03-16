@@ -38,8 +38,8 @@ const ORIGIN_Y      = 60;   // canvas y of the topmost row
  * are NOT shown.
  */
 const TOP_LEVEL_TYPES = new Set([
-  'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon',
-  'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
+  'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
+  'tilingNode', 'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
   'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
   'exponentialMapper', 'logarithmicMapper', 'powerMapper',
   'periodicMapper', 'temporalMapper', 'recursiveMapper',
