@@ -1,0 +1,166 @@
+#!/usr/bin/env node
+/**
+ * scripts/build-source.js
+ *
+ * Usage:
+ *   node scripts/build-source.js -o complexprimitives.source.txt
+ *
+ * What it does:
+ * - Walks ./src for .js/.mjs/.cjs files (skips node_modules)
+ * - Parses `import ... from '...'` and `require('...')`
+ * - Resolves *relative* imports to actual files (.js, .mjs, /index.js)
+ * - Builds dependency graph and topologically sorts files
+ * - On cycles, falls back to a reasonable fallback order, but warns
+ * - Prints concatenated file with `// ---- FILE: <path> ----` separators
+ *
+ * Notes:
+ * - Non-relative imports (like 'three', 'lodash') are ignored.
+ * - If you want a different root folder, change ROOT_DIR below.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const ROOT_DIR = path.resolve(process.cwd(), 'src');
+const OUT_DEFAULT = 'complexprimitives.source.txt';
+const exts = ['.js', '.mjs', '.cjs'];
+
+function usageAndExit() {
+  console.error('Usage: node scripts/build-source.js [-o outfile]');
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+let outFile = OUT_DEFAULT;
+for (let i=0;i<args.length;i++){
+  if (args[i]==='-o' || args[i]==='--out'){ outFile = args[++i] || OUT_DEFAULT; }
+  else usageAndExit();
+}
+
+if (!fs.existsSync(ROOT_DIR)) {
+  console.error('Error: src directory not found at', ROOT_DIR);
+  process.exit(2);
+}
+
+function walk(dir){
+  const res=[];
+  const items = fs.readdirSync(dir, { withFileTypes: true });
+  for (const it of items){
+    if (it.name === 'node_modules') continue;
+    const full = path.join(dir, it.name);
+    if (it.isDirectory()) res.push(...walk(full));
+    else {
+      const ext = path.extname(it.name).toLowerCase();
+      if (exts.includes(ext)) res.push(full);
+    }
+  }
+  return res;
+}
+
+const files = walk(ROOT_DIR).map(p => path.resolve(p));
+
+function readFile(p){ return fs.readFileSync(p, 'utf8'); }
+
+function findImportPaths(content){
+  // crude regexes but good for typical code
+  const imports = [];
+  // ES6 imports
+  const reImport = /import\s+(?:[\s\S]+?)\s+from\s+['"]([^'"]+)['"]/g;
+  let m;
+  while ((m = reImport.exec(content)) !== null) imports.push(m[1]);
+  // bare "import 'module';"
+  const reImportBare = /import\s+['"]([^'"]+)['"]/g;
+  while ((m = reImportBare.exec(content)) !== null) imports.push(m[1]);
+  // CommonJS require
+  const reRequire = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  while ((m = reRequire.exec(content)) !== null) imports.push(m[1]);
+  return imports;
+}
+
+function resolveRelativeImport(fromFile, spec) {
+  if (!spec.startsWith('.')) return null; // not a relative import
+  const base = path.dirname(fromFile);
+  const candidate = path.resolve(base, spec);
+  // try exact file
+  for (const e of ['', ...exts]) {
+    const p = candidate + e;
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+  }
+  // try index files in directory
+  for (const e of exts) {
+    const p = path.join(candidate, 'index' + e);
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+  }
+  return null;
+}
+
+// Build dependency graph
+const graph = new Map(); // file -> Set(depFile)
+for (const f of files) graph.set(f, new Set());
+
+for (const f of files) {
+  try {
+    const content = readFile(f);
+    const imports = findImportPaths(content);
+    for (const spec of imports) {
+      const resolved = resolveRelativeImport(f, spec);
+      if (resolved && graph.has(resolved)) {
+        graph.get(f).add(resolved);
+      }
+    }
+  } catch(e) {
+    console.error('Error reading', f, e);
+  }
+}
+
+// Topological sort (Kahn)
+function topoSort(g) {
+  const inDegree = new Map();
+  for (const k of g.keys()) inDegree.set(k, 0);
+  for (const [u, deps] of g.entries()) {
+    for (const v of deps) inDegree.set(v, (inDegree.get(v) || 0) + 1);
+  }
+  const queue = [];
+  for (const [k, deg] of inDegree.entries()) if (deg === 0) queue.push(k);
+  const order = [];
+  while (queue.length) {
+    const u = queue.shift();
+    order.push(u);
+    for (const v of g.get(u) || []) {
+      inDegree.set(v, inDegree.get(v) - 1);
+      if (inDegree.get(v) === 0) queue.push(v);
+    }
+  }
+  // if we didn't include all nodes, there's a cycle
+  if (order.length !== g.size) return null;
+  return order;
+}
+
+let order = topoSort(graph);
+
+if (!order) {
+  console.warn('Warning: dependency cycle detected. Falling back to heuristic order.');
+  // Heuristic fallback: start with files that are not imported by others (roots),
+  // then append remaining files sorted by path. This at least tends to preserve "entry first".
+  const imported = new Set();
+  for (const deps of graph.values()) for (const d of deps) imported.add(d);
+  const roots = [...graph.keys()].filter(k => !imported.has(k)).sort();
+  const others = [...graph.keys()].filter(k => imported.has(k)).sort();
+  order = [...roots, ...others];
+}
+
+// Write output
+const outParts = [];
+outParts.push('// Combined source file generated by scripts/build-source.js');
+outParts.push(`// Generated: ${new Date().toISOString()}`);
+outParts.push(`// Root: ${ROOT_DIR}`);
+outParts.push('');
+
+for (const f of order) {
+  outParts.push(`\n\n// ---- FILE: ${path.relative(process.cwd(), f)} ----\n`);
+  const c = readFile(f);
+  outParts.push(c);
+}
+
+fs.writeFileSync(path.resolve(process.cwd(), outFile), outParts.join('\n'), 'utf8');
+console.log('Wrote', outFile, 'with', order.length, 'files.');

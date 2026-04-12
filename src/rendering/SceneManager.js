@@ -7,12 +7,16 @@ import { LightingManager } from "./LightingManager.js";
 import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
 import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
 import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from "../Primitives/regionPrimitives.js";
+import { SpherePrimitive, BoxPrimitive, CylinderPrimitive, CapsulePrimitive, TorusPrimitive, ConePrimitive, InfinitePlanePrimitive } from "../Primitives/solidPrimitives.js";
 import { SchurComposition } from "../Primitives/SchurComposition.js";
 import { createPolynomialMapping } from "../utils/DistanceMapping.js";
 import { stateStore } from "../state/stateStore.js";
 import { logger } from "../utils/logger.js";
 import * as meshCreator from "../utils/meshCreator.js";
-import { NodeEvaluator } from "../graph/NodeEvaluator.js";
+import { NodeEvaluator }  from "../graph/NodeEvaluator.js";
+import { GLSLEvaluator }  from "./GLSLEvaluator.js";
+import { SDFRenderer }      from "./SDFRenderer.js";
+import { RayMarchRenderer } from "./RayMarchRenderer.js";
 
 
 export class SceneManager {
@@ -39,6 +43,13 @@ export class SceneManager {
 
     // ── Node graph evaluator ───────────────────────────────────────────────
     this.evaluator = new NodeEvaluator(stateStore.nodeGraph);
+
+    // ── GLSL renderer (Phase 5a) ───────────────────────────────────────────
+    this.glslEvaluator    = new GLSLEvaluator(stateStore.nodeGraph);
+    this.sdfRenderer      = new SDFRenderer(mountElement);
+    this.rayMarchRenderer = new RayMarchRenderer(mountElement);
+    // 'marchingSquares' | 'glsl' | 'rayMarch'
+    this.renderMode       = 'marchingSquares';
 
     // ── Animation ─────────────────────────────────────────────────────────
     this._startTime    = performance.now();
@@ -95,6 +106,7 @@ export class SceneManager {
         });
         triangle.registerWithStateStore(stateStore);
         stateStore.addShape(triangle);
+        this._registerPrimInGraph(triangle, 'triangle', { size: triangle.size, rotation: triangle.rotation, posX: triangle.position?.x ?? 0, posY: triangle.position?.y ?? 0, cornerRounding: triangle.cornerRounding ?? 0 });
         entry = { instance: triangle, type: "triangle" };
         entry.object = triangle.createObject();
         logger.info("Triangle primitive instantiated.");
@@ -118,6 +130,7 @@ export class SceneManager {
         });
         arc.registerWithStateStore(stateStore);
         stateStore.addShape(arc);
+        this._registerPrimInGraph(arc, 'arc', { radius: arc.radius, startAngle: arc.startAngle, endAngle: arc.endAngle, segments: arc.segments, posX: arc.position?.x ?? 0, posY: arc.position?.y ?? 0 });
         entry = { instance: arc, type: "arc" };
         entry.object = arc.createObject();
         logger.info("Arc primitive instantiated.");
@@ -133,6 +146,7 @@ export class SceneManager {
           color: { h: 280, s: 0.7, l: 0.55, a: 1 },
         });
         stateStore.addShape(polytope);
+        this._registerPrimInGraph(polytope, 'polytope', { vertices: polytope.vertices || '[[-1,-1],[1,-1],[1,1],[-1,1]]', posX: polytope.posX ?? 0, posY: polytope.posY ?? 0, rotation: polytope.rotation ?? 0 });
         entry = { instance: polytope, type: 'polytope' };
         entry.object = polytope.createObject();
         logger.info("Polytope primitive instantiated.");
@@ -151,6 +165,7 @@ export class SceneManager {
           color: { h: 120, s: 0.7, l: 0.55, a: 1 },
         });
         stateStore.addShape(poly);
+        this._registerPrimInGraph(poly, 'regularPolygon', { sides: poly.sides, size: poly.size, rotation: poly.rotation, posX: poly.posX, posY: poly.posY });
         entry = { instance: poly, type: 'regularPolygon' };
         entry.object = poly.createObject();
         logger.info(`RegularPolygon primitive instantiated (${poly.sides} sides).`);
@@ -166,9 +181,114 @@ export class SceneManager {
           color: { h: 160, s: 0.8, l: 0.5, a: 1 },
         });
         stateStore.addShape(circle);
+        this._registerPrimInGraph(circle, 'circle', { radius: circle.radius, posX: circle.posX, posY: circle.posY });
         entry = { instance: circle, type: 'circle' };
         entry.object = circle.createObject();
         logger.info("Circle primitive instantiated.");
+        break;
+      }
+
+      case "sphere": {
+        const count = this.activePrimitives.filter(p => p.type === 'sphere').length;
+        const prim  = new SpherePrimitive({
+          radius: 1,
+          posX: (count % 3) * 2.5, posY: 0, posZ: 0,
+          color: { h: 200, s: 0.8, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'sphere', { radius: prim.radius, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        entry = { instance: prim, type: 'sphere', object: prim.createObject() };
+        logger.info('Sphere primitive instantiated.');
+        break;
+      }
+
+      case "box": {
+        const count = this.activePrimitives.filter(p => p.type === 'box').length;
+        const prim  = new BoxPrimitive({
+          width: 2, height: 2, depth: 2,
+          posX: (count % 3) * 3, posY: 0, posZ: 0,
+          color: { h: 30, s: 0.8, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'box', { width: prim.width, height: prim.height, depth: prim.depth, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        entry = { instance: prim, type: 'box', object: prim.createObject() };
+        logger.info('Box primitive instantiated.');
+        break;
+      }
+
+      case "cylinder": {
+        const count = this.activePrimitives.filter(p => p.type === 'cylinder').length;
+        const prim  = new CylinderPrimitive({
+          radius: 1, height: 2, capped: true,
+          posX: (count % 3) * 2.5, posY: 0, posZ: 0,
+          color: { h: 120, s: 0.7, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'cylinder', { radius: prim.radius, height: prim.height, capped: prim.capped ? 'yes' : 'no', posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        entry = { instance: prim, type: 'cylinder', object: prim.createObject() };
+        logger.info('Cylinder primitive instantiated.');
+        break;
+      }
+
+      case "capsule": {
+        const count = this.activePrimitives.filter(p => p.type === 'capsule').length;
+        const prim  = new CapsulePrimitive({
+          ax: 0, ay: -1, az: 0,
+          bx: 0, by:  1, bz: 0,
+          radius: 0.5,
+          color: { h: 280, s: 0.7, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'capsule', { ax: prim.ax, ay: prim.ay, az: prim.az, bx: prim.bx, by: prim.by, bz: prim.bz, radius: prim.radius });
+        entry = { instance: prim, type: 'capsule', object: prim.createObject() };
+        logger.info('Capsule primitive instantiated.');
+        break;
+      }
+
+      case "torus": {
+        const count = this.activePrimitives.filter(p => p.type === 'torus').length;
+        const prim  = new TorusPrimitive({
+          majorRadius: 2, minorRadius: 0.5,
+          posX: (count % 3) * 5, posY: 0, posZ: 0,
+          color: { h: 340, s: 0.8, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'torus', { majorRadius: prim.majorRadius, minorRadius: prim.minorRadius, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        entry = { instance: prim, type: 'torus', object: prim.createObject() };
+        logger.info('Torus primitive instantiated.');
+        break;
+      }
+
+      case "cone": {
+        const count = this.activePrimitives.filter(p => p.type === 'cone').length;
+        const prim  = new ConePrimitive({
+          radius: 1,
+          height: 2,
+          posX: (count % 3) * 2.5,
+          posY: 0,
+          posZ: 0,
+          color: { h: 20, s: 0.8, l: 0.5, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'cone', { radius: prim.radius, height: prim.height, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        entry = { instance: prim, type: 'cone', object: prim.createObject() };
+        logger.info('Cone primitive instantiated.');
+        break;
+      }
+
+      case "plane": {
+        const count = this.activePrimitives.filter(p => p.type === 'plane').length;
+        const prim  = new InfinitePlanePrimitive({
+          nx: 0,
+          ny: 1,
+          nz: 0,
+          offset: 0,
+          color: { h: 210, s: 0.2, l: 0.7, a: 1 }
+        });
+        stateStore.addShape(prim);
+        this._registerPrimInGraph(prim, 'plane', { nx: prim.nx, ny: prim.ny, nz: prim.nz, offset: prim.offset });
+        entry = { instance: prim, type: 'plane', object: prim.createObject() };
+        logger.info('InfinitePlane primitive instantiated.');
         break;
       }
 
@@ -382,7 +502,15 @@ export class SceneManager {
     }
 
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+
+    if (this.renderMode === 'glsl') {
+      this._renderGLSL();
+    } else if (this.renderMode === 'rayMarch') {
+      this.rayMarchRenderer.syncCamera(this.camera, this.controls);
+      this._renderRayMarch();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -456,6 +584,8 @@ export class SceneManager {
   _onResize() {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.cameraManager.updateAspect(window.innerWidth, window.innerHeight);
+    this.sdfRenderer.resize(window.innerWidth, window.innerHeight);
+    this.rayMarchRenderer.resize(window.innerWidth, window.innerHeight);
   }
 
   /**
@@ -472,6 +602,10 @@ export class SceneManager {
    * Stores the result in this.currentSchur so rerender() works afterwards.
    */
   renderSDF(sdfFn, method = 'contours (2D)') {
+    if (this.renderMode === 'glsl') {
+      this._renderGLSL();
+      return;
+    }
     // Remove previous render if any
     if (this.currentSchur) {
       this._removeFromScene(this.currentSchur);
@@ -484,7 +618,109 @@ export class SceneManager {
     this._addToScene(entry);
   }
 
+  /**
+   * Set ray march quality parameters.
+   * @param {number} maxSteps  Maximum sphere-tracing iterations (default 128)
+   * @param {number} epsilon   Hit threshold (default 0.001)
+   * @param {number} maxDist   Maximum ray travel distance (default 30)
+   */
+  setRayMarchQuality(maxSteps = 128, epsilon = 0.001, maxDist = 30) {
+    this.rayMarchRenderer._maxSteps = maxSteps;
+    this.rayMarchRenderer._epsilon  = epsilon;
+    this.rayMarchRenderer._maxDist  = maxDist;
+    // Recompile with new step count baked into shader
+    this._lastRayMarchSource = null;
+  }
+  
+  /**
+   * Switch between 'marchingSquares' and 'glsl' render modes.
+   * Toggles visibility of the Three.js canvas and the SDFRenderer canvas.
+   * @param {'marchingSquares'|'glsl'} mode
+   */
+  setRenderMode(mode) {
+    this.renderMode = mode;
+    const threeCanvas = this.renderer.domElement;
+
+    // Hide all non-Three.js renderers first
+    this.sdfRenderer.hide();
+    this.rayMarchRenderer.hide();
+
+    if (mode === 'glsl') {
+      threeCanvas.style.opacity = '0';
+      threeCanvas.style.pointerEvents = 'none';
+      this.sdfRenderer.show();
+    } else if (mode === 'rayMarch') {
+      threeCanvas.style.opacity = '0';
+      threeCanvas.style.pointerEvents = 'auto';
+      this.rayMarchRenderer.show(); } else {
+      threeCanvas.style.opacity = '1';
+      threeCanvas.style.pointerEvents = '';
+    }
+  }
+
+  /**
+   * Compile and render the current node graph using the GLSL pipeline.
+   * Called by NodeCanvas when the user switches to GLSL mode or
+   * after a compose/rerender in GLSL mode.
+   */
+  _renderGLSL() {
+    const time = (performance.now() - this._startTime) / 1000;
+    const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '2d');
+
+    if (!source || !rootFn) {
+      console.warn('SDFRenderer: GLSLEvaluator produced no source — nothing to render.');
+      return;
+    }
+
+    // Only recompile if the source changed
+    if (source !== this._lastGLSLSource) {
+      const result = this.sdfRenderer.compile(source);
+      if (!result.ok) {
+        console.error('SDFRenderer compile error:\n', result.error);
+        return;
+      }
+      this._lastGLSLSource = source;
+      logger.info('SDFRenderer: shader compiled successfully.');
+    }
+
+    this.sdfRenderer.render(uniforms, time);
+  }
+
+  /**
+   * Compile and render using the ray march renderer.
+   * Requires 3D GLSL templates in GLSLEvaluator (Phase 5d).
+   * For now syncs camera from Three.js and renders with existing shader.
+   */
+  _renderRayMarch() {
+    const time = (performance.now() - this._startTime) / 1000;
+    const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
+
+    if (!source || !rootFn) {
+      console.warn('RayMarchRenderer: no source from GLSLEvaluator.');
+      return;
+    }
+
+    if (source !== this._lastRayMarchSource) {
+      const result = this.rayMarchRenderer.compile(source);
+      if (!result.ok) {
+        console.error('RayMarchRenderer compile error:\n', result.error);
+        return;
+      }
+      this._lastRayMarchSource = source;
+      logger.info('RayMarchRenderer: shader compiled.');
+    }
+
+    // Sync camera from Three.js OrbitControls
+    this.rayMarchRenderer.syncCamera(this.camera, this.controls);
+    this.rayMarchRenderer.render(uniforms, time);
+  }
+
   rerender(method, sdfOverride = null) {
+    if (this.renderMode === 'glsl') {
+      this._renderGLSL();
+      return;
+    }
+
     if (!this.currentSchur) return;
 
     this._removeFromScene(this.currentSchur);
@@ -496,6 +732,22 @@ export class SceneManager {
     );
     this.currentSchur.object = threeObj;
     this._addToScene(this.currentSchur);
+  }
+
+  /**
+   * Register a newly created primitive as a node in the node graph.
+   * Uses forceId so the node graph ID matches the primitive instance ID,
+   * allowing graph.addEdge(prim.id, ...) to work directly.
+   * @param {SolidPrimitive|RegionPrimitive} prim
+   * @param {string} nodeType  The NODE_TYPES key e.g. 'circle', 'sphere'
+   * @param {object} params    The node params (mirrors prim properties)
+   */
+  _registerPrimInGraph(prim, nodeType, params) {
+    const graph = stateStore.nodeGraph;
+    // Only register if not already present (idempotent)
+    if (!graph.nodes.has(prim.id)) {
+      graph.addNode(nodeType, params, { x: 0, y: 0 }, prim.id);
+    }
   }
 
   _ensureOutputNode() {

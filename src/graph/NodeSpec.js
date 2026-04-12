@@ -162,6 +162,157 @@ export const NODE_TYPES = {
     ],
   },
 
+  // ── Solid geometry ────────────────────────────────────────────────────────
+
+  sphere: {
+    type: 'sphere',
+    category: 'geometry',
+    label: 'Sphere',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'radius', type: 'number', default: 1,  min: 0.01, max: 10, step: 0.01 },
+      { name: 'posX',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posY',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posZ',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+    ],
+  },
+
+  box: {
+    type: 'box',
+    category: 'geometry',
+    label: 'Box',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'width',  type: 'number', default: 2,  min: 0.01, max: 10, step: 0.01 },
+      { name: 'height', type: 'number', default: 2,  min: 0.01, max: 10, step: 0.01 },
+      { name: 'depth',  type: 'number', default: 2,  min: 0.01, max: 10, step: 0.01 },
+      { name: 'posX',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posY',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posZ',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+    ],
+  },
+
+  cylinder: {
+    type: 'cylinder',
+    category: 'geometry',
+    label: 'Cylinder',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'radius', type: 'number', default: 1,    min: 0.01, max: 10,  step: 0.01 },
+      { name: 'height', type: 'number', default: 2,    min: 0.01, max: 20,  step: 0.01 },
+      { name: 'capped', type: 'select', default: 'yes', options: ['yes','no'] },
+      { name: 'posX',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
+      { name: 'posY',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
+      { name: 'posZ',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
+    ],
+  },
+
+  capsule: {
+    type: 'capsule',
+    category: 'geometry',
+    label: 'Capsule',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'ax',     type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'ay',     type: 'number', default: -1,  min: -10, max: 10, step: 0.01 },
+      { name: 'az',     type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'bx',     type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'by',     type: 'number', default: 1,   min: -10, max: 10, step: 0.01 },
+      { name: 'bz',     type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
+      { name: 'radius', type: 'number', default: 0.5, min: 0.01, max: 5, step: 0.01 },
+    ],
+  },
+
+  torus: {
+    type: 'torus',
+    category: 'geometry',
+    label: 'Torus',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'majorRadius', type: 'number', default: 2,   min: 0.1, max: 10, step: 0.01 },
+      { name: 'minorRadius', type: 'number', default: 0.5, min: 0.01, max: 5, step: 0.01 },
+      { name: 'posX',        type: 'number', default: 0,   min: -10,  max: 10, step: 0.01 },
+      { name: 'posY',        type: 'number', default: 0,   min: -10,  max: 10, step: 0.01 },
+      { name: 'posZ',        type: 'number', default: 0,   min: -10,  max: 10, step: 0.01 },
+    ],
+  },
+
+  extrudeNode: {
+    type: 'extrudeNode',
+    category: 'transform',
+    label: 'Extrude',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'height', type: 'number', default: 1, min: 0.01, max: 20, step: 0.01 },
+    ],
+  },
+
+  revolveNode: {
+    type: 'revolveNode',
+    category: 'transform',
+    label: 'Revolve',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'offset', type: 'number', default: 0, min: -5, max: 5, step: 0.01 },
+    ],
+  },
+
+  cone: {
+    type: 'cone',
+    category: 'geometry',
+    label: 'Cone',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'radius', type: 'number', default: 1,  min: 0.01, max: 10, step: 0.01 },
+      { name: 'height', type: 'number', default: 2,  min: 0.01, max: 20, step: 0.01 },
+      { name: 'posX',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posY',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+      { name: 'posZ',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
+    ],
+  },
+
+  plane: {
+    type: 'plane',
+    category: 'geometry',
+    label: 'Infinite Plane',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'nx',     type: 'number', default: 0,  min: -1,  max: 1,  step: 0.01 },
+      { name: 'ny',     type: 'number', default: 1,  min: -1,  max: 1,  step: 0.01 },
+      { name: 'nz',     type: 'number', default: 0,  min: -1,  max: 1,  step: 0.01 },
+      { name: 'offset', type: 'number', default: 0,  min: -10, max: 10, step: 0.01 },
+    ],
+  },
+
   // ── Blend ─────────────────────────────────────────────────────────────────
 
   rUnion: {
@@ -417,6 +568,66 @@ export const NODE_TYPES = {
     ],
   },
 
+  symmetryFoldNode: {
+    type: 'symmetryFoldNode',
+    category: 'transform',
+    label: 'Symmetry Fold',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'folds',    type: 'number', default: 6,    min: 1,  max: 32,   step: 1    },
+      { name: 'centerX',  type: 'number', default: 0,    min: -5, max: 5,    step: 0.01 },
+      { name: 'centerY',  type: 'number', default: 0,    min: -5, max: 5,    step: 0.01 },
+      { name: 'rotation', type: 'number', default: 0,    min: 0,  max: 6.28, step: 0.01 },
+      { name: 'reflectX', type: 'select', default: 'no', options: ['yes', 'no'] },
+      { name: 'reflectY', type: 'select', default: 'no', options: ['yes', 'no'] },
+    ],
+  },
+
+  symmetryOrbitNode: {
+    type: 'symmetryOrbitNode',
+    category: 'transform',
+    label: 'Symmetry Orbit',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'folds',      type: 'number', default: 6,     min: 1,  max: 32,   step: 1    },
+      { name: 'centerX',    type: 'number', default: 0,     min: -5, max: 5,    step: 0.01 },
+      { name: 'centerY',    type: 'number', default: 0,     min: -5, max: 5,    step: 0.01 },
+      { name: 'rotation',   type: 'number', default: 0,     min: 0,  max: 6.28, step: 0.01 },
+      { name: 'reflectX',   type: 'select', default: 'no',  options: ['yes', 'no'] },
+      { name: 'combiner',   type: 'select', default: 'min', options: ['min', 'max', 'smoothMin'] },
+      { name: 'smoothness', type: 'number', default: 8,     min: 0,  max: 32,   step: 0.1  },
+    ],
+  },
+
+  mobiusNode: {
+    type: 'mobiusNode',
+    category: 'transform',
+    label: 'Möbius Transform',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'aRe', type: 'number', default: 1,  min: -5, max: 5, step: 0.01 },
+      { name: 'aIm', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+      { name: 'bRe', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+      { name: 'bIm', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+      { name: 'cRe', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+      { name: 'cIm', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+      { name: 'dRe', type: 'number', default: 1,  min: -5, max: 5, step: 0.01 },
+      { name: 'dIm', type: 'number', default: 0,  min: -5, max: 5, step: 0.01 },
+    ],
+  },
+
   tilingNode: {
     type: 'tilingNode',
     category: 'transform',
@@ -428,7 +639,7 @@ export const NODE_TYPES = {
     ],
     params: [
       { name: 'lattice',  type: 'select', default: 'square',
-        options: ['square', 'hexagonal', 'triangular'] },
+        options: ['square', 'hexagonal', 'triangular', 'brick'] },
       { name: 'periodX',  type: 'number', default: 3,   min: 0.1, max: 20, step: 0.1 },
       { name: 'periodY',  type: 'number', default: 3,   min: 0.1, max: 20, step: 0.1 },
       { name: 'offsetX',  type: 'number', default: 0,   min: -10, max: 10, step: 0.01 },
@@ -486,6 +697,69 @@ export const NODE_TYPES = {
   },
 
   // ── Output ────────────────────────────────────────────────────────────────
+
+  noiseDisplaceNode: {
+    type: 'noiseDisplaceNode',
+    category: 'transform',
+    label: 'Noise Displace',
+    timeVarying: true,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'amplitude', type: 'number', default: 0.3,  min: 0,    max: 2,    step: 0.01 },
+      { name: 'frequency', type: 'number', default: 3.0,  min: 0.1,  max: 20,   step: 0.1  },
+      { name: 'animated',  type: 'select', default: 'no', options: ['yes','no'] },
+    ],
+  },
+
+  twistNode: {
+    type: 'twistNode',
+    category: 'transform',
+    label: 'Twist',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'strength', type: 'number', default: 1.0, min: -10, max: 10, step: 0.1 },
+    ],
+  },
+
+  bendNode: {
+    type: 'bendNode',
+    category: 'transform',
+    label: 'Bend',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'strength', type: 'number', default: 0.5, min: -5, max: 5, step: 0.1 },
+    ],
+  },
+
+  repeatNode: {
+    type: 'repeatNode',
+    category: 'transform',
+    label: 'Repeat',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'countX', type: 'number', default: 3,   min: 1, max: 20,  step: 1    },
+      { name: 'countY', type: 'number', default: 3,   min: 1, max: 20,  step: 1    },
+      { name: 'countZ', type: 'number', default: 1,   min: 1, max: 20,  step: 1    },
+      { name: 'spacingX', type: 'number', default: 3, min: 0.1, max: 20, step: 0.1 },
+      { name: 'spacingY', type: 'number', default: 3, min: 0.1, max: 20, step: 0.1 },
+      { name: 'spacingZ', type: 'number', default: 3, min: 0.1, max: 20, step: 0.1 },
+    ],
+  },
 
   outputNode: {
     type: 'outputNode',

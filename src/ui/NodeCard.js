@@ -321,16 +321,25 @@ export class NodeCard {
       ${direction === 'out' ? 'flex-direction: row-reverse;' : ''}
     `;
 
+    // OUT ports are bright blue — these are sources you drag FROM
+    // IN  ports are amber/orange — these are targets you drop ONTO
+    const OUT_COLOR = PORT_COLORS[portSpec.type] || '#4A90D9';
+    const IN_COLOR  = portSpec.type === 'sdf'    ? '#E8943A'
+                    : portSpec.type === 'mapper'  ? '#C97FD4'
+                    : portSpec.type === 'scalar'  ? '#7FD48A'
+                    : '#888';
+    const dotColor  = direction === 'out' ? OUT_COLOR : IN_COLOR;
+
     const dot = document.createElement('div');
     dot.style.cssText = `
       width:  ${PORT_D}px;
       height: ${PORT_D}px;
       border-radius: 50%;
-      background: ${PORT_COLORS[portSpec.type] || '#888'};
+      background: ${dotColor};
       border: 2px solid rgba(255,255,255,0.25);
       cursor: crosshair;
       flex-shrink: 0;
-      ${direction === 'in'  ? 'margin-left:  -' + PORT_R + 'px;' : ''}
+      ${direction === 'in'  ? 'margin-left:  -'  + PORT_R + 'px;' : ''}
       ${direction === 'out' ? 'margin-right: -' + PORT_R + 'px;' : ''}
     `;
     dot.title = `${portSpec.name} (${portSpec.type})`;

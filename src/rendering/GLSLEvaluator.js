@@ -1,0 +1,873 @@
+// File: src/rendering/GLSLEvaluator.js
+//
+// ── Purpose ──────────────────────────────────────────────────────────────────
+// Compiles a NodeGraph into GLSL source code for either 2D or 3D rendering.
+//
+// ── Mode system ──────────────────────────────────────────────────────────────
+// generate(time, mode) accepts:
+//   '2d'   — generates sceneSDF(vec2 p)  used by SDFRenderer
+//   '3d'   — generates sceneSDF(vec3 p)  used by RayMarchRenderer
+//   'auto' — detects from graph: if any solid/extrude/revolve node is present
+//             uses '3d', otherwise '2d'
+//
+// In '3d' mode a compatibility shim is also emitted:
+//   float sceneSDF(vec2 p) { return sceneSDF(vec3(p.x, p.y, 0.0)); }
+// This allows SDFRenderer to still sample the cross-section at z=0.
+//
+// ── Node dimensionality ───────────────────────────────────────────────────────
+// 2D nodes  — circle, regularPolygon, triangle, arc, lineSegment, polytope
+//             schurBlend, tilingNode, symmetryFoldNode, symmetryOrbitNode, mobiusNode
+//             These emit float fn(vec2 p)
+//
+// 3D nodes  — sphere, box, cylinder, capsule, torus, cone, plane
+//             These emit float fn(vec3 p)
+//
+// Bridge nodes — extrudeNode, revolveNode
+//             Input: 2D SDF   Output: 3D SDF
+//             These emit float fn(vec3 p) and call their 2D input with vec2
+//
+// ── Topological sort ─────────────────────────────────────────────────────────
+// Post-order DFS ensures every function is declared before it is called.
+// GLSL requires forward declarations to be in order.
+//
+// ── Number formatting ────────────────────────────────────────────────────────
+// All JS numbers go through _f(v) which guarantees a GLSL float literal
+// (always has a decimal point, non-finite values become 1e10).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Node types that produce a 3D SDF (float fn(vec3 p))
+const SOLID_TYPES = new Set([
+  'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane'
+]);
+
+// Node types that bridge 2D→3D
+const BRIDGE_TYPES = new Set([
+  'extrudeNode', 'revolveNode'
+]);
+
+export class GLSLEvaluator {
+  /**
+   * @param {NodeGraph} graph
+   */
+  constructor(graph) {
+    this.graph    = graph;
+    this.uniforms = new Map();
+    this._time    = 0;
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  /**
+   * Compile the node graph to GLSL.
+   *
+   * @param  {number} time   Seconds since start
+   * @param  {string} mode   '2d' | '3d' | 'auto'
+   * @returns {{ source: string, uniforms: Map<string,number>, rootFn: string|null }}
+   */
+  generate(time = 0, mode = 'auto') {
+    this.uniforms.clear();
+    this._time = time;
+
+    // Resolve effective mode
+    if (mode === 'auto') {
+      mode = this._detectMode();
+    }
+
+    // Locate output node
+    let outputNode = null;
+    this.graph.nodes.forEach(node => {
+      if (node.type === 'outputNode') outputNode = node;
+    });
+    if (!outputNode) {
+      return { source: '', uniforms: this.uniforms, rootFn: null };
+    }
+
+    const incoming = this.graph.getIncomingEdge(outputNode.id, 'sdf');
+    if (!incoming) {
+      return { source: '', uniforms: this.uniforms, rootFn: null };
+    }
+
+    // Topological sort
+    const order = this._topologicalSort();
+
+    // Generate one function per node
+    const functions = [];
+    for (const nodeId of order) {
+      const node = this.graph.nodes.get(nodeId);
+      if (!node || node.type === 'outputNode') continue;
+      const glsl = this._generateNode(node, mode);
+      if (glsl) functions.push(glsl);
+    }
+
+    // sceneSDF entry point
+    const rootFn = this._fnName(incoming.fromNode);
+    const rootNode = this.graph.nodes.get(incoming.fromNode);
+
+    let sceneSDFStr;
+    if (mode === '3d') {
+      // Determine if root already returns vec3 or vec2
+      const rootIs3D = rootNode && this._nodeOutputIs3D(rootNode);
+      if (rootIs3D) {
+        sceneSDFStr = `float sceneSDF(vec3 p) {\n  return ${rootFn}(p);\n}`;
+      } else {
+        // Root is 2D — lift it
+        sceneSDFStr = `float sceneSDF(vec3 p) {\n  return ${rootFn}(p.xy);\n}`;
+      }
+      // Add 2D compatibility shim so SDFRenderer can still sample at z=0
+      sceneSDFStr += `\nfloat sceneSDF(vec2 p) { return sceneSDF(vec3(p.x, p.y, 0.0)); }`;
+    } else {
+      // 2D mode — root is always called with vec2
+      const rootIs3D = rootNode && this._nodeOutputIs3D(rootNode);
+      if (rootIs3D) {
+        sceneSDFStr = `float sceneSDF(vec2 p) {\n  return ${rootFn}(vec3(p.x, p.y, 0.0));\n}`;
+      } else {
+        sceneSDFStr = `float sceneSDF(vec2 p) {\n  return ${rootFn}(p);\n}`;
+      }
+    }
+
+    const source = [this._preamble(), ...functions, sceneSDFStr].join('\n\n');
+    return { source, uniforms: this.uniforms, rootFn };
+  }
+
+  // ── Mode detection ────────────────────────────────────────────────────────
+
+  /**
+   * Detect rendering mode from graph content.
+   * Returns '3d' if any solid, extrude, or revolve node is present.
+   */
+  _detectMode() {
+    let has3D = false;
+    this.graph.nodes.forEach(node => {
+      if (SOLID_TYPES.has(node.type) || BRIDGE_TYPES.has(node.type)) {
+        has3D = true;
+      }
+    });
+    return has3D ? '3d' : '2d';
+  }
+
+  /**
+   * Returns true if a node produces a 3D SDF output (float fn(vec3 p)).
+   * For passthrough transform nodes (noise, twist, bend, repeat) this depends
+   * on whether their input is 3D — so we walk up the graph recursively.
+   */
+  _nodeOutputIs3D(node, visited = new Set()) {
+    if (!node) return false;
+    // Prevent infinite loops on malformed graphs
+    if (visited.has(node.id)) return false;
+    visited.add(node.id);
+
+    // Solid primitives are always 3D
+    if (SOLID_TYPES.has(node.type)) return true;
+
+    // Bridge nodes (extrude, revolve) always output 3D
+    if (BRIDGE_TYPES.has(node.type)) return true;
+
+    // Passthrough transform nodes inherit dimensionality from their input
+    const PASSTHROUGH = new Set([
+      'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode',
+      'symmetryFoldNode', 'symmetryOrbitNode', 'tilingNode', 'mobiusNode',
+      'schurBlend', 'ifsBlend'
+    ]);
+    if (PASSTHROUGH.has(node.type)) {
+      // Check the primary SDF input port
+      const inputPortName = (node.type === 'schurBlend') ? 'sdfA' : 'sdf';
+      const edge = this.graph.getIncomingEdge(node.id, inputPortName);
+      if (!edge) return false;
+      const inputNode = this.graph.nodes.get(edge.fromNode);
+      return this._nodeOutputIs3D(inputNode, visited);
+    }
+
+    return false;
+  }
+
+  // ── Preamble ──────────────────────────────────────────────────────────────
+
+  _preamble() {
+    return `// ── GLSLEvaluator generated preamble ──────────────────────────
+
+float rUnion(float a, float b, float s) {
+  return (a + b + sqrt(a*a + b*b)) / s;
+}
+float rIntersection(float a, float b, float s) {
+  return (a + b - sqrt(a*a + b*b)) / s;
+}
+float rDifference(float a, float b, float s) {
+  return rIntersection(a, -b, s);
+}`;
+  }
+
+  // ── Per-node dispatch ─────────────────────────────────────────────────────
+
+  /**
+   * Generate a GLSL function for one node.
+   * Dispatches to 2D or 3D template based on node type.
+   */
+  _generateNode(node, mode) {
+    if (SOLID_TYPES.has(node.type)) {
+      return this._generate3DNode(node);
+    }
+    if (BRIDGE_TYPES.has(node.type)) {
+      return this._generateBridgeNode(node);
+    }
+    return this._generate2DNode(node, mode);
+  }
+
+  // ── 3D node templates ─────────────────────────────────────────────────────
+
+  _generate3DNode(node) {
+    const fn = this._fnName(node.id);
+    const p  = node.params;
+
+    switch (node.type) {
+
+      case 'sphere': {
+        const r  = this._f(p.radius ?? 1);
+        const cx = this._f(p.posX   ?? 0);
+        const cy = this._f(p.posY   ?? 0);
+        const cz = this._f(p.posZ   ?? 0);
+        return `// sphere node ${node.id}
+float ${fn}(vec3 p) {
+  return length(p - vec3(${cx}, ${cy}, ${cz})) - ${r};
+}`;
+      }
+
+      case 'box': {
+        const bx = this._f((p.width  ?? 2) / 2);
+        const by = this._f((p.height ?? 2) / 2);
+        const bz = this._f((p.depth  ?? 2) / 2);
+        const cx = this._f(p.posX ?? 0);
+        const cy = this._f(p.posY ?? 0);
+        const cz = this._f(p.posZ ?? 0);
+        return `// box node ${node.id}
+float ${fn}(vec3 p) {
+  vec3 q = abs(p - vec3(${cx}, ${cy}, ${cz})) - vec3(${bx}, ${by}, ${bz});
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}`;
+      }
+
+      case 'cylinder': {
+        const r      = this._f(p.radius ?? 1);
+        const h      = this._f((p.height ?? 2) / 2);
+        const cx     = this._f(p.posX ?? 0);
+        const cy     = this._f(p.posY ?? 0);
+        const cz     = this._f(p.posZ ?? 0);
+        const capped = p.capped !== 'no';
+        if (!capped) {
+          return `// cylinder (infinite) node ${node.id}
+float ${fn}(vec3 p) {
+  vec3 q = p - vec3(${cx}, ${cy}, ${cz});
+  return length(vec2(q.x, q.z)) - ${r};
+}`;
+        }
+        return `// cylinder (capped) node ${node.id}
+float ${fn}(vec3 p) {
+  vec3 q  = p - vec3(${cx}, ${cy}, ${cz});
+  vec2 d  = vec2(length(vec2(q.x, q.z)) - ${r}, abs(q.y) - ${h});
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}`;
+      }
+
+      case 'capsule': {
+        const ax = this._f(p.ax ?? 0);
+        const ay = this._f(p.ay ?? -1);
+        const az = this._f(p.az ?? 0);
+        const bx = this._f(p.bx ?? 0);
+        const by = this._f(p.by ?? 1);
+        const bz = this._f(p.bz ?? 0);
+        const r  = this._f(p.radius ?? 0.5);
+        return `// capsule node ${node.id}
+float ${fn}(vec3 p) {
+  vec3 a  = vec3(${ax}, ${ay}, ${az});
+  vec3 b  = vec3(${bx}, ${by}, ${bz});
+  vec3 pa = p - a;
+  vec3 ba = b - a;
+  float t = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * t) - ${r};
+}`;
+      }
+
+      case 'torus': {
+        const R  = this._f(p.majorRadius ?? 2);
+        const r  = this._f(p.minorRadius ?? 0.5);
+        const cx = this._f(p.posX ?? 0);
+        const cy = this._f(p.posY ?? 0);
+        const cz = this._f(p.posZ ?? 0);
+        return `// torus node ${node.id}
+float ${fn}(vec3 p) {
+  vec3 q  = p - vec3(${cx}, ${cy}, ${cz});
+  vec2 t  = vec2(length(vec2(q.x, q.z)) - ${R}, q.y);
+  return length(t) - ${r};
+}`;
+      }
+
+      case 'cone': {
+        const r  = this._f(p.radius ?? 1);
+        const h  = this._f(p.height ?? 2);
+        const cx = this._f(p.posX ?? 0);
+        const cy = this._f(p.posY ?? 0);
+        const cz = this._f(p.posZ ?? 0);
+        return `// cone node ${node.id}
+float ${fn}(vec3 p) {
+  vec3  q    = p - vec3(${cx}, ${cy}, ${cz});
+  float rba  = -${r};
+  float baba = ${h} * ${h};
+  float paba = q.y / ${h};
+  float x    = length(vec2(q.x, q.z));
+  float cax  = max(0.0, x - ${r} * (1.0 - clamp(paba, 0.0, 1.0)));
+  float cay  = abs(paba - 0.5) - 0.5;
+  float k    = rba*rba + baba;
+  float f    = clamp((rba*(x-${r}) + paba*baba)/k, 0.0, 1.0);
+  float cbx  = x - ${r} - f*rba;
+  float cby  = paba - f;
+  float s    = (cbx < 0.0 && cay < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(cax*cax + cay*cay*baba,
+                      cbx*cbx + cby*cby*baba));
+}`;
+      }
+
+      case 'plane': {
+        const nx  = this._f(p.nx     ?? 0);
+        const ny  = this._f(p.ny     ?? 1);
+        const nz  = this._f(p.nz     ?? 0);
+        const off = this._f(p.offset ?? 0);
+        return `// plane node ${node.id}
+float ${fn}(vec3 p) {
+  return dot(p, normalize(vec3(${nx}, ${ny}, ${nz}))) - ${off};
+}`;
+      }
+
+      default:
+        return this._fallback3D(fn, node.id, `unknown 3D type: ${node.type}`);
+    }
+  }
+
+  // ── Bridge node templates (2D input → 3D output) ──────────────────────────
+
+  _generateBridgeNode(node) {
+    const fn = this._fnName(node.id);
+    const p  = node.params;
+
+    switch (node.type) {
+
+      case 'extrudeNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'extrudeNode missing sdf');
+        const h = this._f((p.height ?? 1) / 2);
+        return `// extrudeNode ${node.id}  (height=${this._f(p.height ?? 1)})
+float ${fn}(vec3 p) {
+  float d2 = ${inputFn}(p.xy);
+  float dz = abs(p.z) - ${h};
+  return min(max(d2, dz), 0.0) + length(max(vec2(d2, dz), 0.0));
+}`;
+      }
+
+      case 'revolveNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'revolveNode missing sdf');
+        const off = this._f(p.offset ?? 0);
+        return `// revolveNode ${node.id}
+float ${fn}(vec3 p) {
+  float q = length(vec2(p.x, p.z)) - ${off};
+  return ${inputFn}(vec2(q, p.y));
+}`;
+      }
+
+      default:
+        return this._fallback3D(fn, node.id, `unknown bridge type: ${node.type}`);
+    }
+  }
+
+  // ── 2D node templates ─────────────────────────────────────────────────────
+
+  _generate2DNode(node, mode) {
+    const fn = this._fnName(node.id);
+    const p  = node.params;
+
+    switch (node.type) {
+
+      // ── Region primitives (exact SDF, negative inside) ──────────────────
+
+      case 'circle': {
+        const r  = this._f(p.radius ?? 1);
+        const cx = this._f(p.posX   ?? 0);
+        const cy = this._f(p.posY   ?? 0);
+        return `// circle node ${node.id}
+float ${fn}(vec2 p) {
+  return length(p - vec2(${cx}, ${cy})) - ${r};
+}`;
+      }
+
+      case 'regularPolygon': {
+        const N    = Math.max(3, Math.round(p.sides ?? 6));
+        const size = this._f(p.size     ?? 1);
+        const rot  = this._f((p.rotation ?? 0) + Math.PI / 2);
+        const cx   = this._f(p.posX     ?? 0);
+        const cy   = this._f(p.posY     ?? 0);
+        const apo  = this._f(Math.cos(Math.PI / N));
+        const sec  = this._f((Math.PI * 2) / N);
+        return `// regularPolygon node ${node.id}  (${N} sides)
+float ${fn}(vec2 p) {
+  vec2 q = p - vec2(${cx}, ${cy});
+  float c = cos(-${rot}); float s = sin(-${rot});
+  q = vec2(q.x*c - q.y*s, q.x*s + q.y*c);
+  float sector = ${sec};
+  float a = atan(q.y, q.x);
+  a = a - sector * floor(a / sector + 0.5);
+  float r = length(q);
+  return r * cos(a) - ${size} * ${apo};
+}`;
+      }
+
+      case 'polytope': {
+        let verts;
+        try {
+          verts = typeof p.vertices === 'string' ? JSON.parse(p.vertices) : p.vertices;
+          if (!Array.isArray(verts) || verts.length < 3) throw new Error();
+        } catch(_) {
+          verts = [[-1,-1],[1,-1],[1,1],[-1,1]];
+        }
+        const cx  = this._f(p.posX     ?? 0);
+        const cy  = this._f(p.posY     ?? 0);
+        const rot = this._f(p.rotation ?? 0);
+        const N   = verts.length;
+        const vertLines = verts.map(([x,y],i) =>
+          `  vec2 v${i} = vec2(${this._f(x)}, ${this._f(y)});`
+        ).join('\n');
+        const edgeLines = Array.from({length:N},(_,i) => {
+          const j = (i+1)%N;
+          return `  { vec2 e=v${j}-v${i}; vec2 n=vec2(e.y,-e.x);` +
+                 ` maxD=max(maxD, dot(lp-v${i},normalize(n))); }`;
+        }).join('\n');
+        return `// polytope node ${node.id}  (${N} verts)
+float ${fn}(vec2 p) {
+  vec2 q=p-vec2(${cx},${cy});
+  float c=cos(-${rot}); float s=sin(-${rot});
+  vec2 lp=vec2(q.x*c-q.y*s, q.x*s+q.y*c);
+${vertLines}
+  float maxD=-1e10;
+${edgeLines}
+  return maxD;
+}`;
+      }
+
+      // ── Curve primitives (SDF >= 0, needs isoOffset) ─────────────────────
+
+      case 'triangle': {
+        const sz  = this._f(p.size        ?? 1);
+        const rot = this._f(p.rotation    ?? 0);
+        const cx  = this._f(p.posX        ?? 0);
+        const cy  = this._f(p.posY        ?? 0);
+        const h   = this._f((p.size ?? 1) * Math.sqrt(3) / 2);
+        return `// triangle node ${node.id}
+float ${fn}(vec2 p) {
+  vec2 q=p-vec2(${cx},${cy});
+  float c=cos(-${rot}); float s=sin(-${rot});
+  q=vec2(q.x*c-q.y*s, q.x*s+q.y*c);
+  float h=${h};
+  vec2 v0=vec2(0.0, h*0.6667);
+  vec2 v1=vec2(-${sz}*0.5,-h*0.3333);
+  vec2 v2=vec2( ${sz}*0.5,-h*0.3333);
+  vec2 e0=v1-v0; vec2 e1=v2-v1; vec2 e2=v0-v2;
+  float d0=length(q-v0-e0*clamp(dot(q-v0,e0)/dot(e0,e0),0.0,1.0));
+  float d1=length(q-v1-e1*clamp(dot(q-v1,e1)/dot(e1,e1),0.0,1.0));
+  float d2=length(q-v2-e2*clamp(dot(q-v2,e2)/dot(e2,e2),0.0,1.0));
+  return min(d0,min(d1,d2));
+}`;
+      }
+
+      case 'arc': {
+        const r  = this._f(p.radius     ?? 1);
+        const sa = this._f(p.startAngle ?? 0);
+        const ea = this._f(p.endAngle   ?? Math.PI);
+        const cx = this._f(p.posX       ?? 0);
+        const cy = this._f(p.posY       ?? 0);
+        return `// arc node ${node.id}
+float ${fn}(vec2 p) {
+  vec2 q=p-vec2(${cx},${cy});
+  float phi=atan(q.y,q.x);
+  float sweep=${ea}-${sa};
+  float phiN=mod(phi-${sa},6.2831853);
+  if(phiN<=sweep){ return abs(length(q)-${r}); }
+  vec2 ps=vec2(${r}*cos(${sa}),${r}*sin(${sa}));
+  vec2 pe=vec2(${r}*cos(${ea}),${r}*sin(${ea}));
+  return min(length(q-ps),length(q-pe));
+}`;
+      }
+
+      case 'lineSegment': {
+        const x1 = this._f(p.x1 ?? 0);
+        const y1 = this._f(p.y1 ?? 0);
+        const x2 = this._f(p.x2 ?? 1);
+        const y2 = this._f(p.y2 ?? 0);
+        return `// lineSegment node ${node.id}
+float ${fn}(vec2 p) {
+  vec2 a=vec2(${x1},${y1}); vec2 b=vec2(${x2},${y2});
+  vec2 pa=p-a; vec2 ba=b-a;
+  float t=clamp(dot(pa,ba)/dot(ba,ba),0.0,1.0);
+  return length(pa-ba*t);
+}`;
+      }
+
+      // ── Blend nodes ───────────────────────────────────────────────────────
+
+      case 'schurBlend': {
+        const fnA = this._resolveInputFn(node, 'sdfA');
+        const fnB = this._resolveInputFn(node, 'sdfB');
+        if (!fnA || !fnB) return this._fallback2D(fn, node.id, 'schurBlend missing inputs');
+
+        const op  = p.operation  ?? 'union';
+        const sm  = this._f(p.smoothness ?? 8);
+        const rot = this._f(p.rotation   ?? 0);
+        const sc  = this._f(p.scale      ?? 1);
+        const tx  = this._f(p.posX       ?? 0);
+        const ty  = this._f(p.posY       ?? 0);
+        const iso = this._f(p.isoOffset  ?? 0.15);
+
+        const REGION = new Set(['circle','regularPolygon','polytope',
+                                'sphere','box','cylinder','capsule','torus','cone','plane']);
+        const edgeA  = this.graph.getIncomingEdge(node.id, 'sdfA');
+        const edgeB  = this.graph.getIncomingEdge(node.id, 'sdfB');
+        const nodeA  = edgeA ? this.graph.nodes.get(edgeA.fromNode) : null;
+        const nodeB  = edgeB ? this.graph.nodes.get(edgeB.fromNode) : null;
+        const offA   = (nodeA && REGION.has(nodeA.type)) ? '0.0' : iso;
+        const offB   = (nodeB && REGION.has(nodeB.type)) ? '0.0' : iso;
+
+        const blendCall =
+          op === 'intersection' ? `rIntersection(dA,dB,${sm})` :
+          op === 'difference'   ? `rDifference(dA,dB,${sm})`   :
+                                  `rUnion(dA,dB,${sm})`;
+
+        // Determine if inputs are 3D
+        const aIs3D = nodeA && this._nodeOutputIs3D(nodeA);
+        const bIs3D = nodeB && this._nodeOutputIs3D(nodeB);
+        const dim   = (aIs3D || bIs3D) ? 'vec3' : 'vec2';
+
+        return `// schurBlend node ${node.id}  (${op})
+float ${fn}(${dim} p) {
+  float c=cos(${rot}); float s=sin(${rot});
+  ${dim === 'vec3'
+    ? `vec3 tp=vec3(${sc}*(c*p.x-s*p.y)+${tx}, ${sc}*(s*p.x+c*p.y)+${ty}, p.z);`
+    : `vec2 tp=vec2(${sc}*(c*p.x-s*p.y)+${tx}, ${sc}*(s*p.x+c*p.y)+${ty});`
+  }
+  float dA=${fnA}(${aIs3D ? 'tp' : dim==='vec3'?'tp.xy':'tp'})-${offA};
+  float dB=${fnB}(${bIs3D ? 'tp' : dim==='vec3'?'tp.xy':'tp'})-${offB};
+  return ${blendCall}/${sc};
+}`;
+      }
+
+      // ── Transform nodes ───────────────────────────────────────────────────
+
+      case 'tilingNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback2D(fn, node.id, 'tilingNode missing sdf');
+
+        const lattice = p.lattice   ?? 'square';
+        const pX      = this._f(p.periodX  ?? 3);
+        const pY      = this._f(p.periodY  ?? 3);
+        const oX      = this._f(p.offsetX  ?? 0);
+        const oY      = this._f(p.offsetY  ?? 0);
+        const iso     = this._f(p.isoOffset ?? 0);
+
+        const edge     = this.graph.getIncomingEdge(node.id, 'sdf');
+        const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
+        const CURVE    = new Set(['lineSegment','triangle','arc']);
+        const isCurve  = baseNode && CURVE.has(baseNode.type);
+        const isoLine  = isCurve ? `  d = d - ${iso};` : '';
+
+        let foldBody;
+        if (lattice === 'hexagonal') {
+          foldBody = `
+  float a1x=${pX}; float a1y=0.0;
+  float a2x=${pX}*0.5; float a2y=${pX}*0.8660254;
+  float det=a1x*a2y-a1y*a2x;
+  float u=(a2y*x-a2x*y)/det; float v=(-a1y*x+a1x*y)/det;
+  x=x-(floor(u+0.5)*a1x+floor(v+0.5)*a2x);
+  y=y-(floor(u+0.5)*a1y+floor(v+0.5)*a2y);`;
+        } else if (lattice === 'triangular') {
+          foldBody = `
+  float p2=${pX}/1.7320508;
+  float a1x=p2; float a1y=0.0;
+  float a2x=p2*0.5; float a2y=p2*0.8660254;
+  float det=a1x*a2y-a1y*a2x;
+  float u=(a2y*x-a2x*y)/det; float v=(-a1y*x+a1x*y)/det;
+  x=x-(floor(u+0.5)*a1x+floor(v+0.5)*a2x);
+  y=y-(floor(u+0.5)*a1y+floor(v+0.5)*a2y);`;
+        } else if (lattice === 'brick') {
+          foldBody = `
+  float row=floor(mod(y+${pY}*0.5,${pY})/(${pY}*0.5));
+  float xOff=mod(row,2.0)<0.5?0.0:${pX}*0.5;
+  x=mod(x+xOff+${pX}*0.5,${pX})-${pX}*0.5;
+  y=mod(y+${pY}*0.5,${pY})-${pY}*0.5;`;
+        } else {
+          foldBody = `
+  x=mod(x+${pX}*0.5,${pX})-${pX}*0.5;
+  y=mod(y+${pY}*0.5,${pY})-${pY}*0.5;`;
+        }
+
+        return `// tilingNode ${node.id}  (${lattice})
+float ${fn}(vec2 p) {
+  float x=p.x-${oX}; float y=p.y-${oY};
+${foldBody}
+  float d=${inputFn}(vec2(x+${oX},y+${oY}));
+${isoLine}
+  return d;
+}`;
+      }
+
+      case 'symmetryFoldNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback2D(fn, node.id, 'symmetryFoldNode missing sdf');
+
+        const folds  = Math.max(1, Math.round(p.folds ?? 6));
+        const cx     = this._f(p.centerX  ?? 0);
+        const cy     = this._f(p.centerY  ?? 0);
+        const rot    = this._f(p.rotation ?? 0);
+        const refX   = p.reflectX === 'yes';
+        const refY   = p.reflectY === 'yes';
+        const sector = this._f((Math.PI * 2) / folds);
+
+        const rotBlock = (p.rotation ?? 0) !== 0 ? `
+  float cR=cos(-${rot}); float sR=sin(-${rot});
+  float xr=x*cR-y*sR; float yr=x*sR+y*cR; x=xr; y=yr;` : '';
+
+        return `// symmetryFoldNode ${node.id}  (${folds}-fold)
+float ${fn}(vec2 p) {
+  float x=p.x-${cx}; float y=p.y-${cy};
+${rotBlock}
+  float sector=${sector};
+  float a=atan(y,x);
+  a=a-sector*floor(a/sector+0.5);
+  float r=length(vec2(x,y));
+  x=r*cos(a); y=r*sin(a);
+  ${refX?'x=abs(x);':''} ${refY?'y=abs(y);':''}
+  return ${inputFn}(vec2(x+${cx},y+${cy}));
+}`;
+      }
+
+      case 'symmetryOrbitNode': {
+        const inputFn  = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback2D(fn, node.id, 'symmetryOrbitNode missing sdf');
+
+        const folds    = Math.max(1, Math.round(p.folds ?? 6));
+        const cx       = this._f(p.centerX   ?? 0);
+        const cy       = this._f(p.centerY   ?? 0);
+        const rot      = this._f(p.rotation  ?? 0);
+        const refX     = p.reflectX === 'yes';
+        const combiner = p.combiner ?? 'min';
+        const sm       = this._f(p.smoothness ?? 8);
+        const sector   = this._f((Math.PI * 2) / folds);
+
+        const combineExpr =
+          combiner === 'max'       ? 'max(d,di)'           :
+          combiner === 'smoothMin' ? `rUnion(d,di,${sm})`  :
+                                     'min(d,di)';
+
+        const reflBlock = refX ? `
+  for(int k=0;k<${folds};k++){
+    float theta=${rot}+float(k)*sector;
+    float c=cos(-theta); float s=sin(-theta);
+    float dx=p.x-${cx}; float dy=p.y-${cy};
+    vec2 tp=vec2(-(dx*c-dy*s)+${cx},(dx*s+dy*c)+${cy});
+    float di=${inputFn}(tp); d=${combineExpr};
+  }` : '';
+
+        return `// symmetryOrbitNode ${node.id}  (${folds}-fold)
+float ${fn}(vec2 p) {
+  float d=1e10; float sector=${sector};
+  for(int k=0;k<${folds};k++){
+    float theta=${rot}+float(k)*sector;
+    float c=cos(-theta); float s=sin(-theta);
+    float dx=p.x-${cx}; float dy=p.y-${cy};
+    vec2 tp=vec2(dx*c-dy*s+${cx},dx*s+dy*c+${cy});
+    float di=${inputFn}(tp); d=${combineExpr};
+  }
+${reflBlock}
+  return d;
+}`;
+      }
+
+      case 'mobiusNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback2D(fn, node.id, 'mobiusNode missing sdf');
+
+        const aRe = this._f(p.aRe ?? 1);
+        const aIm = this._f(p.aIm ?? 0);
+        const bRe = this._f(p.bRe ?? 0);
+        const bIm = this._f(p.bIm ?? 0);
+        const cRe = this._f(p.cRe ?? 0);
+        const cIm = this._f(p.cIm ?? 0);
+        const dRe = this._f(p.dRe ?? 1);
+        const dIm = this._f(p.dIm ?? 0);
+        return `// mobiusNode ${node.id}
+float ${fn}(vec2 p) {
+  float x=p.x; float y=p.y;
+  float nRe=${aRe}*x-${aIm}*y+${bRe};
+  float nIm=${aRe}*y+${aIm}*x+${bIm};
+  float dnRe=${cRe}*x-${cIm}*y+${dRe};
+  float dnIm=${cRe}*y+${cIm}*x+${dIm};
+  float denom=dnRe*dnRe+dnIm*dnIm;
+  if(denom<1e-10) return 1e10;
+  float tx=(nRe*dnRe+nIm*dnIm)/denom;
+  float ty=(nIm*dnRe-nRe*dnIm)/denom;
+  return ${inputFn}(vec2(tx,ty));
+}`;
+      }
+
+      case 'noiseDisplaceNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'noiseDisplace missing sdf');
+        const amp  = this._f(node.params.amplitude ?? 0.3);
+        const freq = this._f(node.params.frequency  ?? 3.0);
+        // Determine if input is 3D
+        const edge     = this.graph.getIncomingEdge(node.id, 'sdf');
+        const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
+        const is3D     = baseNode && this._nodeOutputIs3D(baseNode);
+        const dim      = is3D ? 'vec3' : 'vec2';
+        const sampleCoord = is3D
+          ? `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq})`
+          : `vec2(p.x * ${freq}, p.y * ${freq})`;
+        return `// noiseDisplaceNode ${node.id}
+float ndHash(float n) { return fract(sin(n) * 43758.5453); }
+float ndNoise(${dim} p) {
+  ${is3D
+    ? `float ix=floor(p.x); float iy=floor(p.y); float iz=floor(p.z);
+  float fx=fract(p.x); float fy=fract(p.y); float fz=fract(p.z);
+  float ux=fx*fx*(3.0-2.0*fx); float uy=fy*fy*(3.0-2.0*fy); float uz=fz*fz*(3.0-2.0*fz);
+  return mix(mix(mix(ndHash(ix+iy*57.0+iz*113.0),ndHash(ix+1.0+iy*57.0+iz*113.0),ux),
+                 mix(ndHash(ix+(iy+1.0)*57.0+iz*113.0),ndHash(ix+1.0+(iy+1.0)*57.0+iz*113.0),ux),uy),
+             mix(mix(ndHash(ix+iy*57.0+(iz+1.0)*113.0),ndHash(ix+1.0+iy*57.0+(iz+1.0)*113.0),ux),
+                 mix(ndHash(ix+(iy+1.0)*57.0+(iz+1.0)*113.0),ndHash(ix+1.0+(iy+1.0)*57.0+(iz+1.0)*113.0),ux),uy),uz);`
+    : `float ix=floor(p.x); float iy=floor(p.y);
+  float fx=fract(p.x); float fy=fract(p.y);
+  float ux=fx*fx*(3.0-2.0*fx); float uy=fy*fy*(3.0-2.0*fy);
+  return mix(mix(ndHash(ix+iy*57.0),ndHash(ix+1.0+iy*57.0),ux),
+             mix(ndHash(ix+(iy+1.0)*57.0),ndHash(ix+1.0+(iy+1.0)*57.0),ux),uy);`}
+}
+float ${fn}(${dim} p) {
+  float n = ndNoise(${sampleCoord}) * 2.0 - 1.0;
+  return ${inputFn}(p) + n * ${amp};
+}`;
+      }
+
+      case 'twistNode': {
+        const inputFn  = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'twistNode missing sdf');
+        const strength = this._f(node.params.strength ?? 1.0);
+        return `// twistNode ${node.id}
+float ${fn}(vec3 p) {
+  float angle = p.y * ${strength};
+  float c = cos(angle); float s = sin(angle);
+  vec3 tp = vec3(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+  return ${inputFn}(tp);
+}`;
+      }
+
+      case 'bendNode': {
+        const inputFn  = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'bendNode missing sdf');
+        const strength = this._f(node.params.strength ?? 0.5);
+        return `// bendNode ${node.id}
+float ${fn}(vec3 p) {
+  float angle = p.x * ${strength};
+  float c = cos(angle); float s = sin(angle);
+  vec3 tp = vec3(c*p.x - s*p.y, s*p.x + c*p.y, p.z);
+  return ${inputFn}(tp);
+}`;
+      }
+
+      case 'repeatNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'repeatNode missing sdf');
+        const cX = Math.floor(node.params.countX   ?? 3);
+        const cY = Math.floor(node.params.countY   ?? 3);
+        const cZ = Math.floor(node.params.countZ   ?? 1);
+        const sX = this._f(node.params.spacingX ?? 3);
+        const sY = this._f(node.params.spacingY ?? 3);
+        const sZ = this._f(node.params.spacingZ ?? 3);
+        const hX = this._f(Math.floor(cX / 2));
+        const hY = this._f(Math.floor(cY / 2));
+        const hZ = this._f(Math.floor(cZ / 2));
+        return `// repeatNode ${node.id}
+float ${fn}(vec3 p) {
+  vec3 id = clamp(floor(p / vec3(${sX},${sY},${sZ}) + 0.5),
+                  vec3(-${hX},-${hY},-${hZ}),
+                  vec3( ${hX}, ${hY}, ${hZ}));
+  vec3 rp = p - id * vec3(${sX},${sY},${sZ});
+  return ${inputFn}(rp);
+}`;
+      }
+
+      // Nodes without GLSL representation — skip
+      case 'outputNode':
+      case 'identityMapper': case 'polynomialMapper': case 'sinusoidalMapper':
+      case 'exponentialMapper': case 'logarithmicMapper': case 'powerMapper':
+      case 'periodicMapper': case 'temporalMapper': case 'recursiveMapper':
+      case 'blendedMapper': case 'compositeMapper': case 'affineTransform':
+      case 'timeNode': case 'oscillatorNode':
+        return null;
+
+      default:
+        return this._fallback2D(fn, node.id, `unknown 2D type: ${node.type}`);
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  _fnName(nodeId) { return `sdf_${nodeId}`; }
+
+  /**
+   * Emit a float value as either a baked constant or a uniform.
+   * If the param is time-varying, emit a uniform and record the value.
+   * @param {object} node      The node owning this param
+   * @param {string} paramName The param name
+   * @param {number} value     Current JS value
+   */
+  _fp(node, paramName, value) {
+    // Check if this node is time-varying
+    const spec = node._spec || {};
+    if (spec.timeVarying) {
+      const uName = `u_${node.id}_${paramName}`;
+      this.uniforms.set(uName, value);
+      return uName;
+    }
+    return this._f(value);
+  }
+
+  _f(v) {
+    if (!isFinite(v)) return '1e10';
+    let s = Number(v).toFixed(7);
+    if (!s.includes('.')) s += '.0';
+    return s;
+  }
+
+  _resolveInputFn(node, portName) {
+    const edge = this.graph.getIncomingEdge(node.id, portName);
+    if (!edge) return null;
+    return this._fnName(edge.fromNode);
+  }
+
+  _fallback2D(fn, nodeId, reason) {
+    return `// FALLBACK 2D node ${nodeId}: ${reason}
+float ${fn}(vec2 p) { return 1e10; }`;
+  }
+
+  _fallback3D(fn, nodeId, reason) {
+    return `// FALLBACK 3D node ${nodeId}: ${reason}
+float ${fn}(vec3 p) { return 1e10; }`;
+  }
+
+  _topologicalSort() {
+    const visited = new Set();
+    const order   = [];
+    const visit   = (nodeId) => {
+      if (visited.has(nodeId)) return;
+      visited.add(nodeId);
+      this.graph.edges.forEach(edge => {
+        if (edge.toNode === nodeId) visit(edge.fromNode);
+      });
+      order.push(nodeId);
+    };
+    this.graph.nodes.forEach((_, id) => visit(id));
+    return order;
+  }
+}

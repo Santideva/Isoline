@@ -39,7 +39,10 @@ const ORIGIN_Y      = 60;   // canvas y of the topmost row
  */
 const TOP_LEVEL_TYPES = new Set([
   'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
-  'tilingNode', 'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
+  'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
+  'extrudeNode', 'revolveNode',
+  'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode',
+  'tilingNode', 'mobiusNode', 'symmetryFoldNode', 'symmetryOrbitNode', 'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
   'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
   'exponentialMapper', 'logarithmicMapper', 'powerMapper',
   'periodicMapper', 'temporalMapper', 'recursiveMapper',

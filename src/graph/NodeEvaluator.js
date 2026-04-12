@@ -27,6 +27,9 @@ import {
 import { ComplexShape2D } from '../Geometry/ComplexShape2d.js';
 import { TrianglePrimitive, ArcPrimitive } from '../Primitives/primaryDerivativePrimitives.js';
 import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from '../Primitives/regionPrimitives.js';
+import { SpherePrimitive, BoxPrimitive, CylinderPrimitive,
+         CapsulePrimitive, TorusPrimitive,
+         ConePrimitive, InfinitePlanePrimitive } from '../Primitives/solidPrimitives.js';
 
 /**
  * NodeEvaluator takes a NodeGraph and a query point, walks the graph
@@ -190,7 +193,82 @@ export class NodeEvaluator {
         return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) };
       }
 
-      // ── Blend ─────────────────────────────────────────────────────────────
+      // ── Solid geometry ────────────────────────────────────────────────────────
+
+      case 'sphere': {
+        const { radius, posX, posY, posZ } = node.params;
+        const prim = new SpherePrimitive({ radius, posX, posY, posZ });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'box': {
+        const { width, height, depth, posX, posY, posZ } = node.params;
+        const prim = new BoxPrimitive({ width, height, depth, posX, posY, posZ });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'cylinder': {
+        const { radius, height, capped, posX, posY, posZ } = node.params;
+        const prim = new CylinderPrimitive({
+          radius, height, posX, posY, posZ,
+          capped: capped !== 'no'
+        });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'capsule': {
+        const { ax, ay, az, bx, by, bz, radius } = node.params;
+        const prim = new CapsulePrimitive({ ax, ay, az, bx, by, bz, radius });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'torus': {
+        const { majorRadius, minorRadius, posX, posY, posZ } = node.params;
+        const prim = new TorusPrimitive({ majorRadius, minorRadius, posX, posY, posZ });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'cone': {
+        const { radius, height, posX, posY, posZ } = node.params;
+        const prim = new ConePrimitive({ radius, height, posX, posY, posZ });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'plane': {
+        const { nx, ny, nz, offset } = node.params;
+        const prim = new InfinitePlanePrimitive({ nx, ny, nz, offset });
+        return { sdf: (pt) => prim.computeSDF(pt) };
+      }
+
+      case 'extrudeNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const { height } = node.params;
+        const h = (height ?? 1) / 2;
+        return {
+          result: (pt) => {
+            const d2D = baseSDF({ x: pt.x, y: pt.y });
+            const dz  = Math.abs(pt.z || 0) - h;
+            return Math.min(Math.max(d2D, dz), 0) +
+                   Math.sqrt(Math.max(d2D, 0) ** 2 + Math.max(dz, 0) ** 2);
+          }
+        };
+      }
+
+      case 'revolveNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const { offset } = node.params;
+        const off = offset ?? 0;
+        return {
+          result: (pt) => {
+            const q = Math.sqrt(pt.x * pt.x + (pt.z || 0) * (pt.z || 0)) - off;
+            return baseSDF({ x: q, y: pt.y });
+          }
+        };
+      }
+
+      // ── Blend ─────────────────────────────────────────────────────────────────
 
       case 'rUnion': {
         const sdfA = this._resolveSDF(node, 'sdfA');
@@ -355,6 +433,168 @@ export class NodeEvaluator {
 
       // ── Transform ─────────────────────────────────────────────────────────────
 
+      case 'symmetryFoldNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+
+        const { folds, reflectX, reflectY, centerX, centerY, rotation } = node.params;
+
+        // Compute the canonical representative of a point under the symmetry group.
+        // Uses round-to-nearest-sector fold (same as RegularPolygon SDF) to avoid
+        // discontinuities at sector boundaries.
+        const foldPoint = (pt) => {
+          let x = pt.x - centerX;
+          let y = pt.y - centerY;
+
+          // Optional pre-rotation
+          if (rotation !== 0) {
+            const c = Math.cos(-rotation);
+            const s = Math.sin(-rotation);
+            const rx = x * c - y * s;
+            const ry = x * s + y * c;
+            x = rx;
+            y = ry;
+          }
+
+          // N-fold fold — round to nearest sector center (smooth, no seams)
+          if (folds > 1) {
+            const sectorAngle = (Math.PI * 2) / folds;
+            let angle = Math.atan2(y, x);
+            angle = angle - sectorAngle * Math.round(angle / sectorAngle);
+            const r = Math.sqrt(x * x + y * y);
+            x = r * Math.cos(angle);
+            y = r * Math.sin(angle);
+          }
+
+          // Reflection
+          if (reflectX === 'yes') x = Math.abs(x);
+          if (reflectY === 'yes') y = Math.abs(y);
+
+          return { x: x + centerX, y: y + centerY };
+        };
+
+        return {
+          result: (pt, cs = [], t = 0) => baseSDF(foldPoint(pt), cs, t)
+        };
+      }
+
+      case 'symmetryOrbitNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+
+        const { folds, reflectX, centerX, centerY, rotation,
+                combiner, smoothness } = node.params;
+
+        const sector = (Math.PI * 2) / folds;
+
+        // Build the full transform list for the orbit.
+        // Full dihedral group D_N = N rotations + N reflections (if reflectX).
+        const transforms = [];
+
+        // N rotations
+        for (let k = 0; k < folds; k++) {
+          const theta = rotation + k * sector;
+          const c = Math.cos(-theta);
+          const s = Math.sin(-theta);
+          transforms.push((pt) => {
+            const dx = pt.x - centerX;
+            const dy = pt.y - centerY;
+            return {
+              x:  dx * c - dy * s + centerX,
+              y:  dx * s + dy * c + centerY
+            };
+          });
+        }
+
+        // N reflections (dihedral extension)
+        if (reflectX === 'yes') {
+          for (let k = 0; k < folds; k++) {
+            const theta = rotation + k * sector;
+            const c = Math.cos(-theta);
+            const s = Math.sin(-theta);
+            transforms.push((pt) => {
+              const dx = pt.x - centerX;
+              const dy = pt.y - centerY;
+              // Rotate then reflect X
+              return {
+                x: -(dx * c - dy * s) + centerX,
+                y:  (dx * s + dy * c) + centerY
+              };
+            });
+          }
+        }
+
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const values = transforms.map(tf => baseSDF(tf(pt), cs, t));
+            if (combiner === 'max') {
+              return Math.max(...values);
+            } else if (combiner === 'smoothMin') {
+              return values.reduce((acc, v) =>
+                weightedRUnion(acc, v, smoothness), values[0]);
+            } else {
+              // default: min
+              return Math.min(...values);
+            }
+          }
+        };
+      }
+
+      case 'mobiusNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+
+        const { aRe, aIm, bRe, bIm, cRe, cIm, dRe, dIm } = node.params;
+
+        // Complex multiplication: (p + qi)(r + si) = (pr - qs) + (ps + qr)i
+        const cmul = (pr, qi, rr, si) => [pr*rr - qi*si, pr*si + qi*rr];
+
+        // Complex division: (nRe + nIm*i) / (dRe + dIm*i)
+        const cdiv = (nRe, nIm, dRe, dIm) => {
+          const denom = dRe*dRe + dIm*dIm;
+          if (denom < 1e-10) return [Infinity, Infinity];
+          return [(nRe*dRe + nIm*dIm) / denom, (nIm*dRe - nRe*dIm) / denom];
+        };
+
+        // Check determinant ad - bc ≠ 0
+        const [adRe, adIm] = cmul(aRe, aIm, dRe, dIm);
+        const [bcRe, bcIm] = cmul(bRe, bIm, cRe, cIm);
+        const detRe = adRe - bcRe;
+        const detIm = adIm - bcIm;
+        const detMag = Math.sqrt(detRe*detRe + detIm*detIm);
+
+        if (detMag < 1e-10) {
+          // Degenerate transform — return identity
+          return { result: (pt, cs = [], t = 0) => baseSDF(pt, cs, t) };
+        }
+
+        const sdfFn = (pt, cs = [], t = 0) => {
+          const x = pt.x;
+          const y = pt.y;
+
+          // Compute numerator: az + b
+          const [numRe, numIm] = [
+            aRe*x - aIm*y + bRe,
+            aRe*y + aIm*x + bIm
+          ];
+
+          // Compute denominator: cz + d
+          const [denRe, denIm] = [
+            cRe*x - cIm*y + dRe,
+            cRe*y + cIm*x + dIm
+          ];
+
+          // Compute f(z) = numerator / denominator
+          const [tx, ty] = cdiv(numRe, numIm, denRe, denIm);
+
+          if (!isFinite(tx) || !isFinite(ty)) return Infinity;
+
+          return baseSDF({ x: tx, y: ty }, cs, t);
+        };
+
+        return { result: sdfFn };
+      }
+
       case 'tilingNode': {
         const baseSDF = this._resolveSDF(node, 'sdf');
         if (!baseSDF) return { result: () => Infinity };
@@ -405,8 +645,21 @@ export class NodeEvaluator {
           };
         };
 
+        const foldBrick = (pt) => {
+          const x    = pt.x - offsetX;
+          const y    = pt.y - offsetY;
+          // Which row are we in?
+          const row  = Math.floor(((y + periodY / 2) % periodY + periodY) % periodY / (periodY / 2));
+          // Offset alternating rows by half a period
+          const xOff = row % 2 === 0 ? 0 : periodX / 2;
+          const tx   = ((x + xOff + periodX / 2) % periodX + periodX) % periodX - periodX / 2;
+          const ty   = ((y + periodY / 2) % periodY + periodY) % periodY - periodY / 2;
+          return { x: tx, y: ty };
+        };
+
         const fold = lattice === 'hexagonal'  ? foldHexagonal
                    : lattice === 'triangular' ? foldTriangular
+                   : lattice === 'brick'      ? foldBrick
                    : foldSquare;
 
         // Detect if the base shape is a curve primitive (SDF always >= 0)
@@ -454,6 +707,106 @@ export class NodeEvaluator {
       }
 
       // ── Output ────────────────────────────────────────────────────────────
+
+      case 'noiseDisplaceNode': {
+        const baseSDF  = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const { amplitude, frequency, animated } = node.params;
+        const amp  = amplitude ?? 0.3;
+        const freq = frequency ?? 3.0;
+        // Simple hash-based noise — no dependency, pure math
+        const hash = (n) => {
+          let x = Math.sin(n) * 43758.5453;
+          return x - Math.floor(x);
+        };
+        const noise3 = (x, y, z) => {
+          const ix = Math.floor(x); const fx = x - ix;
+          const iy = Math.floor(y); const fy = y - iy;
+          const iz = Math.floor(z); const fz = z - iz;
+          const ux = fx*fx*(3-2*fx);
+          const uy = fy*fy*(3-2*fy);
+          const uz = fz*fz*(3-2*fz);
+          const h000 = hash(ix     + iy*57     + iz*113);
+          const h100 = hash(ix+1   + iy*57     + iz*113);
+          const h010 = hash(ix     + (iy+1)*57 + iz*113);
+          const h110 = hash(ix+1   + (iy+1)*57 + iz*113);
+          const h001 = hash(ix     + iy*57     + (iz+1)*113);
+          const h101 = hash(ix+1   + iy*57     + (iz+1)*113);
+          const h011 = hash(ix     + (iy+1)*57 + (iz+1)*113);
+          const h111 = hash(ix+1   + (iy+1)*57 + (iz+1)*113);
+          return h000*(1-ux)*(1-uy)*(1-uz) + h100*ux*(1-uy)*(1-uz)
+               + h010*(1-ux)*uy*(1-uz)     + h110*ux*uy*(1-uz)
+               + h001*(1-ux)*(1-uy)*uz     + h101*ux*(1-uy)*uz
+               + h011*(1-ux)*uy*uz         + h111*ux*uy*uz;
+        };
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const timeOffset = animated === 'yes' ? t * 0.5 : 0;
+            const n = noise3(
+              pt.x * freq + timeOffset,
+              pt.y * freq,
+              (pt.z || 0) * freq
+            );
+            return baseSDF(pt, cs, t) + (n * 2 - 1) * amp;
+          }
+        };
+      }
+
+      case 'twistNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const strength = node.params.strength ?? 1.0;
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const y     = pt.y || 0;
+            const angle = y * strength;
+            const cosA  = Math.cos(angle);
+            const sinA  = Math.sin(angle);
+            const tx    = cosA * pt.x - sinA * (pt.z || 0);
+            const tz    = sinA * pt.x + cosA * (pt.z || 0);
+            return baseSDF({ x: tx, y, z: tz }, cs, t);
+          }
+        };
+      }
+
+      case 'bendNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const strength = node.params.strength ?? 0.5;
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const x     = pt.x || 0;
+            const angle = x * strength;
+            const cosA  = Math.cos(angle);
+            const sinA  = Math.sin(angle);
+            const tx    = cosA * x    - sinA * (pt.y || 0);
+            const ty    = sinA * x    + cosA * (pt.y || 0);
+            return baseSDF({ x: tx, y: ty, z: pt.z || 0 }, cs, t);
+          }
+        };
+      }
+
+      case 'repeatNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+        const { countX, countY, countZ, spacingX, spacingY, spacingZ } = node.params;
+        const cX = countX   ?? 3;  const sX = spacingX ?? 3;
+        const cY = countY   ?? 3;  const sY = spacingY ?? 3;
+        const cZ = countZ   ?? 1;  const sZ = spacingZ ?? 3;
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const rx = clamp(Math.round(pt.x / sX), -Math.floor(cX/2), Math.floor(cX/2));
+            const ry = clamp(Math.round(pt.y / sY), -Math.floor(cY/2), Math.floor(cY/2));
+            const rz = clamp(Math.round((pt.z||0)/sZ), -Math.floor(cZ/2), Math.floor(cZ/2));
+            return baseSDF({
+              x: pt.x - rx * sX,
+              y: pt.y - ry * sY,
+              z: (pt.z||0) - rz * sZ
+            }, cs, t);
+          }
+        };
+      }
 
       case 'outputNode': {
         // Output node has no computed value — its connected SDF is retrieved

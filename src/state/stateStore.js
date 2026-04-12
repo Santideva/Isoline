@@ -15,6 +15,15 @@ import { logger } from "../utils/logger.js";
 import { TrianglePrimitive, ArcPrimitive } from "../Primitives/primaryDerivativePrimitives.js";
 import { ComplexShape2D } from "../Geometry/ComplexShape2d.js";
 import { ComplexPrimitive2D } from "../Primitives/ComplexPrimitive2d.js";
+import {
+  SpherePrimitive,
+  BoxPrimitive,
+  CylinderPrimitive,
+  CapsulePrimitive,
+  TorusPrimitive,
+  ConePrimitive,
+  InfinitePlanePrimitive
+} from "../Primitives/solidPrimitives.js";
 import { NodeGraph } from "../graph/NodeGraph.js";
 
 
@@ -332,12 +341,21 @@ export class StateStore {
 
     try {
       switch (type.toLowerCase()) {
-        case "triangle":    shape = new TrianglePrimitive(data);   break;
-        case "arc":         shape = new ArcPrimitive(data);        break;
+        case "triangle":          shape = new TrianglePrimitive(data);        break;
+        case "arc":               shape = new ArcPrimitive(data);             break;
         case "line":
         case "complexshape":
-        case "composite":   shape = new ComplexShape2D(data);      break;
-        case "complexprimitive": shape = new ComplexPrimitive2D(data); break;
+        case "composite":         shape = new ComplexShape2D(data);           break;
+        case "complexprimitive":  shape = new ComplexPrimitive2D(data);       break;
+
+        case "sphere":            shape = new SpherePrimitive(data);          break;
+        case "box":               shape = new BoxPrimitive(data);             break;
+        case "cylinder":          shape = new CylinderPrimitive(data);        break;
+        case "capsule":           shape = new CapsulePrimitive(data);         break;
+        case "torus":             shape = new TorusPrimitive(data);           break;
+        case "cone":              shape = new ConePrimitive(data);            break;
+        case "plane":             shape = new InfinitePlanePrimitive(data);   break;
+
         default:
           logger.warn(`Unknown shape type: "${type}"`);
       }
@@ -377,6 +395,13 @@ export class StateStore {
     if (shape.type === 'circle')             return 'circle';
     if (shape.type === 'regularPolygon')     return 'regularPolygon';
     if (shape.type === 'polytope')           return 'polytope';
+    if (shape.type === 'sphere')             return 'sphere';
+    if (shape.type === 'box')                return 'box';
+    if (shape.type === 'cylinder')           return 'cylinder';
+    if (shape.type === 'capsule')            return 'capsule';
+    if (shape.type === 'torus')              return 'torus';
+    if (shape.type === 'cone')               return 'cone';
+    if (shape.type === 'plane')              return 'plane';
     if (shape.type === 'schur-composition')  return 'schurBlend';
     if (shape instanceof ComplexShape2D)     return 'lineSegment';
     return null;
@@ -435,6 +460,70 @@ export class StateStore {
         posX:     shape.posX     !== undefined ? shape.posX     : 0,
         posY:     shape.posY     !== undefined ? shape.posY     : 0,
         rotation: shape.rotation !== undefined ? shape.rotation : 0,
+      };
+    }
+
+    if (shape.type === 'sphere') {
+      return {
+        radius: shape.radius ?? 1,
+        posX:   shape.posX   ?? 0,
+        posY:   shape.posY   ?? 0,
+        posZ:   shape.posZ   ?? 0,
+      };
+    }
+    if (shape.type === 'box') {
+      return {
+        width:  shape.width  ?? 2,
+        height: shape.height ?? 2,
+        depth:  shape.depth  ?? 2,
+        posX:   shape.posX   ?? 0,
+        posY:   shape.posY   ?? 0,
+        posZ:   shape.posZ   ?? 0,
+      };
+    }
+    if (shape.type === 'cylinder') {
+      return {
+        radius: shape.radius ?? 1,
+        height: shape.height ?? 2,
+        capped: shape.capped ? 'yes' : 'no',
+        posX:   shape.posX   ?? 0,
+        posY:   shape.posY   ?? 0,
+        posZ:   shape.posZ   ?? 0,
+      };
+    }
+    if (shape.type === 'capsule') {
+      return {
+        ax: shape.ax ?? 0, ay: shape.ay ?? -1, az: shape.az ?? 0,
+        bx: shape.bx ?? 0, by: shape.by ??  1, bz: shape.bz ?? 0,
+        radius: shape.radius ?? 0.5,
+      };
+    }
+    if (shape.type === 'torus') {
+      return {
+        majorRadius: shape.majorRadius ?? 2,
+        minorRadius: shape.minorRadius ?? 0.5,
+        posX: shape.posX ?? 0,
+        posY: shape.posY ?? 0,
+        posZ: shape.posZ ?? 0,
+      };
+    }
+
+    if (shape.type === 'cone') {
+      return {
+        radius: shape.radius ?? 1,
+        height: shape.height ?? 2,
+        posX:   shape.posX ?? 0,
+        posY:   shape.posY ?? 0,
+        posZ:   shape.posZ ?? 0,
+      };
+    }
+
+    if (shape.type === 'plane') {
+      return {
+        nx:     shape.nx ?? 0,
+        ny:     shape.ny ?? 1,
+        nz:     shape.nz ?? 0,
+        offset: shape.offset ?? 0,
       };
     }
 

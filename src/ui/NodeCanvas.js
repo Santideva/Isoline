@@ -45,16 +45,20 @@
     import { EdgeRenderer }  from './EdgeRenderer.js';
     import { autoLayout, needsLayout, LAYOUT_DIRECTIONS } from './layouts.js';
     import { SchurComposition } from '../Primitives/SchurComposition.js';
+    import { saveScene, loadScene, listScenes } from '../persistence.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
     'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
-    'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
+    'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
+    'extrudeNode', 'revolveNode',
+    'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode','rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
     'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
     'exponentialMapper', 'logarithmicMapper', 'powerMapper',
     'periodicMapper', 'temporalMapper', 'recursiveMapper',
     'blendedMapper', 'compositeMapper',
-    'affineTransform', 'tilingNode',
+    'affineTransform', 'tilingNode', 'mobiusNode',
+    'symmetryFoldNode', 'symmetryOrbitNode',
     'timeNode', 'oscillatorNode',
     'outputNode',
     ]);
@@ -174,7 +178,9 @@
         font-size: 11px;
         padding: 2px 6px;
         `;
-        ['Line', 'Triangle', 'Arc', 'Circle', 'Polygon', 'Polytope'].forEach(t => {
+        ['Line', 'Triangle', 'Arc', 'Circle', 'Polygon', 'Polytope',
+         'Sphere', 'Box', 'Cylinder', 'Capsule', 'Torus',
+         'Cone', 'Plane'].forEach(t => {
         const o = document.createElement('option');
         o.value = t.toLowerCase();
         o.textContent = t;
@@ -183,14 +189,42 @@
         toolbar.appendChild(this._primSelect);
 
         const addBtn = this._makeButton('Add Primitive', () => {
-        this.sceneManager.addPrimitive(this._primSelect.value);
-        // Rebuild cards after a tick so the new node is in the graph
-        setTimeout(() => {
+          this.sceneManager.addPrimitive(this._primSelect.value);
+          setTimeout(() => {
             this._runAutoLayout();
             this._drawEdges();
-        }, 50);
+          }, 50);
         });
         toolbar.appendChild(addBtn);
+
+        // Transform node dropdown
+        const xformLabel = document.createElement('span');
+        xformLabel.textContent = 'Transform:';
+        xformLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
+        toolbar.appendChild(xformLabel);
+
+        this._xformSelect = document.createElement('select');
+        this._xformSelect.style.cssText = `
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 4px;
+          color: rgba(255,255,255,0.8);
+          font-size: 11px;
+          padding: 2px 6px;
+        `;
+        ['Extrude','Revolve','Tiling','SymmetryFold','SymmetryOrbit',
+         'Möbius','NoiseDisplace','Twist','Bend','Repeat'].forEach(t => {
+          const o = document.createElement('option');
+          o.value = t.toLowerCase().replace('ö','o');
+          o.textContent = t;
+          this._xformSelect.appendChild(o);
+        });
+        toolbar.appendChild(this._xformSelect);
+
+        const addXformBtn = this._makeButton('Add Transform', () => {
+          this._addTransformNode(this._xformSelect.value);
+        });
+        toolbar.appendChild(addXformBtn);
 
         // Remove Last button
         const removeBtn = this._makeButton('Remove Last', () => {
@@ -246,14 +280,86 @@
         composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
         toolbar.appendChild(composeBtn);
 
+        
+        // Iso-step slider (visible only in GLSL mode)
+        const isoLabel = document.createElement('span');
+        isoLabel.textContent = 'Iso:';
+        isoLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
+        toolbar.appendChild(isoLabel);
+
+        this._isoSlider = document.createElement('input');
+        this._isoSlider.type  = 'range';
+        this._isoSlider.min   = '0.1';
+        this._isoSlider.max   = '2.0';
+        this._isoSlider.step  = '0.05';
+        this._isoSlider.value = '0.5';
+        this._isoSlider.style.cssText = 'width:80px; cursor:pointer;';
+        this._isoSlider.addEventListener('input', () => {
+        const v = parseFloat(this._isoSlider.value);
+        this.sceneManager.sdfRenderer.setIsoStep(v);
+        if (this.sceneManager.renderMode === 'glsl') {
+            this.sceneManager._renderGLSL();
+        }
+        });
+        toolbar.appendChild(this._isoSlider);
+
+        // Render mode toggle
+        this._renderModeBtn = this._makeButton('⬛ GLSL Mode', () => this._toggleRenderMode());
+        this._renderModeBtn.style.cssText += 'border-color: rgba(80,200,120,0.4); color: rgba(160,255,180,0.9);';
+        toolbar.appendChild(this._renderModeBtn);
+
         // Fit to screen button
         const fitBtn = this._makeButton('Fit', () => this._fitToScreen());
         toolbar.appendChild(fitBtn);
 
-        // Close button
-        const closeBtn = this._makeButton('✕ Close  [Tab]', () => this._doClose());
-        closeBtn.style.marginLeft = '4px';
-        toolbar.appendChild(closeBtn);
+        // Save button
+    const saveBtn = this._makeButton('💾 Save', async () => {
+      const name = prompt('Scene name:', 'autosave');
+      if (!name) return;
+      const ok = await saveScene(this.stateStore.nodeGraph, name);
+      if (ok) {
+        saveBtn.textContent = '✓ Saved';
+        setTimeout(() => { saveBtn.textContent = '💾 Save'; }, 1500);
+      }
+    });
+    saveBtn.style.cssText += 'border-color: rgba(80,180,80,0.4); color: rgba(160,255,160,0.9);';
+    toolbar.appendChild(saveBtn);
+
+    // Load button
+    const loadBtn = this._makeButton('📂 Load', async () => {
+      const names = await listScenes();
+      if (names.length === 0) {
+        alert('No saved scenes found.');
+        return;
+      }
+      const name = prompt(`Available scenes:\n${names.join(', ')}\n\nLoad scene:`, names[0]);
+      if (!name) return;
+
+      // Clear current state first
+      this._clearAll();
+
+      const ok = await loadScene(name, this.stateStore.nodeGraph);
+      if (ok) {
+        // Rebuild the evaluator with the restored graph
+        this.sceneManager.evaluator.graph = this.stateStore.nodeGraph;
+        this.sceneManager.evaluator.invalidate();
+        this.sceneManager.glslEvaluator.graph = this.stateStore.nodeGraph;
+        setTimeout(() => {
+          this._rebuildCards();
+          this._runAutoLayout();
+          this._drawEdges();
+        }, 100);
+      } else {
+        alert(`Could not load scene "${name}"`);
+      }
+    });
+    loadBtn.style.cssText += 'border-color: rgba(80,140,255,0.4); color: rgba(160,200,255,0.9);';
+    toolbar.appendChild(loadBtn);
+
+    // Close button
+    const closeBtn = this._makeButton('✕ Close  [Tab]', () => this._doClose());
+    closeBtn.style.marginLeft = '4px';
+    toolbar.appendChild(closeBtn);
 
         this._overlay.appendChild(toolbar);
 
@@ -328,7 +434,7 @@
         // Viewport stays full screen — the overlay is transparent and
         // pointer-events on the background pass through to OrbitControls.
 
-        // Hide dat.GUI while canvas is open
+        // Hide dat.GUI if present (legacy fallback)
         const gui = document.querySelector('.dg.ac');
         if (gui) gui.style.display = 'none';
 
@@ -565,16 +671,17 @@
     // ── Drag-connect (pending edge) ───────────────────────────────────────────
 
     _beginPendingEdge(nodeId, portName, dir, screenPos) {
-        // Convert screen pos to canvas-inner coords
-        const innerRect = this._inner.getBoundingClientRect();
+        const getInnerRect = () => this._inner.getBoundingClientRect();
+        const innerRect = getInnerRect();
         const x = (screenPos.x - innerRect.left) / this._transform.scale;
         const y = (screenPos.y - innerRect.top)  / this._transform.scale;
 
         this._pendingEdge = { nodeId, portName, dir, x1: x, y1: y, x2: x, y2: y };
 
         const onMouseMove = (e) => {
-        const dx = (e.clientX - innerRect.left) / this._transform.scale;
-        const dy = (e.clientY - innerRect.top)  / this._transform.scale;
+        const r  = getInnerRect();
+        const dx = (e.clientX - r.left) / this._transform.scale;
+        const dy = (e.clientY - r.top)  / this._transform.scale;
         this._pendingEdge.x2 = dx;
         this._pendingEdge.y2 = dy;
         this._edgeRenderer.setPendingEdge({
@@ -603,17 +710,35 @@
         if (!this._pendingEdge) return;
         const { nodeId: fromNodeId, portName: fromPortName, dir: fromDir } = this._pendingEdge;
 
-        // Connection must go from OUT to IN
-        const outNodeId  = fromDir === 'out' ? fromNodeId : toNodeId;
-        const outPort    = fromDir === 'out' ? fromPortName : toPortName;
-        const inNodeId   = fromDir === 'in'  ? fromNodeId : toNodeId;
-        const inPort     = fromDir === 'in'  ? fromPortName : toPortName;
+        // Prevent connecting to the same node
+        if (fromNodeId === toNodeId) return;
+
+        // Determine canonical OUT→IN direction from both port directions
+        let outNodeId, outPort, inNodeId, inPort;
+
+        if (fromDir === 'out' && toDir === 'in') {
+          // Dragged from an output port to an input port — canonical direction
+          outNodeId = fromNodeId;
+          outPort   = fromPortName;
+          inNodeId  = toNodeId;
+          inPort    = toPortName;
+        } else if (fromDir === 'in' && toDir === 'out') {
+          // Dragged backwards (from input to output) — swap to canonical
+          outNodeId = toNodeId;
+          outPort   = toPortName;
+          inNodeId  = fromNodeId;
+          inPort    = fromPortName;
+        } else {
+          // Both same direction — incompatible, ignore silently
+          // (e.g. OUT→OUT or IN→IN)
+          return;
+        }
 
         try {
-        this.stateStore.nodeGraph.addEdge(outNodeId, outPort, inNodeId, inPort);
-        // _onGraphChange will rebuild cards and redraw
+          this.stateStore.nodeGraph.addEdge(outNodeId, outPort, inNodeId, inPort);
+          // _onGraphChange will rebuild cards and redraw
         } catch (e) {
-        console.warn('NodeCanvas: Could not connect ports:', e.message);
+          console.warn('NodeCanvas: Could not connect ports:', e.message);
         }
     }
 
@@ -676,6 +801,44 @@
 
     // ── Graph change handler ──────────────────────────────────────────────────
 
+    _toggleRenderMode() {
+    const modes  = ['marchingSquares', 'glsl', 'rayMarch'];
+    const labels = ['⬛ GLSL Mode', '⬜ Ray March', '▣ Marching Squares'];
+    const current = this.sceneManager.renderMode;
+    const nextIdx = (modes.indexOf(current) + 1) % modes.length;
+    const next    = modes[nextIdx];
+
+    // Auto-wire any geometry node to output when switching away from
+    // marching squares — required for GLSLEvaluator to find source
+    if (next !== 'marchingSquares') {
+      const graph = this.stateStore.nodeGraph;
+      const GEOM  = new Set([
+        'circle', 'regularPolygon', 'triangle', 'arc',
+        'polytope', 'lineSegment',
+        'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane'
+      ]);
+      let geomId = null;
+      graph.nodes.forEach((n, id) => {
+        if (GEOM.has(n.type)) geomId = id;
+      });
+      if (geomId) {
+        const out = this.sceneManager._ensureOutputNode();
+        try {
+          graph.addEdge(geomId, 'sdf', out.id, 'sdf');
+        } catch (e) { /* edge already exists */ }
+      }
+    }
+
+    this.sceneManager.setRenderMode(next);
+    this._renderModeBtn.textContent = labels[nextIdx];
+
+    if (next === 'glsl') {
+      this.sceneManager._renderGLSL();
+    } else if (next === 'rayMarch') {
+      this.sceneManager._renderRayMarch();
+    }
+  }
+
     _clearAll() {
         // 1. Remove currentSchur from scene
         if (this.sceneManager.currentSchur) {
@@ -703,9 +866,103 @@
         }, 50);
     }
 
+    _addTransformNode(type) {
+    const graph    = this.stateStore.nodeGraph;
+    const defaults = {
+      extrude:       { type: 'extrudeNode',      params: { height: 2 } },
+      revolve:       { type: 'revolveNode',       params: { offset: 0 } },
+      tiling:        { type: 'tilingNode',        params: { lattice:'hexagonal', periodX:3, periodY:3, offsetX:0, offsetY:0, isoOffset:0 } },
+      symmetryfold:  { type: 'symmetryFoldNode',  params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', reflectY:'no' } },
+      symmetryorbit: { type: 'symmetryOrbitNode', params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', combiner:'min', smoothness:8 } },
+      mobius:        { type: 'mobiusNode',        params: { aRe:1, aIm:0, bRe:0, bIm:0, cRe:0, cIm:0, dRe:1, dIm:0 } },
+      noisedisplace: { type: 'noiseDisplaceNode', params: { amplitude:0.3, frequency:3, animated:'no' } },
+      twist:         { type: 'twistNode',         params: { strength:1.0 } },
+      bend:          { type: 'bendNode',          params: { strength:0.5 } },
+      repeat:        { type: 'repeatNode',        params: { countX:3, countY:3, countZ:1, spacingX:3, spacingY:3, spacingZ:3 } },
+    };
+
+    const def = defaults[type];
+    if (!def) return;
+
+    const newNode = graph.addNode(def.type, def.params);
+
+    // ── Auto-wire ──────────────────────────────────────────────────────────
+    // Port names: geometry nodes output on 'sdf', transform nodes output on 'result'
+    const GEOM_TYPES = new Set([
+      'circle','regularPolygon','triangle','arc','polytope','lineSegment',
+      'sphere','box','cylinder','capsule','torus','cone','plane'
+    ]);
+    const XFORM_TYPES = new Set([
+      'extrudeNode','revolveNode','noiseDisplaceNode','twistNode','bendNode',
+      'repeatNode','tilingNode','symmetryFoldNode','symmetryOrbitNode','mobiusNode'
+    ]);
+
+    // Find the best source node:
+    // 1. Last selected node that has an SDF output
+    // 2. Fall back to the most recently added geometry or transform node
+    let sourceId   = null;
+    let sourcePort = 'sdf';
+
+    // Priority 1 — selected node
+    if (this._selectedIds.size > 0) {
+      const selId   = [...this._selectedIds].pop();
+      const selNode = graph.nodes.get(selId);
+      if (selNode && selId !== newNode.id) {
+        if (GEOM_TYPES.has(selNode.type)) {
+          sourceId   = selId;
+          sourcePort = 'sdf';
+        } else if (XFORM_TYPES.has(selNode.type)) {
+          sourceId   = selId;
+          sourcePort = 'result';
+        }
+      }
+    }
+
+    // Priority 2 — last geometry or transform node in the graph
+    if (!sourceId) {
+      graph.nodes.forEach((n, id) => {
+        if (id === newNode.id) return;
+        if (GEOM_TYPES.has(n.type)) {
+          sourceId   = id;
+          sourcePort = 'sdf';
+        } else if (XFORM_TYPES.has(n.type)) {
+          sourceId   = id;
+          sourcePort = 'result';
+        }
+      });
+    }
+
+    // Wire source → new transform node
+    if (sourceId) {
+      try {
+        graph.addEdge(sourceId, sourcePort, newNode.id, 'sdf');
+        console.log(`Auto-wired: node ${sourceId} (${sourcePort}) → ${newNode.id} (sdf)`);
+      } catch(e) {
+        console.warn('Auto-wire source failed:', e.message);
+      }
+    } else {
+      console.info('No source node found — wire manually by dragging port connections');
+    }
+
+    // Wire new transform → output node
+    const outNode = this.sceneManager._ensureOutputNode();
+    try {
+      graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
+      console.log(`Auto-wired: node ${newNode.id} (result) → output (sdf)`);
+    } catch(e) {
+      // Edge may already exist if output was already connected — this is fine
+    }
+
+    setTimeout(() => {
+      this._runAutoLayout();
+      this._drawEdges();
+    }, 50);
+  }
+
     _compose() {
         const GEOM_TYPES = new Set([
-      'triangle','arc','lineSegment','circle','regularPolygon','polytope'
+      'triangle','arc','lineSegment','circle','regularPolygon','polytope',
+      'sphere','box','cylinder','capsule','torus','cone','plane'
     ]);
 
         // Collect base shape instances

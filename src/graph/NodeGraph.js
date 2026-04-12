@@ -1,6 +1,6 @@
 // src/graph/NodeGraph.js
 import { NODE_TYPES } from './NodeSpec.js';
-import { nextId } from '../utils/idGenerator.js';
+import { nextId, advanceIdCounter } from '../utils/idGenerator.js';
 
 /**
  * NodeGraph is the ground-truth data model for the entire scene.
@@ -211,6 +211,87 @@ export class NodeGraph {
   onChange(fn) {
     this._listeners.push(fn);
     return () => { this._listeners = this._listeners.filter(l => l !== fn); };
+  }
+
+    /**
+   * Serialize the graph to a plain JSON-compatible object.
+   * Captures all nodes (with params and uiPos) and all edges.
+   */
+  serialize() {
+    const nodes = [];
+    this.nodes.forEach((node, id) => {
+      nodes.push({
+        id,
+        type:   node.type,
+        params: { ...node.params },
+        uiPos:  { ...node.uiPos }
+      });
+    });
+
+    const edges = [];
+    this.edges.forEach((edge, id) => {
+      edges.push({
+        id,
+        fromNode: edge.fromNode,
+        fromPort: edge.fromPort,
+        toNode:   edge.toNode,
+        toPort:   edge.toPort
+      });
+    });
+
+    return { version: 1, nodes, edges };
+  }
+
+  /**
+   * Restore graph state from a serialized object.
+   * Clears existing state first.
+   * @param {object} data  Output of serialize()
+   */
+  deserialize(data) {
+    if (!data || data.version !== 1) {
+      console.warn('NodeGraph.deserialize: unknown format');
+      return false;
+    }
+
+    // Clear existing state
+    this.nodes.clear();
+    this.edges.clear();
+    this._nextEdgeId = 1;
+
+    // Restore nodes — preserve original IDs
+    for (const n of data.nodes) {
+      this.nodes.set(n.id, {
+        id:     n.id,
+        type:   n.type,
+        params: { ...n.params },
+        uiPos:  { ...n.uiPos }
+      });
+    }
+
+    // Restore edges
+    let maxId = 0;
+    for (const e of data.edges) {
+      this.edges.set(e.id, {
+        id:       e.id,
+        fromNode: e.fromNode,
+        fromPort: e.fromPort,
+        toNode:   e.toNode,
+        toPort:   e.toPort
+      });
+      if (typeof e.id === 'number' && e.id > maxId) maxId = e.id;
+    }
+
+    // Advance nodes max ID check
+    for (const n of data.nodes) {
+      if (typeof n.id === 'number' && n.id > maxId) maxId = n.id;
+    }
+
+    // Advance the global ID counter past all restored IDs to prevent collisions
+    advanceIdCounter(maxId);
+
+    this._rebuildLookups();
+    this._notify('deserialized');
+    return true;
   }
 
   // ── Private ───────────────────────────────────────────────────────────────

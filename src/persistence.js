@@ -23,6 +23,12 @@ db.version(1).stores({
   metadata: 'key'
 });
 
+db.version(2).stores({
+  shapes:   'id, type, createdAt',
+  metadata: 'key',
+  scenes:   'name'
+});
+
 // =============================================================================
 // 2. TYPE DETECTION AND UTILITY FUNCTIONS
 // =============================================================================
@@ -309,11 +315,10 @@ export function serializeShapesForStorage() {
 // =============================================================================
 
 /**
- * saveScene
- * This function captures the current visual state, serializes the data,
- * and then saves it to IndexedDB via Dexie.
+ * _legacySaveScene
+ * Original shape-based save — used internally by autoSaveAndGarbageCollect.
  */
-export async function saveScene(sceneName = 'default') {
+async function _legacySaveScene(sceneName = 'default') {
   try {
     const captured = captureVisualState();
     if (!captured) {
@@ -327,17 +332,11 @@ export async function saveScene(sceneName = 'default') {
       return false;
     }
 
-    // Clear existing scene data from the Dexie tables.
     await db.shapes.clear();
     await db.metadata.clear();
-
-    // Save each shape record into the 'shapes' table.
     await db.shapes.bulkPut(serializedData.shapes);
-
-    // Add scene-level metadata into the 'metadata' table, using a fixed key (e.g., 'scene').
     await db.metadata.put({ key: 'scene', value: { sceneName, ...serializedData.metadata } });
 
-    // Reset persistence flags after saving.
     resetPersistenceFlags();
 
     logger.info(`Visual state saved successfully as scene '${sceneName}'`);
@@ -349,12 +348,10 @@ export async function saveScene(sceneName = 'default') {
 }
 
 /**
- * loadScene
- * Loads the saved scene from IndexedDB via Dexie, reconstructs the shapes, 
- * and restores scene metadata.
+ * _legacyLoadScene (internal)
+ * Original shape-based load — called by the new loadScene when passed the old signature.
  */
-// Enhanced loadScene function with proper visual rendering support
-export async function loadScene({ clearVisuals, createVisual, triggerRender }) {
+async function _legacyLoadScene({ clearVisuals, createVisual, triggerRender }) {
   try {
     // 1️⃣ Clear in-memory shapes
     stateStore.clear();
@@ -465,7 +462,7 @@ export async function loadScene({ clearVisuals, createVisual, triggerRender }) {
 export async function autoSaveAndGarbageCollect() {
   try {
     // Auto-save the current scene.
-    const saved = await saveScene('autosave');
+    const saved = await _legacySaveScene('autosave');
     if (!saved) {
       logger.error("Auto-save failed.");
       return false;
@@ -523,7 +520,7 @@ export function addSaveButtonToGUI(gui) {
   const saveFolder = gui.addFolder('Save/Restore');
   const saveController = {
     saveState: async function() {
-      const success = await saveScene();
+      const success = await _legacySaveScene('default');
       if (success) {
         alert("Visual state saved successfully!");
       } else {
@@ -543,7 +540,7 @@ export function setupSaveButton() {
   const saveButton = document.getElementById('saveButton');
   if (saveButton) {
     saveButton.addEventListener('click', async () => {
-      const success = await saveScene();
+      const success = await _legacySaveScene('default');
       if (success) {
         alert("Visual state saved successfully!");
       } else {
@@ -567,11 +564,104 @@ export function initializeSaveFeature(gui) {
   logger.info("Save feature initialized");
 }
 
+// =============================================================================
+// 9. NODE GRAPH SCENE PERSISTENCE (Phase 7A)
+// These replace the shape-based saveScene/loadScene for the node canvas UI.
+// NodeCanvas.js calls: saveScene(nodeGraph, name), loadScene(name, nodeGraph)
+// =============================================================================
+
+/**
+ * Save the current node graph to the 'scenes' IndexedDB table.
+ * This is the function imported by NodeCanvas.js.
+ * @param {NodeGraph} nodeGraph
+ * @param {string}    name
+ * @returns {Promise<boolean>}
+ */
+export async function saveScene(nodeGraph, name = 'autosave') {
+  try {
+    const data = {
+      name,
+      savedAt:   Date.now(),
+      nodeGraph: nodeGraph.serialize(),
+    };
+    await db.scenes.put(data);
+    logger.info(`Scene saved: "${name}"`);
+    return true;
+  } catch (e) {
+    logger.error(`saveScene failed: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Load a named scene from the 'scenes' table into the node graph.
+ * This is the function imported by NodeCanvas.js.
+ * @param {string}    name
+ * @param {NodeGraph} nodeGraph
+ * @returns {Promise<boolean>}
+ */
+export async function loadScene(name = 'autosave', nodeGraph) {
+  // Handle both call signatures:
+  //   Old:  loadScene({ clearVisuals, createVisual, triggerRender })
+  //   New:  loadScene(name, nodeGraph)
+  if (typeof name === 'object' && name !== null) {
+    // Old signature — delegate to legacy loader
+    return _legacyLoadScene(name);
+  }
+
+  try {
+    const data = await db.scenes.get(name);
+    if (!data) {
+      logger.warn(`loadScene: no scene named "${name}"`);
+      return false;
+    }
+    const ok = nodeGraph.deserialize(data.nodeGraph);
+    if (ok) {
+      logger.info(`Scene loaded: "${name}" (saved ${new Date(data.savedAt).toLocaleString()})`);
+    }
+    return ok;
+  } catch (e) {
+    logger.error(`loadScene failed: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * List all saved scene names from the 'scenes' table.
+ * @returns {Promise<string[]>}
+ */
+export async function listScenes() {
+  try {
+    const all = await db.scenes.toArray();
+    return all.map(s => s.name);
+  } catch (e) {
+    logger.error(`listScenes failed: ${e.message}`);
+    return [];
+  }
+}
+
+/**
+ * Delete a named scene.
+ * @param {string} name
+ * @returns {Promise<boolean>}
+ */
+export async function deleteScene(name) {
+  try {
+    await db.scenes.delete(name);
+    logger.info(`Scene deleted: "${name}"`);
+    return true;
+  } catch (e) {
+    logger.error(`deleteScene failed: ${e.message}`);
+    return false;
+  }
+}
+
+
 export function addLoadButtonToGUI(gui, { clearVisuals, createVisual, triggerRender }) {
   const folder = gui.addFolder('Load');
   folder.add({
     loadState: async () => {
-      const ok = await loadScene({ clearVisuals, createVisual, triggerRender });
+      const ok = await _legacyLoadScene({ clearVisuals, createVisual, triggerRender });
       alert(ok ? "Loaded!" : "Load failed; see console.");
     }
   }, 'loadState').name('Load Saved Scene');
