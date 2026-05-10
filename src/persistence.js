@@ -577,15 +577,16 @@ export function initializeSaveFeature(gui) {
  * @param {string}    name
  * @returns {Promise<boolean>}
  */
-export async function saveScene(nodeGraph, name = 'autosave') {
+export async function saveScene(nodeGraph, name = 'autosave', meta = {}) {
   try {
     const data = {
       name,
-      savedAt:   Date.now(),
-      nodeGraph: nodeGraph.serialize(),
+      savedAt:    Date.now(),
+      nodeGraph:  nodeGraph.serialize(),
+      renderMode: meta.renderMode || 'marchingSquares',
     };
     await db.scenes.put(data);
-    logger.info(`Scene saved: "${name}"`);
+    logger.info(`Scene saved: "${name}" (renderMode: ${data.renderMode})`);
     return true;
   } catch (e) {
     logger.error(`saveScene failed: ${e.message}`);
@@ -605,7 +606,6 @@ export async function loadScene(name = 'autosave', nodeGraph) {
   //   Old:  loadScene({ clearVisuals, createVisual, triggerRender })
   //   New:  loadScene(name, nodeGraph)
   if (typeof name === 'object' && name !== null) {
-    // Old signature — delegate to legacy loader
     return _legacyLoadScene(name);
   }
 
@@ -613,16 +613,18 @@ export async function loadScene(name = 'autosave', nodeGraph) {
     const data = await db.scenes.get(name);
     if (!data) {
       logger.warn(`loadScene: no scene named "${name}"`);
-      return false;
+      return null;
     }
     const ok = nodeGraph.deserialize(data.nodeGraph);
     if (ok) {
-      logger.info(`Scene loaded: "${name}" (saved ${new Date(data.savedAt).toLocaleString()})`);
+      logger.info(`Scene loaded: "${name}" (saved ${new Date(data.savedAt).toLocaleString()}, renderMode: ${data.renderMode || 'marchingSquares'})`);
+      // Return the full record so callers can read renderMode etc.
+      return data;
     }
-    return ok;
+    return null;
   } catch (e) {
     logger.error(`loadScene failed: ${e.message}`);
-    return false;
+    return null;
   }
 }
 

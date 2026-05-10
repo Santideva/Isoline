@@ -44,9 +44,11 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._pointLights = [];
 
     // Ray march tuning — changing maxSteps forces recompile (it is baked)
-    this._maxSteps = 128;
-    this._maxDist  = 30.0;
-    this._epsilon  = 0.001;
+    this._maxSteps  = 128;
+    this._maxDist   = 30.0;
+    this._epsilon   = 0.001;
+    // Step scale: reduce below 1.0 for non-Lipschitz SDFs (rDifference etc.)
+    this._stepScale = 0.9;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -78,8 +80,11 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._u3f('uMatColor', ...this._matColor);
 
     // Ray march tuning
-    this._u1f('uMaxDist', this._maxDist);
-    this._u1f('uEpsilon', this._epsilon);
+    this._u1f('uMaxDist',   this._maxDist);
+    this._u1f('uEpsilon',   this._epsilon);
+    // Step scale: 0.4 for rDifference/schurBlend(difference) scenes whose
+    // SDF gradient can be well below 1.0; 0.9 for all other SDFs.
+    this._u1f('uStepScale', this._stepScale ?? 0.9);
 
     // Point lights — always upload all 4 slots
     const plc = Math.min(this._pointLights.length, 4);
@@ -215,6 +220,7 @@ uniform vec3  uMatColor;
 // Ray march tuning
 uniform float uMaxDist;
 uniform float uEpsilon;
+uniform float uStepScale;
 
 // Point lights (up to 4)
 uniform vec3  uPointLightPos[4];
@@ -262,14 +268,18 @@ float ambientOcclusion(vec3 p, vec3 n) {
   return clamp(1.0 - 2.0 * occ, 0.0, 1.0);
 }
 
-// ── Sphere-tracing loop ───────────────────────────────────────────────────────
+// ── Sphere-tracing loop ───────────────────────────────────────────────
 float rayMarch(vec3 ro, vec3 rd) {
   float t = 0.001;
   for (int i = 0; i < ${maxSteps}; i++) {
     float d = sceneSDF(ro + rd * t);
     if (d < uEpsilon) return t;
     if (t > uMaxDist) break;
-    t += d;
+    // uStepScale < 1.0 makes the marcher conservative for non-Lipschitz SDFs
+    // (e.g. rDifference creates crescent boundaries where |∇SDF| << 1).
+    // For standard SDFs uStepScale = 0.9 (slight understepping avoids
+    // over-bounding artefacts on flat surfaces).
+    t += d * uStepScale;
   }
   return -1.0;
 }

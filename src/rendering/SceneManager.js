@@ -22,7 +22,8 @@ import { RayMarchRenderer } from "./RayMarchRenderer.js";
 export class SceneManager {
   constructor(mountElement) {
     // ── Three.js core ──────────────────────────────────────────────────────
-    this.scene    = new THREE.Scene();
+    this.scene       = new THREE.Scene();
+    this._mountEl    = mountElement;   // saved so setRenderMode can use it
 
     this.cameraManager = new CameraManager();
     this.camera   = this.cameraManager.getCamera();
@@ -31,7 +32,12 @@ export class SceneManager {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     mountElement.appendChild(this.renderer.domElement);
 
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    // Attach OrbitControls to the CONTAINER, not to renderer.domElement.
+    // This is critical: in ray march mode the ray march canvas sits on top
+    // of the Three.js canvas and intercepts all pointer events. By listening
+    // on the container, OrbitControls receives events regardless of which
+    // canvas is currently on top.
+    this.controls = new OrbitControls(this.camera, mountElement);
     this.camera.position.set(0, 0, 5);
     this.controls.update();
 
@@ -106,7 +112,13 @@ export class SceneManager {
         });
         triangle.registerWithStateStore(stateStore);
         stateStore.addShape(triangle);
-        this._registerPrimInGraph(triangle, 'triangle', { size: triangle.size, rotation: triangle.rotation, posX: triangle.position?.x ?? 0, posY: triangle.position?.y ?? 0, cornerRounding: triangle.cornerRounding ?? 0 });
+        this._registerPrimInGraph(triangle, 'triangle', {
+          size:           triangle.size             ?? 1,
+          rotation:       triangle.rotation         ?? 0,
+          posX:           triangle.position?.x      ?? 0,
+          posY:           triangle.position?.y      ?? 0,
+          cornerRounding: triangle.cornerRounding   ?? 0,
+        });
         entry = { instance: triangle, type: "triangle" };
         entry.object = triangle.createObject();
         logger.info("Triangle primitive instantiated.");
@@ -128,9 +140,15 @@ export class SceneManager {
           color: { h: 30, s: 0.9, l: 0.5, a: 1 },
           blendSmoothness: 8
         });
-        arc.registerWithStateStore(stateStore);
         stateStore.addShape(arc);
-        this._registerPrimInGraph(arc, 'arc', { radius: arc.radius, startAngle: arc.startAngle, endAngle: arc.endAngle, segments: arc.segments, posX: arc.position?.x ?? 0, posY: arc.position?.y ?? 0 });
+        this._registerPrimInGraph(arc, 'arc', {
+          radius:     arc.radius     ?? 1.5,
+          startAngle: arc.startAngle ?? 0,
+          endAngle:   arc.endAngle   ?? Math.PI,
+          segments:   arc.segments   ?? 8,
+          posX:       arc.position?.x ?? 0,
+          posY:       arc.position?.y ?? 0,
+        });
         entry = { instance: arc, type: "arc" };
         entry.object = arc.createObject();
         logger.info("Arc primitive instantiated.");
@@ -146,7 +164,12 @@ export class SceneManager {
           color: { h: 280, s: 0.7, l: 0.55, a: 1 },
         });
         stateStore.addShape(polytope);
-        this._registerPrimInGraph(polytope, 'polytope', { vertices: polytope.vertices || '[[-1,-1],[1,-1],[1,1],[-1,1]]', posX: polytope.posX ?? 0, posY: polytope.posY ?? 0, rotation: polytope.rotation ?? 0 });
+        this._registerPrimInGraph(polytope, 'polytope', {
+          vertices: polytope.vertices ?? '[[-1,-1],[1,-1],[1,1],[-1,1]]',
+          posX:     polytope.posX     ?? 0,
+          posY:     polytope.posY     ?? 0,
+          rotation: polytope.rotation ?? 0,
+        });
         entry = { instance: polytope, type: 'polytope' };
         entry.object = polytope.createObject();
         logger.info("Polytope primitive instantiated.");
@@ -165,7 +188,13 @@ export class SceneManager {
           color: { h: 120, s: 0.7, l: 0.55, a: 1 },
         });
         stateStore.addShape(poly);
-        this._registerPrimInGraph(poly, 'regularPolygon', { sides: poly.sides, size: poly.size, rotation: poly.rotation, posX: poly.posX, posY: poly.posY });
+        this._registerPrimInGraph(poly, 'regularPolygon', {
+          sides:    poly.sides,
+          size:     poly.size,
+          rotation: poly.rotation ?? 0,
+          posX:     poly.posX     ?? 0,
+          posY:     poly.posY     ?? 0,
+        });
         entry = { instance: poly, type: 'regularPolygon' };
         entry.object = poly.createObject();
         logger.info(`RegularPolygon primitive instantiated (${poly.sides} sides).`);
@@ -181,7 +210,11 @@ export class SceneManager {
           color: { h: 160, s: 0.8, l: 0.5, a: 1 },
         });
         stateStore.addShape(circle);
-        this._registerPrimInGraph(circle, 'circle', { radius: circle.radius, posX: circle.posX, posY: circle.posY });
+        this._registerPrimInGraph(circle, 'circle', {
+          radius: circle.radius,
+          posX:   circle.posX   ?? 0,
+          posY:   circle.posY   ?? 0,
+        });
         entry = { instance: circle, type: 'circle' };
         entry.object = circle.createObject();
         logger.info("Circle primitive instantiated.");
@@ -196,7 +229,12 @@ export class SceneManager {
           color: { h: 200, s: 0.8, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'sphere', { radius: prim.radius, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        this._registerPrimInGraph(prim, 'sphere', {
+          radius: prim.radius,
+          posX:   prim.posX ?? 0,
+          posY:   prim.posY ?? 0,
+          posZ:   prim.posZ ?? 0,
+        });
         entry = { instance: prim, type: 'sphere', object: prim.createObject() };
         logger.info('Sphere primitive instantiated.');
         break;
@@ -210,7 +248,14 @@ export class SceneManager {
           color: { h: 30, s: 0.8, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'box', { width: prim.width, height: prim.height, depth: prim.depth, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        this._registerPrimInGraph(prim, 'box', {
+          width:  prim.width,
+          height: prim.height,
+          depth:  prim.depth,
+          posX:   prim.posX ?? 0,
+          posY:   prim.posY ?? 0,
+          posZ:   prim.posZ ?? 0,
+        });
         entry = { instance: prim, type: 'box', object: prim.createObject() };
         logger.info('Box primitive instantiated.');
         break;
@@ -224,8 +269,18 @@ export class SceneManager {
           color: { h: 120, s: 0.7, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'cylinder', { radius: prim.radius, height: prim.height, capped: prim.capped ? 'yes' : 'no', posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
-        entry = { instance: prim, type: 'cylinder', object: prim.createObject() };
+        this._registerPrimInGraph(prim, 'cylinder', {
+          radius: prim.radius,
+          height: prim.height,
+          capped: prim.capped ? 'yes' : 'no',
+          axis:   'Y',
+          posX:   prim.posX ?? 0,
+          posY:   prim.posY ?? 0,
+          posZ:   prim.posZ ?? 0,
+        });
+        const cylObj = prim.createObject();
+        // Default cylinder is along Y — no rotation needed for Y axis
+        entry = { instance: prim, type: 'cylinder', object: cylObj };
         logger.info('Cylinder primitive instantiated.');
         break;
       }
@@ -239,7 +294,11 @@ export class SceneManager {
           color: { h: 280, s: 0.7, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'capsule', { ax: prim.ax, ay: prim.ay, az: prim.az, bx: prim.bx, by: prim.by, bz: prim.bz, radius: prim.radius });
+        this._registerPrimInGraph(prim, 'capsule', {
+          ax: prim.ax, ay: prim.ay, az: prim.az,
+          bx: prim.bx, by: prim.by, bz: prim.bz,
+          radius: prim.radius,
+        });
         entry = { instance: prim, type: 'capsule', object: prim.createObject() };
         logger.info('Capsule primitive instantiated.');
         break;
@@ -253,7 +312,13 @@ export class SceneManager {
           color: { h: 340, s: 0.8, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'torus', { majorRadius: prim.majorRadius, minorRadius: prim.minorRadius, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        this._registerPrimInGraph(prim, 'torus', {
+          majorRadius: prim.majorRadius,
+          minorRadius: prim.minorRadius,
+          posX: prim.posX ?? 0,
+          posY: prim.posY ?? 0,
+          posZ: prim.posZ ?? 0,
+        });
         entry = { instance: prim, type: 'torus', object: prim.createObject() };
         logger.info('Torus primitive instantiated.');
         break;
@@ -270,7 +335,14 @@ export class SceneManager {
           color: { h: 20, s: 0.8, l: 0.5, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'cone', { radius: prim.radius, height: prim.height, posX: prim.posX, posY: prim.posY, posZ: prim.posZ });
+        this._registerPrimInGraph(prim, 'cone', {
+          radius: prim.radius,
+          height: prim.height,
+          axis:   'Y',
+          posX:   prim.posX ?? 0,
+          posY:   prim.posY ?? 0,
+          posZ:   prim.posZ ?? 0,
+        });
         entry = { instance: prim, type: 'cone', object: prim.createObject() };
         logger.info('Cone primitive instantiated.');
         break;
@@ -286,7 +358,12 @@ export class SceneManager {
           color: { h: 210, s: 0.2, l: 0.7, a: 1 }
         });
         stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'plane', { nx: prim.nx, ny: prim.ny, nz: prim.nz, offset: prim.offset });
+        this._registerPrimInGraph(prim, 'plane', {
+          nx:     prim.nx     ?? 0,
+          ny:     prim.ny     ?? 1,
+          nz:     prim.nz     ?? 0,
+          offset: prim.offset ?? 0,
+        });
         entry = { instance: prim, type: 'plane', object: prim.createObject() };
         logger.info('InfinitePlane primitive instantiated.');
         break;
@@ -532,9 +609,11 @@ export class SceneManager {
     if (entry.instance) entry.instance.rendered = false;
   }
 
-  _buildSchurObject(schur, method, sdfOverride = null) {
-    const bounds2D = [-4, -4, 4, 4];
-    const bounds3D = [-4, -4, -4, 4, 4, 4];
+  _buildSchurObject(schur, method, sdfOverride = null, bounds2D = null, bounds3D = null) {
+    // Use caller-supplied bounds (from adaptive logic in renderSDF) if provided,
+    // otherwise fall back to the hardcoded defaults.
+    bounds2D = bounds2D ?? [-4, -4, 4, 4];
+    bounds3D = bounds3D ?? [-4, -4, -4, 4, 4, 4];
 
     let sdfFn;
     if (sdfOverride) {
@@ -581,6 +660,172 @@ export class SceneManager {
     }
   }
 
+  /**
+   * Compute a 2D bounding box [minX, minY, maxX, maxY] that covers all
+   * geometry primitive nodes in the graph, plus a padding margin.
+   *
+   * Used by renderSDF to auto-expand the marching-squares scan area when
+   * a primitive has been placed outside the Output node's current bounds.
+   *
+   * Plane is excluded — it is infinite and has no meaningful position-based
+   * bounds. If the graph contains only a plane, the default [-4,4] is used.
+   *
+   * @param {NodeGraph} graph
+   * @returns {[number,number,number,number]} [minX, minY, maxX, maxY]
+   */
+  _computeAdaptiveBounds(graph) {
+    // Geometry types whose position params are meaningful for bounds computation.
+    // Plane is intentionally omitted — it is infinite and has no finite extent.
+    const BOUNDED_GEOM = new Set([
+      'circle', 'regularPolygon', 'polytope', 'triangle', 'arc',
+      'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone',
+    ]);
+
+    const PADDING = 2.0;  // units of extra margin beyond the outermost primitive
+
+    let minX = Infinity,  minY = Infinity;
+    let maxX = -Infinity, maxY = -Infinity;
+    let foundAny = false;
+
+    graph.nodes.forEach(node => {
+      if (!BOUNDED_GEOM.has(node.type)) return;
+
+      const p  = node.params;
+      const cx = p.posX ?? 0;
+      const cy = p.posY ?? 0;
+
+      // Estimate the rough half-extent of this primitive.
+      // We take the most generous estimate from all known size parameters
+      // so that we never accidentally clip a shape's boundary.
+      let r = 1; // minimum 1 unit so even a zero-size node has some bounds
+      if (p.radius !== undefined)      r = Math.max(r, p.radius);
+      if (p.majorRadius !== undefined) r = Math.max(r, p.majorRadius + (p.minorRadius ?? 0.5));
+      if (p.minorRadius !== undefined) r = Math.max(r, p.minorRadius);
+      if (p.size !== undefined)        r = Math.max(r, p.size);
+      if (p.width !== undefined)       r = Math.max(r, p.width  / 2);
+      if (p.height !== undefined)      r = Math.max(r, p.height / 2);
+      if (p.depth !== undefined)       r = Math.max(r, p.depth  / 2);
+
+      minX = Math.min(minX, cx - r);
+      minY = Math.min(minY, cy - r);
+      maxX = Math.max(maxX, cx + r);
+      maxY = Math.max(maxY, cy + r);
+      foundAny = true;
+    });
+
+    if (!foundAny) {
+      // No bounded geometry in the graph — return the conservative default.
+      return [-4, -4, 4, 4];
+    }
+
+    return [
+      minX - PADDING,
+      minY - PADDING,
+      maxX + PADDING,
+      maxY + PADDING,
+    ];
+  }
+
+  /**
+   * Run a coarse grid search over a large area to locate the SDF zero-crossing
+   * when it is not present within the normal render bounds.
+   *
+   * This is called automatically by renderSDF when the pre-flight sign check
+   * determines that all samples within the current bounds have the same sign —
+   * meaning the surface exists somewhere but not here. Typical causes:
+   *   - A twistNode or bendNode has relocated the geometry
+   *   - A tilingNode creates copies at tiling-period offsets
+   *   - A mobiusNode maps geometry to a distant region of the plane
+   *
+   * The search samples a (gridSize × gridSize) lattice over searchBounds,
+   * then checks each 2×2 cell for a sign change (positive neighbour adjacent
+   * to a negative neighbour). The bounding box of all sign-change cells is
+   * returned, expanded by a small padding so the full-resolution marching
+   * squares scan has room to trace the contour cleanly.
+   *
+   * Returns null if no sign change is found anywhere in the search area,
+   * which means the geometry is genuinely invisible (e.g. rDifference of
+   * two identical shapes produces an empty set with SDF > 0 everywhere).
+   *
+   * @param {Function} sdfFn           The SDF to search
+   * @param {number[]} searchBounds    [minX,minY,maxX,maxY] — defaults to [-20,-20,20,20]
+   * @param {number}   gridSize        Number of cells per axis — defaults to 30
+   * @returns {number[]|null}          [minX,minY,maxX,maxY] of surface region, or null
+   */
+  _coarseSearchForSurface(
+    sdfFn,
+    searchBounds = [-20, -20, 20, 20],
+    gridSize     = 30
+  ) {
+    const [sMinX, sMinY, sMaxX, sMaxY] = searchBounds;
+    const stepX = (sMaxX - sMinX) / gridSize;
+    const stepY = (sMaxY - sMinY) / gridSize;
+
+    // Sample every grid vertex once
+    const vals = [];
+    for (let i = 0; i <= gridSize; i++) {
+      vals[i] = [];
+      for (let j = 0; j <= gridSize; j++) {
+        const x = sMinX + i * stepX;
+        const y = sMinY + j * stepY;
+        try {
+          const v = sdfFn({ x, y, z: 0 });
+          vals[i][j] = (isFinite(v) ? v : null);
+        } catch (_) {
+          vals[i][j] = null;
+        }
+      }
+    }
+
+    // Find every 2×2 cell that straddles the surface (sign change)
+    let foundMinX =  Infinity,  foundMinY =  Infinity;
+    let foundMaxX = -Infinity,  foundMaxY = -Infinity;
+    let foundAny  = false;
+
+    for (let i = 0; i < gridSize; i++) {
+      for (let j = 0; j < gridSize; j++) {
+        const v00 = vals[i][j];
+        const v10 = vals[i + 1][j];
+        const v01 = vals[i][j + 1];
+        const v11 = vals[i + 1][j + 1];
+
+        // Skip cells where any corner evaluation failed
+        if (v00 === null || v10 === null || v01 === null || v11 === null) continue;
+
+        const hasPositive = v00 > 0 || v10 > 0 || v01 > 0 || v11 > 0;
+        const hasNegative = v00 < 0 || v10 < 0 || v01 < 0 || v11 < 0;
+
+        if (hasPositive && hasNegative) {
+          // This cell straddles the surface — record its extents
+          const cellMinX = sMinX +  i      * stepX;
+          const cellMinY = sMinY +  j      * stepY;
+          const cellMaxX = sMinX + (i + 1) * stepX;
+          const cellMaxY = sMinY + (j + 1) * stepY;
+
+          foundMinX = Math.min(foundMinX, cellMinX);
+          foundMinY = Math.min(foundMinY, cellMinY);
+          foundMaxX = Math.max(foundMaxX, cellMaxX);
+          foundMaxY = Math.max(foundMaxY, cellMaxY);
+          foundAny  = true;
+        }
+      }
+    }
+
+    if (!foundAny) return null;
+
+    // Add padding so the full-resolution scan has room on all sides.
+    // Use at least 2× the coarse step size so the contour is never
+    // right at the edge of the scan area.
+    const pad = Math.max(stepX * 2, stepY * 2, 1.0);
+
+    return [
+      foundMinX - pad,
+      foundMinY - pad,
+      foundMaxX + pad,
+      foundMaxY + pad,
+    ];
+  }
+
   _onResize() {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.cameraManager.updateAspect(window.innerWidth, window.innerHeight);
@@ -606,14 +851,167 @@ export class SceneManager {
       this._renderGLSL();
       return;
     }
-    // Remove previous render if any
+
+    // ── Step 1: Resolve the live node graph and output node ───────────────
+    // We need both to read current bounds and to persist any auto-expansions.
+    const graph = this.evaluator?.graph ?? stateStore.nodeGraph;
+    let outputNode = null;
+    graph?.nodes?.forEach(n => { if (n.type === 'outputNode') outputNode = n; });
+
+    // ── Step 2: Auto-expand bounds from primitive positions (Fix B) ───────
+    // Read the Output node's current boundsMin/boundsMax. Compute the
+    // bounding box of every connected geometry primitive. If any primitive
+    // sits outside the current bounds, silently expand the bounds to include
+    // it. We only ever EXPAND — never shrink — so user-set manual bounds
+    // are always respected.
+    //
+    // This handles the common case: user places a shape at posX=6 but the
+    // default boundsMax is 4. The scanner would never visit x=6 and the
+    // shape would be invisible. This expansion fixes that transparently.
+    let bounds2D;
+
+    if (outputNode) {
+      const currentMin = outputNode.params.boundsMin ?? -4;
+      const currentMax = outputNode.params.boundsMax ??  4;
+
+      const [aMinX, aMinY, aMaxX, aMaxY] = this._computeAdaptiveBounds(graph);
+
+      // Take the most expansive of: user bounds, primitive-derived bounds
+      const newMin = Math.min(currentMin, aMinX, aMinY);
+      const newMax = Math.max(currentMax, aMaxX, aMaxY);
+
+      if (newMin < currentMin || newMax > currentMax) {
+        // Primitive positions fall outside current bounds — persist the expansion
+        // so the Output node card sliders reflect what is actually being used.
+        graph.updateNodeParam(outputNode.id, 'boundsMin', Math.floor(newMin - 0.5));
+        graph.updateNodeParam(outputNode.id, 'boundsMax', Math.ceil(newMax  + 0.5));
+        logger.info(
+          `renderSDF: bounds auto-expanded from [${currentMin}, ${currentMax}] ` +
+          `to [${graph.nodes.get(outputNode.id)?.params.boundsMin}, ` +
+          `${graph.nodes.get(outputNode.id)?.params.boundsMax}] ` +
+          `to include all primitives`
+        );
+      }
+
+      // Read back the final (possibly just-expanded) values
+      const finalMin = outputNode.params.boundsMin ?? -4;
+      const finalMax = outputNode.params.boundsMax ??  4;
+      bounds2D = [finalMin, finalMin, finalMax, finalMax];
+    } else {
+      // No output node — fall back to default scan area
+      bounds2D = [-4, -4, 4, 4];
+    }
+
+    // ── Step 3: Pre-flight sign check with coarse-search fallback (Fix A) ─
+    // Sample seven points spread across the current bounds. If every point
+    // has the same sign there is no zero-crossing in this region, meaning
+    // the surface boundary is not here.
+    //
+    // When this happens we do NOT just warn and give up. We run a coarse
+    // 30×30 search over a large area ([-20, 20]) to find where the surface
+    // actually IS — for example when a bendNode or tilingNode has moved the
+    // geometry to a location unrelated to the primitive's posX/posY. If the
+    // coarse search finds the surface we auto-adjust the bounds and proceed
+    // with a full-resolution scan in the correct region.
+    //
+    // Only if the coarse search also fails do we emit a readable warning
+    // and give up — at that point the geometry is genuinely invisible
+    // (e.g. rDifference of two identical shapes = empty set).
+    try {
+      const [bMinX, bMinY, bMaxX, bMaxY] = bounds2D;
+      const midX = (bMinX + bMaxX) / 2;
+      const midY = (bMinY + bMaxY) / 2;
+
+      const preflightProbes = [
+        { x: midX,         y: midY,         z: 0 },
+        { x: bMaxX * 0.7,  y: midY,         z: 0 },
+        { x: bMinX * 0.7,  y: midY,         z: 0 },
+        { x: midX,         y: bMaxY * 0.7,  z: 0 },
+        { x: midX,         y: bMinY * 0.7,  z: 0 },
+        { x: bMaxX * 0.7,  y: bMaxY * 0.7,  z: 0 },
+        { x: bMinX * 0.7,  y: bMinY * 0.7,  z: 0 },
+      ];
+
+      const preflightValues = preflightProbes
+        .map(p => { try { return sdfFn(p); } catch(_) { return null; } })
+        .filter(v => v !== null && isFinite(v));
+
+      if (preflightValues.length > 0) {
+        const allPositive = preflightValues.every(v => v > 0);
+        const allNegative = preflightValues.every(v => v < 0);
+
+        if (allPositive || allNegative) {
+          // No zero-crossing in current bounds — run coarse search
+          logger.info(
+            `renderSDF: surface not found within bounds [${bMinX},${bMinY}]→` +
+            `[${bMaxX},${bMaxY}]. Running coarse search over [-20, 20]…`
+          );
+
+          const foundBounds = this._coarseSearchForSurface(sdfFn);
+
+          if (foundBounds) {
+            // Surface located — adopt the found region as the scan bounds
+            const [fMinX, fMinY, fMaxX, fMaxY] = foundBounds;
+            bounds2D = foundBounds;
+
+            // Persist the found bounds to the Output node so the card
+            // sliders reflect the actual scan area being used
+            if (outputNode) {
+              const newMin = Math.min(fMinX, fMinY);
+              const newMax = Math.max(fMaxX, fMaxY);
+              graph.updateNodeParam(outputNode.id, 'boundsMin', Math.floor(newMin - 0.5));
+              graph.updateNodeParam(outputNode.id, 'boundsMax', Math.ceil(newMax  + 0.5));
+            }
+
+            logger.info(
+              `renderSDF: surface found at ` +
+              `[${fMinX.toFixed(2)}, ${fMinY.toFixed(2)}]→` +
+              `[${fMaxX.toFixed(2)}, ${fMaxY.toFixed(2)}]. ` +
+              `Bounds adjusted — re-rendering in correct region.`
+            );
+          } else {
+            // Coarse search also found nothing — geometry is genuinely
+            // invisible. Emit a plain-language explanation and continue
+            // (the render will produce zero vertices, which is correct).
+            if (allPositive) {
+              logger.warn(
+                'renderSDF: no visible surface found anywhere in [-20, 20]. ' +
+                'The result may be geometrically empty — for example, ' +
+                'rDifference of two identical shapes is always empty. ' +
+                'Check that the shapes actually overlap for intersection ' +
+                'or difference operations, and that the blend is wired correctly.'
+              );
+            } else {
+              logger.warn(
+                'renderSDF: shape fills the entire search area with no visible ' +
+                'boundary. The SDF may not have a zero crossing — the shape ' +
+                'may be extremely large or the operation may produce an ' +
+                'always-negative result.'
+              );
+            }
+            // Fall through — attempt the render anyway. The user may have
+            // deliberately unusual geometry or custom bounds set elsewhere.
+          }
+        }
+        // Mixed signs: surface is within current bounds — proceed normally.
+      }
+    } catch (_) {
+      // Pre-flight check must never crash the render, regardless of SDF errors.
+    }
+
+    // ── Step 4: Render ────────────────────────────────────────────────────
+    // Remove the previous rendered object if any, then build and add the new one.
     if (this.currentSchur) {
       this._removeFromScene(this.currentSchur);
       this.currentSchur = null;
     }
 
-    const threeObj = this._buildSchurObject(null, method, sdfFn);
-    const entry    = { instance: { computeSDF: sdfFn, family: 'region' }, type: 'schur', object: threeObj };
+    const threeObj = this._buildSchurObject(null, method, sdfFn, bounds2D);
+    const entry    = {
+      instance: { computeSDF: sdfFn, family: 'region' },
+      type:     'schur',
+      object:   threeObj,
+    };
     this.currentSchur = entry;
     this._addToScene(entry);
   }
@@ -639,22 +1037,41 @@ export class SceneManager {
    */
   setRenderMode(mode) {
     this.renderMode = mode;
-    const threeCanvas = this.renderer.domElement;
 
-    // Hide all non-Three.js renderers first
+    // Force shader recompile on every mode switch
+    this._lastGLSLSource     = null;
+    this._lastRayMarchSource = null;
+
+    const threeCanvas = this.renderer?.domElement;
+
+    // Hide all GPU canvases first, then show the correct one
     this.sdfRenderer.hide();
     this.rayMarchRenderer.hide();
 
     if (mode === 'glsl') {
-      threeCanvas.style.opacity = '0';
-      threeCanvas.style.pointerEvents = 'none';
+      // 2D GLSL mode: Three.js canvas hidden, GLSL canvas shown
+      if (threeCanvas) {
+        threeCanvas.style.opacity       = '0';
+        threeCanvas.style.pointerEvents = 'none';
+      }
       this.sdfRenderer.show();
+
     } else if (mode === 'rayMarch') {
-      threeCanvas.style.opacity = '0';
-      threeCanvas.style.pointerEvents = 'auto';
-      this.rayMarchRenderer.show(); } else {
-      threeCanvas.style.opacity = '1';
-      threeCanvas.style.pointerEvents = '';
+      // 3D ray march mode: Three.js canvas hidden, ray march canvas shown.
+      // OrbitControls is attached to the mount element (not the canvas)
+      // so camera orbit works regardless of canvas visibility.
+      if (threeCanvas) {
+        threeCanvas.style.opacity       = '0';
+        threeCanvas.style.pointerEvents = 'none';
+      }
+      this.rayMarchRenderer.show();
+
+    } else {
+      // marchingSquares: Three.js canvas fully visible
+      if (threeCanvas) {
+        threeCanvas.style.opacity       = '1';
+        threeCanvas.style.pointerEvents = 'auto';
+      }
     }
   }
 
@@ -700,6 +1117,80 @@ export class SceneManager {
       return;
     }
 
+    // ── Step quality adaptation for non-Lipschitz SDFs ───────────────────
+    // rDifference and schurBlend(difference) use the Lp-norm formula:
+    //   a − b + (|a|^p + |b|^p)^(1/p)
+    // Near the inner boundary of the subtracted shape, b ≈ 0 and the Lp
+    // term ≈ |a|, so the result ≈ 0 over a wide band. Sphere tracing
+    // stalls in this near-zero region and exhausts its step budget before
+    // reaching the crescent surface.
+    //
+    // Two parameters must both change:
+    //   _stepScale  — reduces each step from d to d*scale, preventing
+    //                 overshoot at the gradient kink
+    //   _maxSteps   — increases the step budget so the marcher can still
+    //                 converge after taking many small steps
+    //
+    // _maxSteps is baked into the GLSL loop bound, so changing it requires
+    // recompilation. We detect the change and clear _lastRayMarchSource to
+    // force that recompile BEFORE the compile check below.
+    // ── Detect scene complexity for sphere-tracing quality ────────────────
+    // Non-Lipschitz operations — the SDF gradient can exceed 1, causing
+    // standard sphere-tracing steps to overshoot the surface.
+    //
+    // SEVERE:  rDifference / schurBlend(difference)
+    //   Lp-norm difference formula hovering near zero along the subtracted
+    //   shape inner boundary. Requires smallest step and most iterations.
+    //
+    // MODERATE: twist / bend / noise displace
+    //   Space-warping transforms. The SDF gradient magnitude scales with
+    //   the warp strength. Require reduced step but less than difference.
+    //
+    // DEFAULT: clean SDFs (union, intersection, primitive-only)
+    //   Lipschitz-1. Standard sphere tracing converges reliably.
+    const hasDifference = source.includes('rDifference(') ||
+      (source.includes('schurBlend') && source.includes('"difference"'));
+
+    const hasWarp = !hasDifference && (
+      source.includes('twist(')         ||
+      source.includes('twistSDF(')      ||
+      source.includes('applyTwist(')    ||
+      source.includes('bend(')          ||
+      source.includes('bendSDF(')       ||
+      source.includes('applyBend(')     ||
+      source.includes('noiseDisplace(') ||
+      source.includes('fbm(')           ||
+      source.includes('mobiusSDF(')     ||
+      source.includes('symmetryOrbit(')
+    );
+
+    let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
+    if (hasDifference) {
+      targetMaxSteps  = 256;
+      targetStepScale = 0.25;
+      targetEpsilon   = 0.0001;
+      targetMaxDist   = 80.0;
+    } else if (hasWarp) {
+      targetMaxSteps  = 256;
+      targetStepScale = 0.4;
+      targetEpsilon   = 0.0005;
+      targetMaxDist   = 50.0;
+    } else {
+      targetMaxSteps  = 128;
+      targetStepScale = 0.85;
+      targetEpsilon   = 0.001;
+      targetMaxDist   = 30.0;
+    }
+
+    if (this.rayMarchRenderer._maxSteps !== targetMaxSteps) {
+      // _maxSteps is a loop bound baked into the shader — force recompile
+      this.rayMarchRenderer._maxSteps = targetMaxSteps;
+      this._lastRayMarchSource = null;
+    }
+    this.rayMarchRenderer._stepScale = targetStepScale;
+    this.rayMarchRenderer._epsilon   = targetEpsilon;
+    this.rayMarchRenderer._maxDist   = targetMaxDist;
+
     if (source !== this._lastRayMarchSource) {
       const result = this.rayMarchRenderer.compile(source);
       if (!result.ok) {
@@ -710,7 +1201,6 @@ export class SceneManager {
       logger.info('RayMarchRenderer: shader compiled.');
     }
 
-    // Sync camera from Three.js OrbitControls
     this.rayMarchRenderer.syncCamera(this.camera, this.controls);
     this.rayMarchRenderer.render(uniforms, time);
   }
@@ -732,6 +1222,86 @@ export class SceneManager {
     );
     this.currentSchur.object = threeObj;
     this._addToScene(this.currentSchur);
+  }
+
+  /**
+   * Reconstruct a primitive instance and Three.js mesh from a serialized
+   * node graph entry. Used by the load handler to restore visual objects
+   * after graph.deserialize() has restored the node structure.
+   *
+   * Unlike addPrimitive(), this uses the node's existing ID (forceId) so
+   * that edges in the restored graph continue to point at valid nodes.
+   *
+   * @param {object} node  A NodeInstance from the restored NodeGraph
+   * @returns {{ instance, type, object }|null}
+   */
+  _rebuildPrimitiveFromNode(node) {
+    const p  = node.params;
+    const id = node.id;
+    let prim, type, object;
+
+    switch (node.type) {
+      case 'circle': {
+        prim = new CirclePrimitive({ id, radius: p.radius ?? 1, posX: p.posX ?? 0, posY: p.posY ?? 0 });
+        type = 'circle';
+        break;
+      }
+      case 'regularPolygon': {
+        prim = new RegularPolygonPrimitive({ id, sides: p.sides ?? 6, size: p.size ?? 1, rotation: p.rotation ?? 0, posX: p.posX ?? 0, posY: p.posY ?? 0 });
+        type = 'regularPolygon';
+        break;
+      }
+      case 'polytope': {
+        prim = new PolytopePrimitive({ id, vertices: p.vertices, posX: p.posX ?? 0, posY: p.posY ?? 0, rotation: p.rotation ?? 0 });
+        type = 'polytope';
+        break;
+      }
+      case 'sphere': {
+        prim = new SpherePrimitive({ id, radius: p.radius ?? 1, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        type = 'sphere';
+        break;
+      }
+      case 'box': {
+        prim = new BoxPrimitive({ id, width: p.width ?? 2, height: p.height ?? 2, depth: p.depth ?? 2, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        type = 'box';
+        break;
+      }
+      case 'cylinder': {
+        prim = new CylinderPrimitive({ id, radius: p.radius ?? 1, height: p.height ?? 2, capped: p.capped !== 'no', posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        type = 'cylinder';
+        break;
+      }
+      case 'capsule': {
+        prim = new CapsulePrimitive({ id, ax: p.ax ?? 0, ay: p.ay ?? -1, az: p.az ?? 0, bx: p.bx ?? 0, by: p.by ?? 1, bz: p.bz ?? 0, radius: p.radius ?? 0.5 });
+        type = 'capsule';
+        break;
+      }
+      case 'torus': {
+        prim = new TorusPrimitive({ id, majorRadius: p.majorRadius ?? 2, minorRadius: p.minorRadius ?? 0.5, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        type = 'torus';
+        break;
+      }
+      case 'cone': {
+        prim = new ConePrimitive({ id, radius: p.radius ?? 1, height: p.height ?? 2, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        type = 'cone';
+        break;
+      }
+      case 'plane': {
+        prim = new InfinitePlanePrimitive({ id, nx: p.nx ?? 0, ny: p.ny ?? 1, nz: p.nz ?? 0, offset: p.offset ?? 0 });
+        type = 'plane';
+        break;
+      }
+      default:
+        return null;
+    }
+
+    // Register in stateStore (so the evaluator can find it by ID)
+    stateStore.addShape(prim);
+
+    // Create Three.js mesh proxy
+    object = prim.createObject();
+
+    return { instance: prim, type, object };
   }
 
   /**

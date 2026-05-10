@@ -70,14 +70,12 @@ export class NodeEvaluator {
   }
 
   /**
-   * Evaluate the output of a specific node's specific port.
-   * Returns the appropriate typed value for that port.
+   * Evaluate a node and return its full result object.
+   * Port selection is handled by callers, not by the cache layer.
    */
-  evaluate(nodeId, portName = null) {
-    // Return cached result if available
+  evaluate(nodeId) {
     if (this._cache.has(nodeId)) {
-      const cached = this._cache.get(nodeId);
-      return portName ? cached[portName] : cached;
+      return this._cache.get(nodeId);
     }
 
     const node = this.graph.nodes.get(nodeId);
@@ -85,7 +83,7 @@ export class NodeEvaluator {
 
     const result = this._evaluateNode(node);
     this._cache.set(nodeId, result);
-    return portName ? result[portName] : result;
+    return result;
   }
 
   /**
@@ -99,11 +97,22 @@ export class NodeEvaluator {
     });
     if (!outputNode) return null;
 
-    const incoming = this.graph.getIncomingEdge(outputNode.id, 'sdf');
-    if (!incoming) return null;
+    const allEdges = this.graph.getAllIncomingEdges(outputNode.id, 'sdf');
+    if (allEdges.length === 0) return null;
 
-    const sdfFn = this.evaluate(incoming.fromNode, incoming.fromPort);
-    return sdfFn;
+    const sdfs = allEdges.map(e => {
+      const result = this.evaluate(e.fromNode);
+      return result?.sdf || result?.result || null;
+    }).filter(Boolean);
+
+    if (sdfs.length === 0) return null;
+    if (sdfs.length === 1) return sdfs[0];
+
+    return (pt, cs = [], t = 0) => {
+      let d = Infinity;
+      for (const fn of sdfs) d = Math.min(d, fn(pt, cs, t));
+      return d;
+    };
   }
 
   // ── Private — node type evaluators ───────────────────────────────────────
@@ -209,11 +218,37 @@ export class NodeEvaluator {
 
       case 'cylinder': {
         const { radius, height, capped, posX, posY, posZ } = node.params;
+        const axis = node.params.axis ?? 'Y';
+        // Create at origin — we handle position + swizzle manually
+        // so the axis rotation and position offset compose correctly.
         const prim = new CylinderPrimitive({
-          radius, height, posX, posY, posZ,
+          radius, height,
+          posX: 0, posY: 0, posZ: 0,
           capped: capped !== 'no'
         });
-        return { sdf: (pt) => prim.computeSDF(pt) };
+        return {
+          sdf: (pt) => {
+            // Step 1: translate to local (primitive) coordinates
+            const lx = pt.x - (posX || 0);
+            const ly = pt.y - (posY || 0);
+            const lz = (pt.z || 0) - (posZ || 0);
+            // Step 2: swizzle to match axis selection.
+            // The cylinder formula always treats Y as the long axis internally.
+            // Swizzling maps the chosen world axis onto Y before evaluation.
+            let sx, sy, sz;
+            if (axis === 'X') {
+              // World X becomes the cylinder axis: swap X and Y
+              sx = ly; sy = lx; sz = lz;
+            } else if (axis === 'Z') {
+              // World Z becomes the cylinder axis: swap Y and Z
+              sx = lx; sy = lz; sz = ly;
+            } else {
+              // Default Y axis: no swap
+              sx = lx; sy = ly; sz = lz;
+            }
+            return prim.computeSDF({ x: sx, y: sy, z: sz });
+          }
+        };
       }
 
       case 'capsule': {
@@ -230,8 +265,27 @@ export class NodeEvaluator {
 
       case 'cone': {
         const { radius, height, posX, posY, posZ } = node.params;
-        const prim = new ConePrimitive({ radius, height, posX, posY, posZ });
-        return { sdf: (pt) => prim.computeSDF(pt) };
+        const axis = node.params.axis ?? 'Y';
+        const prim = new ConePrimitive({
+          radius, height,
+          posX: 0, posY: 0, posZ: 0
+        });
+        return {
+          sdf: (pt) => {
+            const lx = pt.x - (posX || 0);
+            const ly = pt.y - (posY || 0);
+            const lz = (pt.z || 0) - (posZ || 0);
+            let sx, sy, sz;
+            if (axis === 'X') {
+              sx = ly; sy = lx; sz = lz;
+            } else if (axis === 'Z') {
+              sx = lx; sy = lz; sz = ly;
+            } else {
+              sx = lx; sy = ly; sz = lz;
+            }
+            return prim.computeSDF({ x: sx, y: sy, z: sz });
+          }
+        };
       }
 
       case 'plane': {
@@ -474,7 +528,11 @@ export class NodeEvaluator {
         };
 
         return {
-          result: (pt, cs = [], t = 0) => baseSDF(foldPoint(pt), cs, t)
+          result: (pt, cs = [], t = 0) => {
+            const fp = foldPoint(pt);
+            // Forward z — fold only operates on XY, z must pass through unchanged
+            return baseSDF({ x: fp.x, y: fp.y, z: pt.z || 0 }, cs, t);
+          }
         };
       }
 
@@ -500,8 +558,9 @@ export class NodeEvaluator {
             const dx = pt.x - centerX;
             const dy = pt.y - centerY;
             return {
-              x:  dx * c - dy * s + centerX,
-              y:  dx * s + dy * c + centerY
+              x: dx * c - dy * s + centerX,
+              y: dx * s + dy * c + centerY,
+              z: pt.z || 0   // forward z — orbit only rotates XY
             };
           });
         }
@@ -518,7 +577,8 @@ export class NodeEvaluator {
               // Rotate then reflect X
               return {
                 x: -(dx * c - dy * s) + centerX,
-                y:  (dx * s + dy * c) + centerY
+                y:  (dx * s + dy * c) + centerY,
+                z:  pt.z || 0   // forward z — reflection only affects XY
               };
             });
           }
@@ -589,7 +649,8 @@ export class NodeEvaluator {
 
           if (!isFinite(tx) || !isFinite(ty)) return Infinity;
 
-          return baseSDF({ x: tx, y: ty }, cs, t);
+          // Forward z — Möbius transform only remaps XY (complex plane)
+          return baseSDF({ x: tx, y: ty, z: pt.z || 0 }, cs, t);
         };
 
         return { result: sdfFn };
@@ -675,7 +736,9 @@ export class NodeEvaluator {
 
         return {
           result: (pt, cs = [], t = 0) => {
-            const d = baseSDF(fold(pt), cs, t);
+            const fp = fold(pt);
+            // Forward z — tiling only folds XY, z passes through unchanged
+            const d = baseSDF({ x: fp.x, y: fp.y, z: pt.z || 0 }, cs, t);
             return isCurve ? d - isoOffset : d;
           }
         };
@@ -821,16 +884,20 @@ export class NodeEvaluator {
 
   // ── Private helpers ───────────────────────────────────────────────────────
 
+
+    _pickSDF(result) {
+    return result?.sdf || result?.result || null;
+  }
+  
   /**
    * Resolve the SDF function connected to an input port.
    * Returns null if unconnected.
    */
-  _resolveSDF(node, portName) {
+    _resolveSDF(node, portName) {
     const edge = this.graph.getIncomingEdge(node.id, portName);
     if (!edge) return null;
-    const result = this.evaluate(edge.fromNode);
-    // SDF nodes use different output port names — try 'sdf' and 'result'
-    return result.sdf || result.result || null;
+
+    return this._pickSDF(this.evaluate(edge.fromNode));
   }
 
   /**
@@ -840,7 +907,8 @@ export class NodeEvaluator {
   _resolveMapper(node, portName) {
     const edge = this.graph.getIncomingEdge(node.id, portName);
     if (!edge) return null;
+
     const result = this.evaluate(edge.fromNode);
-    return result.mapper || null;
+    return result?.mapper || null;
   }
 }

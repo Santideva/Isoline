@@ -226,6 +226,41 @@
         });
         toolbar.appendChild(addXformBtn);
 
+        // ── Blend node dropdown + button ──────────────────────────────────────
+        const blendLabel = document.createElement('span');
+        blendLabel.textContent = 'Blend:';
+        blendLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
+        toolbar.appendChild(blendLabel);
+
+        this._blendSelect = document.createElement('select');
+        this._blendSelect.style.cssText = `
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 4px;
+          color: rgba(255,255,255,0.8);
+          font-size: 11px;
+          padding: 2px 6px;
+        `;
+        [
+          ['schurBlend',    'Schur Blend'],
+          ['rUnion',        'R-Union'],
+          ['rIntersection', 'R-Intersection'],
+          ['rDifference',   'R-Difference'],
+        ].forEach(([val, label]) => {
+          const o = document.createElement('option');
+          o.value = val;
+          o.textContent = label;
+          this._blendSelect.appendChild(o);
+        });
+        toolbar.appendChild(this._blendSelect);
+
+        const addBlendBtn = this._makeButton('Add Blend', () => {
+          this._addBlendNode(this._blendSelect.value);
+        });
+        addBlendBtn.style.cssText +=
+          'border-color: rgba(180,100,255,0.5); color: rgba(210,160,255,0.9);';
+        toolbar.appendChild(addBlendBtn);
+
         // Remove Last button
         const removeBtn = this._makeButton('Remove Last', () => {
         this.sceneManager.removeLast();
@@ -248,32 +283,8 @@
         const autoBtn = this._makeButton('Auto Layout', () => this._runAutoLayout());
         toolbar.appendChild(autoBtn);
 
-        // Operation selector for compose
+        // Operation defaults (used by legacy _compose() only)
         this._composeOperation = 'union';
-        const opLabel = document.createElement('span');
-        opLabel.textContent = 'Op:';
-        opLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(opLabel);
-
-        const opSelect = document.createElement('select');
-        opSelect.style.cssText = `
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 4px;
-        color: rgba(255,255,255,0.8);
-        font-size: 11px;
-        padding: 2px 6px;
-        `;
-        ['union','intersection','difference'].forEach(op => {
-        const o = document.createElement('option');
-        o.value = op;
-        o.textContent = op;
-        opSelect.appendChild(o);
-        });
-        opSelect.addEventListener('change', () => {
-        this._composeOperation = opSelect.value;
-        });
-        toolbar.appendChild(opSelect);
 
         // Compose button
         const composeBtn = this._makeButton('⬡ Compose', () => this._compose());
@@ -316,7 +327,11 @@
     const saveBtn = this._makeButton('💾 Save', async () => {
       const name = prompt('Scene name:', 'autosave');
       if (!name) return;
-      const ok = await saveScene(this.stateStore.nodeGraph, name);
+      const ok = await saveScene(
+        this.stateStore.nodeGraph,
+        name,
+        { renderMode: this.sceneManager.renderMode }
+      );
       if (ok) {
         saveBtn.textContent = '✓ Saved';
         setTimeout(() => { saveBtn.textContent = '💾 Save'; }, 1500);
@@ -338,20 +353,78 @@
       // Clear current state first
       this._clearAll();
 
-      const ok = await loadScene(name, this.stateStore.nodeGraph);
-      if (ok) {
-        // Rebuild the evaluator with the restored graph
-        this.sceneManager.evaluator.graph = this.stateStore.nodeGraph;
-        this.sceneManager.evaluator.invalidate();
-        this.sceneManager.glslEvaluator.graph = this.stateStore.nodeGraph;
-        setTimeout(() => {
-          this._rebuildCards();
-          this._runAutoLayout();
-          this._drawEdges();
-        }, 100);
-      } else {
+      const loadedData = await loadScene(name, this.stateStore.nodeGraph);
+      if (!loadedData) {
         alert(`Could not load scene "${name}"`);
+        return;
       }
+
+      // ── Rebuild Three.js visual objects from the restored graph ───────────
+      // deserialize() restores node graph structure but does not create
+      // Three.js meshes or populate sceneManager.activePrimitives.
+      // We iterate geometry nodes and call addPrimitive with the stored params
+      // so rendered objects appear in the viewport.
+      const graph = this.stateStore.nodeGraph;
+      const GEOM_TYPES = new Set([
+        'circle','regularPolygon','triangle','arc','polytope','lineSegment',
+        'sphere','box','cylinder','capsule','torus','cone','plane'
+      ]);
+
+      graph.nodes.forEach((node, id) => {
+        if (!GEOM_TYPES.has(node.type)) return;
+
+        // addPrimitive creates the instance and mesh with a fresh ID,
+        // but we need the instance to use the SAME ID as the graph node
+        // so that graph edges remain valid.
+        // Strategy: call the primitive constructor directly and register it
+        // rather than going through addPrimitive (which allocates a new ID).
+        try {
+          const entry = this.sceneManager._rebuildPrimitiveFromNode(node);
+          if (entry) {
+            this.sceneManager.activePrimitives.push(entry);
+            this.sceneManager._addToScene(entry);
+          }
+        } catch(e) {
+          console.warn(`Could not rebuild primitive for node ${id} (${node.type}):`, e.message);
+        }
+      });
+
+      // Point evaluators at the restored graph
+      this.sceneManager.evaluator.graph       = graph;
+      this.sceneManager.evaluator.invalidate();
+      this.sceneManager.glslEvaluator.graph   = graph;
+      this.sceneManager._lastGLSLSource       = null;
+      this.sceneManager._lastRayMarchSource   = null;
+
+      const savedMode = loadedData?.renderMode || 'marchingSquares';
+
+      setTimeout(() => {
+        this._rebuildCards();
+        this._runAutoLayout();
+        this._drawEdges();
+        this._fitToScreen();
+
+        // Restore the render mode that was active when the scene was saved
+        if (savedMode === 'rayMarch') {
+          this.sceneManager.setRenderMode('rayMarch');
+          this.sceneManager.rayMarchRenderer?.show();
+          this.sceneManager._renderRayMarch();
+          this._renderModeBtn.textContent = '▣ Marching Squares';
+        } else if (savedMode === 'glsl') {
+          this.sceneManager.setRenderMode('glsl');
+          this.sceneManager.sdfRenderer?.show();
+          this.sceneManager._renderGLSL();
+          this._renderModeBtn.textContent = '⬜ Ray March';
+        } else {
+          this.sceneManager.setRenderMode('marchingSquares');
+          this._renderModeBtn.textContent = '⬛ GLSL Mode';
+          // Trigger a marching squares render
+          this.sceneManager.evaluator.graph = this.stateStore.nodeGraph;
+          this.sceneManager.evaluator.invalidate();
+          const sdf = this.sceneManager.evaluator.getRootSDF();
+          if (sdf) this.sceneManager.renderSDF(sdf, 'contours (2D)');
+        }
+      }, 100);
     });
     loadBtn.style.cssText += 'border-color: rgba(80,140,255,0.4); color: rgba(160,200,255,0.9);';
     toolbar.appendChild(loadBtn);
@@ -402,6 +475,104 @@
         (nodeId, portName, dir) => this._getPortPosition(nodeId, portName, dir)
         );
 
+        // ── Edge deletion via right-click on canvas background ────────────────
+        // When the user right-clicks on the background canvas, we check whether
+        // the click is close to any drawn edge. If so, we offer to delete it.
+        //
+        // All position arithmetic is done in the same coordinate space that
+        // _getPortPosition returns — canvas-inner space (post-transform).
+        // The click arrives in screen space and must be converted first.
+        this._bgCanvas.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          // Convert screen coordinates → canvas-inner coordinates.
+          // The inner div is translated and scaled by this._transform.
+          // Screen point (cx, cy) maps to inner point:
+          //   ix = (cx - rect.left - tx) / scale
+          //   iy = (cy - rect.top  - ty) / scale
+          const rect  = this._bgCanvas.getBoundingClientRect();
+          const tx    = this._transform.tx;
+          const ty    = this._transform.ty;
+          const scale = this._transform.scale;
+          const mx    = (e.clientX - rect.left - tx) / scale;
+          const my    = (e.clientY - rect.top  - ty) / scale;
+
+          // Hit-test radius in canvas-inner pixels.
+          // 14 pixels feels comfortable at default zoom.
+          const HIT_RADIUS = 14;
+
+          const graph = this.stateStore.nodeGraph;
+          let closestEdge = null;
+          let closestDist = Infinity;
+
+          // Iterate every edge in the graph and find the closest one
+          // whose line segment passes within HIT_RADIUS of the click.
+          graph.edges.forEach(edge => {
+            // Get the screen-space port positions, then convert to inner space.
+            // _getPortPosition returns positions in screen coordinates (via
+            // getBoundingClientRect on the port element), so we apply the
+            // same transform inversion used above.
+            const rawFrom = this._getPortPosition(edge.fromNode, edge.fromPort, 'out');
+            const rawTo   = this._getPortPosition(edge.toNode,   edge.toPort,   'in');
+
+            if (!rawFrom || !rawTo) return;
+
+            // The positions returned by _getPortPosition are already in
+            // inner-canvas space (EdgeRenderer uses them directly without
+            // further transform). Use them as-is.
+            const ax = rawFrom.x;
+            const ay = rawFrom.y;
+            const bx = rawTo.x;
+            const by = rawTo.y;
+
+            // Distance from point (mx, my) to line segment (ax,ay)→(bx,by)
+            const dx  = bx - ax;
+            const dy  = by - ay;
+            const len2 = dx * dx + dy * dy;
+
+            let dist;
+            if (len2 < 0.001) {
+              // Degenerate edge (zero length) — use distance to the point
+              dist = Math.sqrt((mx - ax) ** 2 + (my - ay) ** 2);
+            } else {
+              // Project click onto the line, clamp to segment
+              const t  = Math.max(0, Math.min(1,
+                ((mx - ax) * dx + (my - ay) * dy) / len2
+              ));
+              const px = ax + t * dx;
+              const py = ay + t * dy;
+              dist = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
+            }
+
+            if (dist < HIT_RADIUS && dist < closestDist) {
+              closestEdge = edge;
+              closestDist = dist;
+            }
+          });
+
+          if (!closestEdge) return; // no edge near the click — do nothing
+
+          const fromNode = graph.nodes.get(closestEdge.fromNode);
+          const toNode   = graph.nodes.get(closestEdge.toNode);
+          const fromLabel = `${fromNode?.type ?? '?'} #${closestEdge.fromNode}`;
+          const toLabel   = `${toNode?.type   ?? '?'} #${closestEdge.toNode}`;
+
+          if (!confirm(`Delete connection:\n  ${fromLabel} → ${toLabel}?`)) return;
+
+          try { graph.removeEdge(closestEdge.id); } catch(e) {
+            console.warn('NodeCanvas: could not remove edge:', e.message);
+            return;
+          }
+
+          // Invalidate caches so the next render reflects the deletion
+          this.sceneManager._lastGLSLSource     = null;
+          this.sceneManager._lastRayMarchSource = null;
+          this.sceneManager.evaluator.invalidate();
+
+          this._drawEdges();
+        });
+        
         // ── Pan/zoom on canvas area ───────────────────────────────────────────
         this._attachPanZoom(canvasArea);
     }
@@ -450,6 +621,7 @@
         );
         this._edgeRenderer.setGraph(this.stateStore.nodeGraph);
 
+        
         // Attach viewport drag once
         if (!this._viewportDragAttached) {
         this._attachViewportDrag();
@@ -518,7 +690,14 @@
             (nodeId, paramName, value) => this._onParamChange(nodeId, paramName, value),
             (nodeId, portName, dir, pos) => this._beginPendingEdge(nodeId, portName, dir, pos),
             (nodeId, portName, dir) => this._completePendingEdge(nodeId, portName, dir),
-            (nodeId, x, y) => { this._drawEdges(); },
+            (nodeId, x, y) => {
+              // Persist the dragged position into node.uiPos so that the
+              // next _rebuildCards() call restores it correctly.
+              // NodeGraph.updateNodePosition does NOT fire onChange, so
+              // this does not trigger a re-render loop.
+              this.stateStore.nodeGraph.updateNodePosition(nodeId, x, y);
+              this._drawEdges();
+            },
             (nodeId, previewCanvas) => this._renderSDFPreview(nodeId, previewCanvas)
         );
 
@@ -529,6 +708,65 @@
             this._setSelected(node.id, e.shiftKey);
             });
         }
+
+        // ── Right-click on card → delete node and all its connections ───────
+        card.el.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const nodeType = node.type;
+          const nodeId   = node.id;
+
+          if (!confirm(
+            `Delete "${nodeType}" node #${nodeId} and all its connections?`
+          )) return;
+
+          const graph = this.stateStore.nodeGraph;
+
+          // Collect all edge IDs touching this node before removing anything
+          const edgeIdsToRemove = [];
+          graph.edges.forEach(edge => {
+            if (edge.fromNode === nodeId || edge.toNode === nodeId)
+              edgeIdsToRemove.push(edge.id);
+          });
+
+          // Remove edges first (graph may validate on node removal)
+          edgeIdsToRemove.forEach(eid => {
+            try { graph.removeEdge(eid); } catch(_) {}
+          });
+
+          // Remove the node from the graph
+          try { graph.removeNode(nodeId); } catch(e) {
+            console.warn(`NodeCanvas: could not remove node ${nodeId}:`, e.message);
+          }
+
+          // If this was a geometry primitive, remove it from the 3D scene too
+          const primIdx = this.sceneManager.activePrimitives.findIndex(
+            p => p.instance.id === nodeId
+          );
+          if (primIdx !== -1) {
+            const primEntry = this.sceneManager.activePrimitives[primIdx];
+            this.sceneManager._removeFromScene(primEntry);
+            this.sceneManager.activePrimitives.splice(primIdx, 1);
+          }
+
+          // If this was a SchurComposition, remove it too
+          if (this.sceneManager.currentSchur?.instance?.id === nodeId) {
+            this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
+            this.sceneManager.currentSchur = null;
+          }
+
+          // Invalidate shader caches so the next render reflects the deletion
+          this.sceneManager._lastGLSLSource     = null;
+          this.sceneManager._lastRayMarchSource = null;
+          this.sceneManager.evaluator.invalidate();
+
+          setTimeout(() => {
+            this._rebuildCards();
+            this._runAutoLayout();
+            this._drawEdges();
+          }, 50);
+        });
 
         this._cards.set(id, card);
         this._inner.appendChild(card.el);
@@ -694,12 +932,19 @@
         this._drawEdges();
         };
 
-        const onMouseUp = () => {
+      const onMouseUp = () => {
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('mouseup',   onMouseUp);
-        this._edgeRenderer.setPendingEdge(null);
-        this._pendingEdge = null;
-        this._drawEdges();
+        // Defer cleanup by one microtask so the port dot's mouseup handler
+        // fires first and can call _completePendingEdge while _pendingEdge
+        // is still set. Without this setTimeout, _pendingEdge is nulled
+        // before _completePendingEdge reads it, silently aborting every
+        // manual drag-connect attempt.
+        setTimeout(() => {
+          this._edgeRenderer.setPendingEdge(null);
+          this._pendingEdge = null;
+          this._drawEdges();
+        }, 0);
         };
 
         document.addEventListener('mousemove', onMouseMove);
@@ -749,6 +994,11 @@
         const shape = this.stateStore.getShape(nodeId);
 
         if (!node) return;
+
+        // Any param change may affect the generated GLSL (e.g. axis, operation,
+        // smoothness). Always invalidate the shader cache so it recompiles next frame.
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
 
         // Update the live shape instance for ALL node types that have
         // updateParameters — this includes both geometry and schurBlend nodes.
@@ -808,38 +1058,45 @@
     const nextIdx = (modes.indexOf(current) + 1) % modes.length;
     const next    = modes[nextIdx];
 
-    // Auto-wire any geometry node to output when switching away from
-    // marching squares — required for GLSLEvaluator to find source
-    if (next !== 'marchingSquares') {
-      const graph = this.stateStore.nodeGraph;
-      const GEOM  = new Set([
-        'circle', 'regularPolygon', 'triangle', 'arc',
-        'polytope', 'lineSegment',
-        'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane'
-      ]);
-      let geomId = null;
-      graph.nodes.forEach((n, id) => {
-        if (GEOM.has(n.type)) geomId = id;
-      });
-      if (geomId) {
-        const out = this.sceneManager._ensureOutputNode();
-        try {
-          graph.addEdge(geomId, 'sdf', out.id, 'sdf');
-        } catch (e) { /* edge already exists */ }
-      }
-    }
-
     this.sceneManager.setRenderMode(next);
     this._renderModeBtn.textContent = labels[nextIdx];
 
+    // Explicitly manage canvas visibility to prevent Three.js from
+    // overlapping the ray march / GLSL canvases
+    const threeCanvas = this.sceneManager.renderer?.domElement;
+    if (threeCanvas) {
+      if (next === 'marchingSquares') {
+        threeCanvas.style.opacity      = '1';
+        threeCanvas.style.pointerEvents = 'auto';
+      } else {
+        threeCanvas.style.opacity      = '0';
+        threeCanvas.style.pointerEvents = 'none';
+      }
+    }
+
     if (next === 'glsl') {
+      this.sceneManager.sdfRenderer?.show();
       this.sceneManager._renderGLSL();
     } else if (next === 'rayMarch') {
+      this.sceneManager.rayMarchRenderer?.show();
       this.sceneManager._renderRayMarch();
+    } else {
+      // marchingSquares — hide GPU canvases
+      this.sceneManager.sdfRenderer?._canvas &&
+        (this.sceneManager.sdfRenderer._canvas.style.display = 'none');
+      this.sceneManager.rayMarchRenderer?._canvas &&
+        (this.sceneManager.rayMarchRenderer._canvas.style.display = 'none');
     }
   }
 
     _clearAll() {
+        // 0. Switch back to marching squares before clearing so the animation
+        //    loop does not spam "no source" while the graph is empty
+        if (this.sceneManager.renderMode !== 'marchingSquares') {
+          this.sceneManager.setRenderMode('marchingSquares');
+          this._renderModeBtn.textContent = '⬛ GLSL Mode';
+        }
+
         // 1. Remove currentSchur from scene
         if (this.sceneManager.currentSchur) {
         this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
@@ -852,19 +1109,57 @@
         });
         this.sceneManager.activePrimitives = [];
 
-        // 3. Wipe the entire stateStore — clears sessionShapes and resets nodeGraph
+        // 3. Wipe the entire stateStore in place so graph references survive
         this.stateStore.clear();
 
-        // 4. Point the evaluator at the fresh nodeGraph
+        // 4. Keep evaluators pointed at the live graph object
         this.sceneManager.evaluator.graph = this.stateStore.nodeGraph;
         this.sceneManager.evaluator.invalidate();
 
+        this.sceneManager.glslEvaluator.graph = this.stateStore.nodeGraph;
+        this.sceneManager._lastGLSLSource = null;
+        this.sceneManager._lastRayMarchSource = null;
+
         // 5. Rebuild the canvas
         setTimeout(() => {
-        this._rebuildCards();
-        this._drawEdges();
+          this._rebuildCards();
+          this._drawEdges();
         }, 50);
     }
+
+    /**
+   * Add a blend node to the graph WITHOUT auto-wiring.
+   * Blend nodes always require explicit multi-input wiring by the user.
+   * The user must drag-connect two source branches into sdfA and sdfB,
+   * then drag-connect the result port to Output or the next node.
+   */
+  _addBlendNode(type) {
+    const graph  = this.stateStore.nodeGraph;
+    const params = {
+      schurBlend:    { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
+      rUnion:        { smoothness: 8 },
+      rIntersection: { smoothness: 8 },
+      rDifference:   { smoothness: 8 },
+    }[type] || {};
+
+    const newNode = graph.addNode(type, params);
+
+    // Always ensure the output node exists so Compose and the GLSL button
+    // can find it. The output node is the terminal of every valid graph.
+    this.sceneManager._ensureOutputNode();
+
+    console.info(
+      `Blend node "${type}" added (id:${newNode.id}).\n` +
+      `  → Drag the blue output dot of one shape to the orange sdfA port.\n` +
+      `  → Drag the blue output dot of another shape to the orange sdfB port.\n` +
+      `  → Drag the blue result port to the orange sdf port of Output.`
+    );
+
+    setTimeout(() => {
+      this._runAutoLayout();
+      this._drawEdges();
+    }, 50);
+  }
 
     _addTransformNode(type) {
     const graph    = this.stateStore.nodeGraph;
@@ -886,71 +1181,266 @@
 
     const newNode = graph.addNode(def.type, def.params);
 
-    // ── Auto-wire ──────────────────────────────────────────────────────────
-    // Port names: geometry nodes output on 'sdf', transform nodes output on 'result'
+    // ── Node type classification sets ──────────────────────────────────────
+    // Used to decide what can be a chain source and what is a merge boundary.
+
     const GEOM_TYPES = new Set([
       'circle','regularPolygon','triangle','arc','polytope','lineSegment',
       'sphere','box','cylinder','capsule','torus','cone','plane'
     ]);
-    const XFORM_TYPES = new Set([
+
+    const LINEAR_XFORM = new Set([
       'extrudeNode','revolveNode','noiseDisplaceNode','twistNode','bendNode',
       'repeatNode','tilingNode','symmetryFoldNode','symmetryOrbitNode','mobiusNode'
     ]);
 
-    // Find the best source node:
-    // 1. Last selected node that has an SDF output
-    // 2. Fall back to the most recently added geometry or transform node
-    let sourceId   = null;
-    let sourcePort = 'sdf';
+    // Merge nodes always require explicit wiring — they are never auto-chained
+    // because they have two input ports (sdfA, sdfB) and the system cannot
+    // guess which branch each source belongs to.
+    const MERGE_TYPES = new Set([
+      'schurBlend','rUnion','rIntersection','rDifference','ifsBlend'
+    ]);
 
-    // Priority 1 — selected node
+    // ── Chain tail walker ──────────────────────────────────────────────────
+    // Given a starting node ID, follow outgoing edges forward through the
+    // graph until we reach either:
+    //   a) a node with no outgoing edges (the current tail of the chain), or
+    //   b) a node whose next downstream node is a merge node or the output node.
+    // We stop BEFORE entering merge nodes or the output node because those
+    // are explicit wiring boundaries that the user must control manually.
+    //
+    // Example: sphere(4) → noise(7) → output(9)
+    //   findChainTail(4) returns 7, not 4, because 7 is the tail.
+    //   The new transform should be inserted after 7, not after 4.
+    //
+    // Example: sphere(4) → noise(7) → twist(11) → output(9)
+    //   findChainTail(4) returns 11.
+    //
+    // Example: sphere(4) → schurBlend(8)
+    //   findChainTail(4) returns 4, because the next node (schurBlend) is
+    //   a merge node and we stop before entering it.
+
+    const findChainTail = (startId) => {
+      let current = startId;
+      const visited = new Set();
+
+      while (true) {
+        // Cycle guard — should not happen in a valid DAG but prevents infinite loop
+        if (visited.has(current)) break;
+        visited.add(current);
+
+        const currentNode = graph.nodes.get(current);
+        if (!currentNode) break;
+
+        // Collect all outgoing edges from this node.
+        // Geometry nodes output on 'sdf'; transform nodes output on 'result'.
+        // We check both to handle any node type correctly.
+        const outEdgesFromSdf    = graph.getOutgoingEdges(current, 'sdf')    || [];
+        const outEdgesFromResult = graph.getOutgoingEdges(current, 'result') || [];
+        const allOutEdges        = [...outEdgesFromSdf, ...outEdgesFromResult];
+
+        // No outgoing edges — this node IS the tail, stop here.
+        if (allOutEdges.length === 0) break;
+
+        // Follow the first outgoing edge to the next node.
+        // (Nodes in a linear chain have exactly one outgoing edge.)
+        const nextEdge = allOutEdges[0];
+        const nextId   = nextEdge.toNode;
+        const nextNode = graph.nodes.get(nextId);
+        if (!nextNode) break;
+
+        // Stop BEFORE entering merge nodes.
+        // The tail is the current node (current), not the merge node (nextId).
+        // The user must explicitly wire into merge nodes.
+        if (MERGE_TYPES.has(nextNode.type)) break;
+
+        // Stop BEFORE entering the output node.
+        // The output node is always the terminal; we do not walk through it.
+        if (nextNode.type === 'outputNode') break;
+
+        // The next node is a valid continuation — advance to it.
+        current = nextId;
+      }
+
+      return current;
+    };
+
+    // ── Helper: which output port does a node type use? ────────────────────
+    // Geometry nodes output their SDF on the 'sdf' port.
+    // Transform nodes output on the 'result' port.
+    const outPortOf = (nodeType) =>
+      GEOM_TYPES.has(nodeType) ? 'sdf' : 'result';
+
+    // ── Find the chain root to extend ──────────────────────────────────────
+    // We look for the best starting point for the new chain, then walk to
+    // the tail of that chain so the new transform is appended at the end.
+    //
+    // Priority 1: A node card is explicitly selected (clicked by the user).
+    //   Walk from the selected node to the tail of its chain and wire from there.
+    //   This handles the case: user selects sphere, presses Add Transform —
+    //   the transform extends the sphere's chain even if it already has nodes
+    //   wired further down.
+    //   Merge nodes selected by the user are ignored (they cannot be chain roots).
+    //
+    // Priority 2: Exactly one geometry primitive is in the graph AND it has
+    //   no outgoing edges yet (completely unwired). In this case the intent
+    //   is unambiguous so we auto-chain automatically.
+    //   This is the "first primitive + first transform" convenience case.
+    //   If multiple primitives exist, or the primitive is already wired, we
+    //   do nothing and inform the user to select a card first.
+
+    let chainRootId   = null;   // the node we start walking from
+    let chainTailId   = null;   // the end of the chain (where we wire from)
+    let chainTailPort = null;   // 'sdf' or 'result' depending on tail node type
+
+    // ── Priority 1: selected node ──────────────────────────────────────────
     if (this._selectedIds.size > 0) {
+      // Take the most recently selected node ID
       const selId   = [...this._selectedIds].pop();
       const selNode = graph.nodes.get(selId);
+
       if (selNode && selId !== newNode.id) {
-        if (GEOM_TYPES.has(selNode.type)) {
-          sourceId   = selId;
-          sourcePort = 'sdf';
-        } else if (XFORM_TYPES.has(selNode.type)) {
-          sourceId   = selId;
-          sourcePort = 'result';
+        // Only geometry and linear transform nodes can be chain roots.
+        // Merge nodes (schurBlend, rUnion etc) cannot be chain roots because
+        // they do not have a simple single-output chain structure.
+        if (GEOM_TYPES.has(selNode.type) || LINEAR_XFORM.has(selNode.type)) {
+          // The user selected a valid chain node.
+          // Walk forward to find the tail of the chain that starts here.
+          // Example: user selects sphere(4) in chain sphere→noise→output.
+          //   findChainTail(4) returns noise(7) — the actual tail.
+          //   The new transform is inserted after noise, not after sphere.
+          chainRootId   = selId;
+          chainTailId   = findChainTail(selId);
+          chainTailPort = outPortOf(graph.nodes.get(chainTailId)?.type);
+        } else {
+          // User selected a merge node or an unsupported type.
+          // Do not auto-chain — require explicit wiring.
+          console.info(
+            `Selected node "${selNode.type}" is a merge/output node. ` +
+            `Wire the new transform manually using drag-connect.`
+          );
         }
       }
     }
 
-    // Priority 2 — last geometry or transform node in the graph
-    if (!sourceId) {
+    // ── Priority 2: single unwired primitive fallback ──────────────────────
+    if (!chainRootId) {
+      // Count all geometry primitives in the graph (excluding the new node itself)
+      const prims = [];
       graph.nodes.forEach((n, id) => {
         if (id === newNode.id) return;
-        if (GEOM_TYPES.has(n.type)) {
-          sourceId   = id;
-          sourcePort = 'sdf';
-        } else if (XFORM_TYPES.has(n.type)) {
-          sourceId   = id;
-          sourcePort = 'result';
-        }
+        if (GEOM_TYPES.has(n.type)) prims.push(id);
       });
+
+      if (prims.length === 1) {
+        const pid = prims[0];
+        // Only auto-chain if the primitive has no outgoing SDF edges yet.
+        // If it already has outgoing edges, it is already wired into something
+        // and we cannot safely determine the intent.
+        const existingOut = graph.getOutgoingEdges(pid, 'sdf') || [];
+        if (existingOut.length === 0) {
+          // Single primitive, completely unwired — safe to auto-chain.
+          chainRootId   = pid;
+          chainTailId   = pid;        // no chain yet, tail = root
+          chainTailPort = 'sdf';      // geometry nodes output on 'sdf'
+        } else {
+          // Primitive is already wired somewhere — ambiguous, require selection.
+          console.info(
+            `Primitive (id:${pid}) is already wired. ` +
+            `Click a node card to select it, then click Add Transform ` +
+            `to extend that branch.`
+          );
+        }
+      } else if (prims.length > 1) {
+        // Multiple primitives — cannot determine intent without selection.
+        console.info(
+          `${prims.length} primitives present — click a node card to select one, ` +
+          `then click Add Transform to extend that branch.`
+        );
+      }
+      // If prims.length === 0, the graph has no geometry at all.
+      // In that case chainRootId remains null and we skip all wiring below.
     }
 
-    // Wire source → new transform node
-    if (sourceId) {
+    // ── Wire tail → new transform node ────────────────────────────────────
+    // If we found a valid chain tail, wire it to the new transform's input.
+    if (chainTailId) {
       try {
-        graph.addEdge(sourceId, sourcePort, newNode.id, 'sdf');
-        console.log(`Auto-wired: node ${sourceId} (${sourcePort}) → ${newNode.id} (sdf)`);
+        graph.addEdge(chainTailId, chainTailPort, newNode.id, 'sdf');
+        console.log(
+          `Auto-wired chain tail: ${chainTailId}(${chainTailPort}) → ${newNode.id}(sdf)`
+        );
       } catch(e) {
-        console.warn('Auto-wire source failed:', e.message);
+        console.warn('Auto-wire tail→transform failed:', e.message);
       }
     } else {
-      console.info('No source node found — wire manually by dragging port connections');
+      console.info(
+        'No chain root found — wire the new transform manually using drag-connect.'
+      );
     }
 
-    // Wire new transform → output node
-    const outNode = this.sceneManager._ensureOutputNode();
-    try {
-      graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
-      console.log(`Auto-wired: node ${newNode.id} (result) → output (sdf)`);
-    } catch(e) {
-      // Edge may already exist if output was already connected — this is fine
+    // ── Wire new transform → output ────────────────────────────────────────
+    // Determine whether to connect the new transform to the output node.
+    // We do this in three scenarios:
+    //
+    //   Scenario A: The old chain tail was already connected to output.
+    //     In this case the user had a working chain ending at output.
+    //     We remove the old tail→output edge and replace it with
+    //     newNode→output so the chain continues to reach the output.
+    //     Example: sphere→noise→output. User adds twist after noise.
+    //     Result should be: sphere→noise→twist→output.
+    //     Without this, the chain would be sphere→noise→twist (dangling)
+    //     and sphere→noise→output (still present, wrong).
+    //
+    //   Scenario B: Nothing is connected to output yet.
+    //     The new transform becomes the first thing wired to output.
+    //     This happens when the user adds a transform to a fresh scene.
+    //
+    //   Scenario C: Output is already wired from a different branch.
+    //     Do not touch output — the user has a deliberate multi-branch
+    //     scene and must wire manually.
+
+    const outNode   = this.sceneManager._ensureOutputNode();
+    const outEdges  = graph.getAllIncomingEdges(outNode.id, 'sdf') || [];
+
+    // Scenario A: was the chain tail previously wired to output?
+    const tailWasToOutput = chainTailId
+      ? outEdges.some(e => e.fromNode === chainTailId)
+      : false;
+
+    // Scenario B: is output completely unconnected?
+    const outputIsEmpty = outEdges.length === 0;
+
+    if (tailWasToOutput) {
+      // Remove the old tail→output edge before adding newNode→output.
+      const oldEdge = outEdges.find(e => e.fromNode === chainTailId);
+      if (oldEdge) {
+        graph.removeEdge(oldEdge.id);
+        console.log(
+          `Removed old edge: ${chainTailId}(${chainTailPort}) → output`
+        );
+      }
+      try {
+        graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
+        console.log(
+          `Auto-wired: ${newNode.id}(result) → output(sdf) [replaced tail]`
+        );
+      } catch(e) { /* edge exists, fine */ }
+    } else if (outputIsEmpty) {
+      // Nothing wired to output — connect new node as the first output source.
+      try {
+        graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
+        console.log(
+          `Auto-wired: ${newNode.id}(result) → output(sdf) [first connection]`
+        );
+      } catch(e) { /* fine */ }
+    } else {
+      // Scenario C: output already has connections from other branches.
+      // Do not auto-wire — inform the user.
+      console.info(
+        `Output already wired from another branch. ` +
+        `Connect ${newNode.id} to output manually if needed.`
+      );
     }
 
     setTimeout(() => {
@@ -960,86 +1450,75 @@
   }
 
     _compose() {
-        const GEOM_TYPES = new Set([
-      'triangle','arc','lineSegment','circle','regularPolygon','polytope',
-      'sphere','box','cylinder','capsule','torus','cone','plane'
-    ]);
+    // Compose renders whatever the node graph currently describes.
+    // It does not create any new nodes — the user has already built
+    // the graph by adding primitives, transforms, and blend nodes
+    // and wiring them together.
+    //
+    // This button is equivalent to clicking "render now" using the
+    // CPU evaluator and marching squares — it is the fallback path
+    // that works for all node types including mappers.
 
-        // Collect base shape instances
-        const bases = [];
-        this.stateStore.nodeGraph.nodes.forEach((node, id) => {
-        if (!GEOM_TYPES.has(node.type)) return;
-        const shape = this.stateStore.getShape(id);
-        if (shape) bases.push(shape);
-        });
+    const graph = this.stateStore.nodeGraph;
 
-        if (bases.length < 2) {
-        alert('Add at least two primitives first.');
-        return;
-        }
+    // Find the output node
+    let outputNode = null;
+    graph.nodes.forEach(n => { if (n.type === 'outputNode') outputNode = n; });
 
-        // Clear existing composition
-        if (this.sceneManager.currentSchur) {
-        this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
-        this.stateStore.removeShape(this.sceneManager.currentSchur.instance.id);
-        this.sceneManager.currentSchur = null;
-        }
-
-        const op         = this._composeOperation || 'union';
-        const smoothness = this.schurParams.weight     || 8;
-        const isoOffset  = this.schurParams.isoOffset  || 0.15;
-
-        // Left-fold cascade: ((A op B) op C) op D ...
-        let current = bases[0];
-        for (let i = 1; i < bases.length; i++) {
-        const next = new SchurComposition({
-            shapes:          [current, bases[i]],
-            operations:      [op],
-            weights:         [smoothness],
-            rotation:        this.schurParams.rotation || 0,
-            scale:           this.schurParams.scale    || 1,
-            position:        { x: this.schurParams.posX || 0,
-                            y: this.schurParams.posY || 0 },
-            blendSmoothness: smoothness,
-            isoOffset,
-            color:           { h: 0, s: 0, l: 0.8, a: 1 },
-            onDependencyUpdate: (id, childIds) =>
-            this.stateStore._updateDependencies(id, childIds)
-        });
-        this.stateStore.addShape(next);
-        current = next;
-        }
-
-        // For cascade compositions, only wire the final result → outputNode.
-        // The intermediate SchurComposition structure lives in memory only.
-        // For 2-shape compositions, wire normally so the evaluator can use it.
-        if (bases.length === 2) {
-        this.sceneManager._wireCompositionGraph(current, bases);
-        } else {
-        // Just ensure outputNode exists and wire final result to it
-        const outputNode = this.sceneManager._ensureOutputNode();
-        try {
-            this.stateStore.nodeGraph.addEdge(
-            current.id, 'result', outputNode.id, 'sdf'
-            );
-        } catch (e) { /* edge may already exist */ }
-        }
-        this.sceneManager.evaluator.invalidate();
-
-        // Bypass the evaluator — the cascade structure lives in the
-        // SchurComposition instances, not in the flat node graph.
-        const threeObj = this.sceneManager._buildSchurObject(
-        current, this.renderParams.method,
-        pt => current.computeSDF(pt)
-        );
-        const entry = { instance: current, type: 'schur', object: threeObj };
-        this.sceneManager.currentSchur = entry;
-        this.sceneManager._addToScene(entry);
-
-        // Clear selection after compose so no stale IDs remain in _selectedIds
-        this._setSelected(null);
-        setTimeout(() => { this._runAutoLayout(); this._drawEdges(); }, 100);
+    if (!outputNode) {
+      console.warn('Compose: no output node found. Add primitives and wire them first.');
+      return;
     }
+
+    // Check the output has at least one incoming SDF edge
+    const inEdges = graph.getAllIncomingEdges(outputNode.id, 'sdf');
+    if (inEdges.length === 0) {
+      console.warn('Compose: output node has no incoming connections. Wire a node to output first.');
+      return;
+    }
+
+    // Evaluate the graph using the CPU evaluator
+    this.sceneManager.evaluator.graph = graph;
+    this.sceneManager.evaluator.invalidate();
+
+    let sdf = null;
+    try {
+      sdf = this.sceneManager.evaluator.getRootSDF();
+    } catch(e) {
+      console.error('Compose: evaluator error:', e.message);
+      return;
+    }
+
+    if (!sdf) {
+      console.warn('Compose: getRootSDF returned null — check that all required ports are connected.');
+      return;
+    }
+
+    // Switch to marching squares (CPU path supports all node types)
+    this.sceneManager.setRenderMode('marchingSquares');
+    this._renderModeBtn.textContent = '⬛ GLSL Mode';
+
+    // Restore Three.js canvas visibility
+    const threeCanvas = this.sceneManager.renderer?.domElement;
+    if (threeCanvas) {
+      threeCanvas.style.opacity = '1';
+      threeCanvas.style.pointerEvents = 'auto';
+    }
+
+    // Hide GPU canvases
+    this.sceneManager.sdfRenderer?._canvas &&
+      (this.sceneManager.sdfRenderer._canvas.style.display = 'none');
+    this.sceneManager.rayMarchRenderer?._canvas &&
+      (this.sceneManager.rayMarchRenderer._canvas.style.display = 'none');
+
+    // Render
+    try {
+      this.sceneManager.renderSDF(sdf, 'contours (2D)');
+      console.log('Compose: rendered via CPU marching squares');
+    } catch(e) {
+      console.error('Compose: render error:', e.message);
+    }
+  }
 
     _renderSDFPreview(nodeId, previewCanvas) {
         import('./previewRenderer.js').then(({ drawSDFPreview }) => {

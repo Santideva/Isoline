@@ -400,8 +400,8 @@ export class NodeCard {
     let isDragging = false;
     let startX, startY, startPosX, startPosY;
 
-    // Show a crosshair cursor to indicate this is a drag surface
-    canvas.style.cursor = 'crosshair';
+    // Use a neutral drag cursor so port-dot diagnostics do not confuse this canvas
+    canvas.style.cursor = 'move';
 
     const toDelta = (px) => (px / canvas.offsetWidth) * WORLD_SIZE;
 
@@ -660,6 +660,46 @@ export class NodeCard {
         this._handleParamChange(paramSpec.name, sel.value)
       );
       return sel;
+    }
+
+    // JSON / array params (e.g. polytope vertices) — show truncated read-only
+    // display. The full value is accessible on hover. Actual editing is done
+    // via the PolygonEditor preview widget, not this control.
+    if (paramSpec.type === 'json' || paramSpec.type === 'vertices' ||
+        paramSpec.name === 'vertices') {
+      const display = document.createElement('div');
+      display.style.cssText = `
+        flex: 1;
+        font-size: 10px;
+        opacity: 0.65;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-family: monospace;
+        background: rgba(255,255,255,0.04);
+        border-radius: 3px;
+        padding: 2px 5px;
+        cursor: default;
+      `;
+      // Show a compact summary rather than the raw JSON
+      try {
+        const val = currentValue;
+        const arr = typeof val === 'string' ? JSON.parse(val) : val;
+        if (Array.isArray(arr)) {
+          display.textContent = `[${arr.length} pts]`;
+        } else {
+          const raw = JSON.stringify(val);
+          display.textContent = raw.length > 30 ? raw.slice(0, 28) + '…' : raw;
+        }
+      } catch(_) {
+        const raw = String(currentValue);
+        display.textContent = raw.length > 30 ? raw.slice(0, 28) + '…' : raw;
+      }
+      // Full value on hover for inspection
+      display.title = typeof currentValue === 'string'
+        ? currentValue
+        : JSON.stringify(currentValue);
+      return display;
     }
 
     // Number — slider + numeric display

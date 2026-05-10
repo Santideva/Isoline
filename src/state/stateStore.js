@@ -176,7 +176,17 @@ export class StateStore {
 
   clear() {
     this.sessionShapes.clear();
-    this.nodeGraph = new NodeGraph();
+
+    if (this.nodeGraph && typeof this.nodeGraph.clear === 'function') {
+      this.nodeGraph.clear();
+    } else {
+      // Fallback for older NodeGraph implementations.
+      this.nodeGraph.nodes.clear();
+      this.nodeGraph.edges.clear();
+      this.nodeGraph._incomingEdge.clear();
+      this.nodeGraph._outgoingEdges.clear();
+    }
+
     this.dependencyMap.clear();
     console.log("State store cleared.");
   }

@@ -64,7 +64,7 @@ stateStore.updateMappingConfig({
 });
 
 // ── 6. Default primitive ──────────────────────────────────────────────────────
-sceneManager.addPrimitive('line');
+// sceneManager.addPrimitive('line');
 
 // ── 7. Auto-save on exit ──────────────────────────────────────────────────────
 window.addEventListener('beforeunload', () => {

@@ -17,6 +17,7 @@ import { logger } from './logger.js';
  * @returns {Array<Array<{x:number,y:number}>>} array of contour loops
  */
 export function marchingSquares(sdfFn, bounds, resolution = 100) {
+  console.trace('marchingSquares called from:');
   logger.info(`Starting marching squares with resolution: ${resolution}`);
   logger.debug(`Bounds: [${bounds.join(', ')}]`);
   
@@ -49,11 +50,32 @@ export function marchingSquares(sdfFn, bounds, resolution = 100) {
   logger.debug(`Grid computation complete. Size: ${grid.length}x${grid[0].length}`);
   logger.debug(`SDF value range: [${minSDF.toFixed(4)}, ${maxSDF.toFixed(4)}]`);
   
-  // If all values are on the same side of the contour, we won't find any contours
-  if ((minSDF >= 0 && maxSDF >= 0) || (minSDF <= 0 && maxSDF <= 0)) {
-    logger.warn('All SDF values are on the same side of zero. No contours will be found.');
+  // If all values are strictly positive, the surface is entirely outside the
+  // render bounds or the shape has zero volume.
+  if (minSDF > 0) {
+    logger.warn(
+      'marchingSquares: all SDF values are positive — shape boundary is outside ' +
+      'render bounds, or the geometry is empty (e.g. rDifference of identical shapes). ' +
+      'Try increasing boundsMax on the Output node.'
+    );
     return [];
   }
+
+  // If all values are strictly negative, the shape fills the entire render bounds
+  // with no visible boundary.
+  if (maxSDF < 0) {
+    logger.warn(
+      'marchingSquares: all SDF values are negative — shape fills the entire render area ' +
+      'with no visible boundary. The shape may be very large or the iso-level offset ' +
+      'may need adjustment.'
+    );
+    return [];
+  }
+
+  // Note: maxSDF == 0 is valid — it occurs with weightedRUnion at p=1, where all
+  // exterior points evaluate to exactly zero. Cells straddling the boundary still
+  // have negative interior corners and are correctly detected below.
+  // Note: minSDF == 0 is valid — same reason for weightedRIntersection at p=1.
 
   // All possible marching squares edge configurations
   // Each entry maps to the edges that the contour passes through
@@ -120,10 +142,15 @@ export function marchingSquares(sdfFn, bounds, resolution = 100) {
         grid[j+1][i]      // Top-left
       ];
       
-      // Calculate the cell case (0-15)
+      // Calculate the cell case (0-15).
+      // isFinite guard: NaN or Infinity from a broken SDF chain is treated
+      // as "outside" so it doesn't corrupt the case index.
+      // A value of exactly 0 is treated as "outside" — this is correct and
+      // intentional; the boundary itself sits between a negative interior
+      // corner and the zero/positive exterior.
       let caseIndex = 0;
       for (let k = 0; k < 4; k++) {
-        if (values[k] < 0) {
+        if (isFinite(values[k]) && values[k] < 0) {
           caseIndex |= (1 << k);
         }
       }
@@ -182,102 +209,107 @@ export function marchingSquares(sdfFn, bounds, resolution = 100) {
     return [];
   }
   
-  // ── Contour tracing ───────────────────────────────────────────────────────
-  //
-  // Each interior grid edge is shared by exactly two cells.  Given a segment
-  // that exits through edge N of cell (ci, cj), the continuation is always
-  // found in a specific neighbour at a specific entry edge:
-  //
-  //   exit edge 0 (bottom) → cell (ci,   cj-1), entry edge 2 (top)
-  //   exit edge 1 (right)  → cell (ci+1, cj),   entry edge 3 (left)
-  //   exit edge 2 (top)    → cell (ci,   cj+1), entry edge 0 (bottom)
-  //   exit edge 3 (left)   → cell (ci-1, cj),   entry edge 1 (right)
-  //
-  // This is O(1) per step and works in all four cardinal directions.
+  // ── Collect exact contour segments with topology metadata ─────────────────
 
-  // [di, dj, entryEdge]
-  const NEXT = {
-    0: [ 0, -1, 2],
-    1: [ 1,  0, 3],
-    2: [ 0,  1, 0],
-    3: [-1,  0, 1]
-  };
+  // Map a local cell edge index to a globally unique shared grid-edge id.
+  // Horizontal edges (0 = bottom, 2 = top) and vertical edges (1 = right, 3 = left)
+  // are keyed so that the same physical edge shared between adjacent cells
+  // maps to the same key — this is what allows us to stitch segments into loops.
+  function globalEdgeKey(i, j, edge) {
+    switch (edge) {
+      case 0: return `H:${i},${j}`;       // bottom edge of cell (i,j)
+      case 2: return `H:${i},${j + 1}`;   // top edge = bottom edge of cell above
+      case 3: return `V:${i},${j}`;       // left edge of cell (i,j)
+      case 1: return `V:${i + 1},${j}`;   // right edge = left edge of cell to right
+      default: return null;
+    }
+  }
 
-  const contours = [];
-  // visited key: `${i},${j},${segmentIndex}`
-  const visited = new Set();
-
+  const segments = [];
   for (let j = 0; j < resolution; j++) {
     for (let i = 0; i < resolution; i++) {
       const cell = cellCrossings[j][i];
-      if (cell.edges.length === 0) continue;
-
-      for (let e = 0; e < cell.edges.length; e++) {
-        const startKey = `${i},${j},${e}`;
-        if (visited.has(startKey)) continue;
-
-        // Start a new contour from this unvisited segment
-        const contour = [];
-        visited.add(startKey);
-
-        const [pt1, pt2, , exitEdge0] = cell.edges[e];
-        contour.push(pt1, pt2);
-
-        let ci       = i;
-        let cj       = j;
-        let exitEdge = exitEdge0;
-
-        // Follow the chain until we close the loop or hit a boundary
-        const MAX_STEPS = resolution * resolution * 2;
-        for (let step = 0; step < MAX_STEPS; step++) {
-          const [di, dj, entryEdge] = NEXT[exitEdge];
-          const ni = ci + di;
-          const nj = cj + dj;
-
-          // Out of bounds → open contour, stop
-          if (ni < 0 || ni >= resolution || nj < 0 || nj >= resolution) break;
-
-          const neighbour = cellCrossings[nj][ni];
-          if (neighbour.edges.length === 0) break;
-
-          // Find the segment in the neighbour whose entry edge matches
-          let found = false;
-          for (let ne = 0; ne < neighbour.edges.length; ne++) {
-            const nKey = `${ni},${nj},${ne}`;
-            const [, , neighbourEntry, neighbourExit] = neighbour.edges[ne];
-
-            if (neighbourEntry !== entryEdge) continue;
-
-            // Loop closed — the exit point connects back to our start
-            if (visited.has(nKey)) {
-              // Only close if this really is our start cell
-              if (ni === i && nj === j && ne === e) {
-                contour.push(contour[0]); // close the loop
-              }
-              found = true;
-              break;
-            }
-
-            visited.add(nKey);
-            contour.push(neighbour.edges[ne][1]); // push pt2
-            exitEdge = neighbourExit;
-            ci = ni;
-            cj = nj;
-            found = true;
-            break;
-          }
-
-          if (!found) break; // boundary or saddle dead-end
-        }
-
-        if (contour.length > 2) {
-          contours.push(contour);
-        }
+      if (!cell.edges.length) continue;
+      for (const edge of cell.edges) {
+        const [pt1, pt2, edgeA, edgeB] = edge;
+        segments.push({
+          pt1,
+          pt2,
+          startKey: globalEdgeKey(i, j, edgeA),
+          endKey:   globalEdgeKey(i, j, edgeB),
+        });
       }
     }
   }
 
-  logger.info(`Marching squares completed. Found ${contours.length} contours.`);
+  logger.debug(`Raw contour segments: ${segments.length}`);
+  if (segments.length === 0) {
+    logger.info('No contour segments found.');
+    return [];
+  }
+
+  // ── Build adjacency map: shared edge key → segment indices ────────────────
+  // Each physical grid edge can be touched by at most 2 segments (one per
+  // adjacent cell in the ambiguous case, or one in the normal case).
+  const edgeMap = new Map();
+  const addToEdgeMap = (key, idx) => {
+    if (!edgeMap.has(key)) edgeMap.set(key, []);
+    edgeMap.get(key).push(idx);
+  };
+  segments.forEach((seg, idx) => {
+    addToEdgeMap(seg.startKey, idx);
+    addToEdgeMap(seg.endKey,   idx);
+  });
+
+  // ── Trace contours by following the adjacency graph ───────────────────────
+  // Each segment belongs to exactly one contour. Starting from any unvisited
+  // segment, we walk forward (and backward if the start is not the loop
+  // closure) until we return to the start or cannot continue.
+  const visited  = new Set();
+  const contours = [];
+
+  for (let s = 0; s < segments.length; s++) {
+    if (visited.has(s)) continue;
+
+    const contour     = [];
+    let   currentIdx  = s;
+    let   currentSeg  = segments[currentIdx];
+
+    visited.add(currentIdx);
+    contour.push(currentSeg.pt1);
+    contour.push(currentSeg.pt2);
+    let currentEdge = currentSeg.endKey;
+
+    // Walk forward along the chain
+    const MAX_STEPS = segments.length * 2;
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const connected = edgeMap.get(currentEdge);
+      if (!connected) break;
+
+      // Find the next unvisited segment that shares this edge
+      let nextIdx = null;
+      for (const candidate of connected) {
+        if (!visited.has(candidate)) { nextIdx = candidate; break; }
+      }
+      if (nextIdx === null) break;  // loop closed or dead end
+
+      visited.add(nextIdx);
+      const nextSeg = segments[nextIdx];
+
+      // Append the far endpoint of the next segment
+      if (nextSeg.startKey === currentEdge) {
+        contour.push(nextSeg.pt2);
+        currentEdge = nextSeg.endKey;
+      } else {
+        contour.push(nextSeg.pt1);
+        currentEdge = nextSeg.startKey;
+      }
+    }
+
+    if (contour.length > 1) contours.push(contour);
+  }
+
+  logger.info(`Marching squares completed. Found ${contours.length} stitched contours.`);
   return contours;
 }
 
@@ -755,6 +787,7 @@ export function createSDFMesh(sdfObject, bounds, options = {}) {
  * @returns {THREE.Group} Group containing visualizations
  */
 export function visualizeSDFContours(sdfObject, bounds, options = {}) {
+  console.trace('visualizeSDFContours called');
   logger.info('Visualizing SDF contours');
   logger.debug(`Bounds: [${bounds.join(', ')}]`);
   logger.debug(`Options: ${JSON.stringify(options)}`);

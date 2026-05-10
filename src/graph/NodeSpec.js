@@ -210,6 +210,7 @@ export const NODE_TYPES = {
       { name: 'radius', type: 'number', default: 1,    min: 0.01, max: 10,  step: 0.01 },
       { name: 'height', type: 'number', default: 2,    min: 0.01, max: 20,  step: 0.01 },
       { name: 'capped', type: 'select', default: 'yes', options: ['yes','no'] },
+      { name: 'axis',   type: 'select', default: 'Y',  options: ['Y','X','Z'] },
       { name: 'posX',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
       { name: 'posY',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
       { name: 'posZ',   type: 'number', default: 0,    min: -10,  max: 10,  step: 0.01 },
@@ -291,6 +292,7 @@ export const NODE_TYPES = {
     params: [
       { name: 'radius', type: 'number', default: 1,  min: 0.01, max: 10, step: 0.01 },
       { name: 'height', type: 'number', default: 2,  min: 0.01, max: 20, step: 0.01 },
+      { name: 'axis',   type: 'select', default: 'Y', options: ['Y','X','Z'] },
       { name: 'posX',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
       { name: 'posY',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
       { name: 'posZ',   type: 'number', default: 0,  min: -10,  max: 10, step: 0.01 },
@@ -767,7 +769,7 @@ export const NODE_TYPES = {
     label: 'Output',
     timeVarying: false,
     ports: [
-      { name: 'sdf',    type: PortType.SDF,    dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'sdf', type: PortType.SDF, dir: PortDirection.IN, required: true, default: null, multi: true },
     ],
     params: [
       { name: 'renderMethod', type: 'select', default: 'contours (2D)',

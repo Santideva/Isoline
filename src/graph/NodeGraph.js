@@ -36,7 +36,8 @@ export class NodeGraph {
 
     // Derived lookup: for each node+port, which edge connects to it?
     // Rebuilt on every mutation.
-    this._incomingEdge  = new Map();  // `${nodeId}:${portName}` → edgeId
+    this._incomingEdge  = new Map();  // `${nodeId}:${portName}` → edgeId  (last only — single-input ports)
+    this._incomingEdges = new Map();  // `${nodeId}:${portName}` → edgeId[] (all — multi-input ports)
     this._outgoingEdges = new Map();  // `${nodeId}:${portName}` → edgeId[]
 
     // Callbacks — fired on any mutation
@@ -120,11 +121,16 @@ export class NodeGraph {
       throw new Error(`Edge must go from OUT port to IN port`);
     }
 
-    // Each IN port accepts only one edge — remove existing if present
-    const inKey = `${toNode}:${toPort}`;
-    const existingEdgeId = this._incomingEdge.get(inKey);
-    if (existingEdgeId !== undefined) {
-      this._removeEdgeInternal(existingEdgeId);
+    // Single-input ports replace existing edge.
+    // Multi-input ports keep all incoming edges.
+    const isMulti = toPortSpec?.multi === true;
+
+    if (!isMulti) {
+      const inKey = `${toNode}:${toPort}`;
+      const existingEdgeId = this._incomingEdge.get(inKey);
+      if (existingEdgeId !== undefined) {
+        this._removeEdgeInternal(existingEdgeId);
+      }
     }
 
     // Cycle check before adding
@@ -151,6 +157,22 @@ export class NodeGraph {
     return true;
   }
 
+  /**
+   * Clear all graph contents in place.
+   * Keeps the same NodeGraph object alive so existing references and UI
+   * subscriptions remain valid.
+   */
+  clear() {
+    this.nodes.clear();
+    this.edges.clear();
+    this._incomingEdge.clear();
+    this._outgoingEdges.clear();
+
+    // Keep _listeners intact on purpose.
+    // If you later add graph-level caches or counters, reset them here.
+    this._notify('cleared');
+  }
+
   // ── Queries ───────────────────────────────────────────────────────────────
 
   getIncomingEdge(nodeId, portName) {
@@ -160,6 +182,15 @@ export class NodeGraph {
 
   getOutgoingEdges(nodeId, portName) {
     const edgeIds = this._outgoingEdges.get(`${nodeId}:${portName}`) || [];
+    return edgeIds.map(id => this.edges.get(id)).filter(Boolean);
+  }
+
+  /**
+   * Get ALL edges incoming to a port (for multi: true ports).
+   * Returns an empty array for unconnected ports.
+   */
+  getAllIncomingEdges(nodeId, portName) {
+    const edgeIds = this._incomingEdges.get(`${nodeId}:${portName}`) || [];
     return edgeIds.map(id => this.edges.get(id)).filter(Boolean);
   }
 
@@ -303,9 +334,17 @@ export class NodeGraph {
 
   _rebuildLookups() {
     this._incomingEdge.clear();
+    this._incomingEdges.clear();
     this._outgoingEdges.clear();
     this.edges.forEach((edge, edgeId) => {
+      // Single-value map (last write wins) — used for single-input ports
       this._incomingEdge.set(`${edge.toNode}:${edge.toPort}`, edgeId);
+
+      // Multi-value map — used for multi-input ports and direct iteration
+      const inKey = `${edge.toNode}:${edge.toPort}`;
+      if (!this._incomingEdges.has(inKey)) this._incomingEdges.set(inKey, []);
+      this._incomingEdges.get(inKey).push(edgeId);
+
       const outKey = `${edge.fromNode}:${edge.fromPort}`;
       if (!this._outgoingEdges.has(outKey)) this._outgoingEdges.set(outKey, []);
       this._outgoingEdges.get(outKey).push(edgeId);
