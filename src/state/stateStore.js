@@ -174,6 +174,83 @@ export class StateStore {
     return null;
   }
 
+/**
+   * Remove all registered shape instances from the stateStore WITHOUT
+   * touching the node graph, the dependency map, or any other state.
+   *
+   * WHY THIS METHOD EXISTS — THE UNDO PROBLEM:
+   *
+   * stateStore.clear() wipes everything including the node graph.
+   * The undo system works by deserializing a snapshot INTO the node graph
+   * immediately before _afterGraphReplaced() runs. If _afterGraphReplaced
+   * then called stateStore.clear(), it would wipe the graph that undo
+   * just restored, leaving the canvas blank and requiring a second
+   * deserialization — effectively running undo twice and introducing
+   * a window where the graph is in an invalid state.
+   *
+   * clearShapes() solves this by removing only the shape instances —
+   * the stale Three.js-linked objects that belong to the PREVIOUS graph
+   * state — while leaving the newly restored node graph completely intact.
+   * _rebuildPrimitiveFromNode can then create fresh instances for each
+   * geometry node in the restored graph and register them cleanly.
+   *
+   * THE CORRECT UNDO REBUILD SEQUENCE:
+   *
+   *   1.  undoManager.undo() / redo()      → deserializes snapshot into nodeGraph
+   *   2.  Three.js scene objects cleared   → done by _afterGraphReplaced
+   *   3.  stateStore.clearShapes()         → this method
+   *   4.  _rebuildPrimitiveFromNode(node)  → re-registers fresh shapes + Three.js meshes
+   *
+   * IMPLEMENTATION NOTE:
+   *   This method iterates and calls removeShape(id) for each registered
+   *   shape rather than calling this.sessionShapes.clear() directly.
+   *   removeShape() may contain cleanup logic (event dispatch, dependency
+   *   invalidation) that direct Map.clear() would bypass. Using removeShape()
+   *   ensures any per-shape teardown is correctly executed for every instance.
+   *
+   *   Replace 'sessionShapes' with the property name revealed by the
+   *   console discovery script if it differs on your installation:
+   *
+   *     Object.getOwnPropertyNames(_stateStore)
+   *       .filter(k => _stateStore[k] instanceof Map)
+   *       .forEach(k => {
+   *         const m = _stateStore[k];
+   *         console.log(`${k}: Map(${m.size})`, [...m.keys()].slice(0, 3));
+   *       });
+   */
+  /**
+   * Remove all shape instances from the session registry WITHOUT touching
+   * the node graph, edges, or any other state.
+   *
+   * IMPORTANT — why this does NOT call removeShape():
+   *   removeShape(id) performs a full teardown of a shape: it removes the
+   *   instance from sessionShapes AND deletes the corresponding node from
+   *   nodeGraph. That is correct when the user manually removes a primitive.
+   *   But clearShapes() is called during undo/redo, where the nodeGraph has
+   *   just been restored by deserialization and must not be touched.
+   *   Calling removeShape() here would delete the restored graph nodes,
+   *   leaving only the outputNode and making _graphIsRenderable() return
+   *   false even when the graph is fully wired.
+   *
+   *   Direct Map.clear() removes only the JavaScript shape instances from
+   *   the registry. The nodeGraph is completely unaffected.
+   */
+  clearShapes() {
+    const count = this.sessionShapes?.size ?? 0;
+
+    // Bypass removeShape() entirely — directly clear the instance registry.
+    // The nodeGraph nodes, edges, and all other stateStore state are untouched.
+    if (this.sessionShapes) {
+      this.sessionShapes.clear();
+    }
+
+    logger.info(
+      `clearShapes: ${count} shape instance(s) removed from registry — ` +
+      `nodeGraph preserved (${this.nodeGraph.nodes.size} nodes, ` +
+      `${(this.nodeGraph.edges ?? this.nodeGraph.connections ?? new Map()).size} edges).`
+    );
+  }
+
   clear() {
     this.sessionShapes.clear();
 

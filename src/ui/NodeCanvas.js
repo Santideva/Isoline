@@ -46,6 +46,7 @@
     import { autoLayout, needsLayout, LAYOUT_DIRECTIONS } from './layouts.js';
     import { SchurComposition } from '../Primitives/SchurComposition.js';
     import { saveScene, loadScene, listScenes } from '../persistence.js';
+    import { UndoManager } from '../state/UndoManager.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
@@ -63,8 +64,39 @@
     'outputNode',
     ]);
 
-    export class NodeCanvas {
     /**
+ * Returns true if the vertex array describes a convex polygon.
+ * Works for both CW and CCW winding.
+ * Collinear vertices are skipped (they neither confirm nor deny convexity).
+ * Returns true for degenerate inputs (< 3 vertices, all collinear) so that
+ * no spurious warning fires — the SDF code handles those cases separately.
+ *
+ * @param  {Array<[number,number]>} vertices
+ * @returns {boolean}
+ */
+function _isConvexPolygon(vertices) {
+    if (!Array.isArray(vertices) || vertices.length < 3) return true;
+    const n = vertices.length;
+    let expectedSign = 0;
+    for (let i = 0; i < n; i++) {
+        const [ax, ay] = vertices[i];
+        const [bx, by] = vertices[(i + 1) % n];
+        const [cx, cy] = vertices[(i + 2) % n];
+        // Z-component of cross product (B−A) × (C−B)
+        const cross = (bx - ax) * (cy - by) - (by - ay) * (cx - bx);
+        if (Math.abs(cross) < 1e-9) continue;   // collinear — skip
+        const sign = cross > 0 ? 1 : -1;
+        if (expectedSign === 0) {
+            expectedSign = sign;
+        } else if (sign !== expectedSign) {
+            return false;   // turn direction reversed — concave vertex
+        }
+    }
+    return true;
+}
+
+     export class NodeCanvas {
+     /**
      * @param {StateStore}   stateStore
      * @param {SceneManager} sceneManager
      * @param {object}       schurParams   reference to the schurParams object in index.js
@@ -87,6 +119,15 @@
         this._recomposeTimer       = null;
         this._viewportDragAttached = false;
 
+        // ── Undo / Redo ───────────────────────────────────────────────────
+        this._undo      = new UndoManager(stateStore.nodeGraph);
+        this._undoBtnEl = null;   // assigned in _buildDOM
+        this._redoBtnEl = null;
+        this._undo.onChange(({ canUndo, canRedo }) => {
+            if (this._undoBtnEl) this._undoBtnEl.disabled = !canUndo;
+            if (this._redoBtnEl) this._redoBtnEl.disabled = !canRedo;
+        });
+
         this._buildDOM();
         this._attachGlobalEvents();
     }
@@ -102,6 +143,29 @@
     // ── DOM construction ──────────────────────────────────────────────────────
 
     _buildDOM() {
+        // ── Inject option styles for dropdown readability ─────────────────────
+        // Native <select> popups on Windows use the OS white-background theme.
+        // Without explicit option styling the white text becomes invisible.
+        // This block runs once per page load; the id guard prevents duplication.
+        if (!document.getElementById('nc-option-styles')) {
+            const _os = document.createElement('style');
+            _os.id = 'nc-option-styles';
+            _os.textContent = `
+                select option {
+                    background-color: #1c1c22 !important;
+                    color: rgba(220, 220, 230, 0.95) !important;
+                    font-size: 12px;
+                }
+                select option:hover,
+                select option:focus,
+                select option:checked {
+                    background-color: #2e2e44 !important;
+                    color: #ffffff !important;
+                }
+            `;
+            document.head.appendChild(_os);
+        }
+
         // ── Overlay root ──────────────────────────────────────────────────────
         this._overlay = document.createElement('div');
         this._overlay.id = 'node-canvas-overlay';
@@ -119,184 +183,262 @@
         // ── Toolbar ───────────────────────────────────────────────────────────
         const toolbar = document.createElement('div');
         toolbar.style.cssText = `
-        height: 40px;
+        height: 44px;
         background: rgba(12,12,14,0.92);
         border-bottom: 1px solid rgba(255,255,255,0.08);
         display: flex;
         align-items: center;
-        padding: 0 12px;
-        gap: 8px;
+        padding: 0 10px;
+        gap: 5px;
         flex-shrink: 0;
         pointer-events: auto;
         backdrop-filter: blur(4px);
         `;
 
-        const title = document.createElement('span');
-        title.textContent = 'Node Graph';
-        title.style.cssText = 'font-size:13px; font-weight:500; color:rgba(255,255,255,0.7); margin-right:auto;';
-        toolbar.appendChild(title);
-
-        // Layout direction selector
-        const layoutLabel = document.createElement('span');
-        layoutLabel.textContent = 'Layout:';
-        layoutLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(layoutLabel);
-
-        this._layoutSelect = document.createElement('select');
-        this._layoutSelect.style.cssText = `
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 4px;
-        color: rgba(255,255,255,0.8);
-        font-size: 11px;
-        padding: 2px 6px;
+        // ── Shared toolbar utilities ───────────────────────────────────────────
+        const _selectStyle = `
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 4px;
+          color: rgba(255,255,255,0.8);
+          font-size: 12px;
+          padding: 3px 5px;
+          cursor: pointer;
         `;
+
+        // Create an <option> with explicit background/color so the native
+        // OS dropdown popup renders readable text on any system theme.
+        const _opt = (val, lbl) => {
+          const o = document.createElement('option');
+          o.value = val; o.textContent = lbl;
+          o.style.backgroundColor = '#1c1c22';
+          o.style.color = 'rgba(220,220,230,0.95)';
+          return o;
+        };
+
+        // Placeholder option: shown when nothing is selected; disabled so
+        // it cannot itself be dispatched as an add action.
+        const _ph = (label) => {
+          const o = document.createElement('option');
+          o.value = ''; o.textContent = label;
+          o.disabled = true; o.selected = true;
+          o.style.backgroundColor = '#14141a';
+          o.style.color = 'rgba(150,150,165,0.7)';
+          return o;
+        };
+
+        // Dispatch helper: called on every dropdown's change event.
+        // Adds the selected node type and resets the dropdown to its placeholder.
+        const _GEOM = new Set([
+          'line','triangle','arc','circle','polygon','polytope',
+          'sphere','box','cylinder','capsule','torus','cone','plane'
+        ]);
+        const _XFORM = new Set([
+          'extrude','revolve','tiling','symmetryfold','symmetryorbit',
+          'mobius','noisedisplace','twist','bend','repeat'
+        ]);
+        const _BLEND = new Set([
+          'schurBlend','rUnion','rIntersection','rDifference'
+        ]);
+
+        const _dispatchAdd = (v, selectEl) => {
+          if (!v) return;
+          selectEl.value = '';          // reset to placeholder immediately
+          if (_GEOM.has(v)) {
+            this._undo.snapshot();
+            this.sceneManager.addPrimitive(v);
+            setTimeout(() => { this._runAutoLayout(); this._drawEdges(); }, 50);
+          } else if (_XFORM.has(v)) {
+            this._addTransformNode(v);  // snapshot taken inside _addTransformNode
+          } else if (_BLEND.has(v)) {
+            this._addBlendNode(v);      // snapshot taken inside _addBlendNode
+          }
+        };
+
+        // ── 2D geometry dropdown ──────────────────────────────────────────────
+        this._2dSelect = document.createElement('select');
+        this._2dSelect.style.cssText = _selectStyle;
+        this._2dSelect.title = 'Click a 2D primitive to add it to the graph';
+        this._2dSelect.appendChild(_ph('2D ▾'));
+        [
+          ['line','Line'], ['triangle','Triangle'], ['arc','Arc'],
+          ['circle','Circle'], ['polygon','Polygon'], ['polytope','Conv. Polygon'],
+        ].forEach(([v, l]) => this._2dSelect.appendChild(_opt(v, l)));
+        this._2dSelect.addEventListener('change', () =>
+          _dispatchAdd(this._2dSelect.value, this._2dSelect));
+        toolbar.appendChild(this._2dSelect);
+
+        // ── 3D geometry dropdown ──────────────────────────────────────────────
+        this._3dSelect = document.createElement('select');
+        this._3dSelect.style.cssText = _selectStyle;
+        this._3dSelect.title = 'Click a 3D primitive to add it to the graph';
+        this._3dSelect.appendChild(_ph('3D ▾'));
+        [
+          ['sphere','Sphere'], ['box','Box'], ['cylinder','Cylinder'],
+          ['capsule','Capsule'], ['torus','Torus'], ['cone','Cone'], ['plane','Plane'],
+        ].forEach(([v, l]) => this._3dSelect.appendChild(_opt(v, l)));
+        this._3dSelect.addEventListener('change', () =>
+          _dispatchAdd(this._3dSelect.value, this._3dSelect));
+        toolbar.appendChild(this._3dSelect);
+
+        // ── Transform / operation dropdown ────────────────────────────────────
+        this._xformSelect = document.createElement('select');
+        this._xformSelect.style.cssText = _selectStyle;
+        this._xformSelect.title = 'Click an operation to add it to the graph';
+        this._xformSelect.appendChild(_ph('Op ▾'));
+        [
+          ['extrude','Extrude'], ['revolve','Revolve'], ['tiling','Tiling'],
+          ['symmetryfold','Sym. Fold'], ['symmetryorbit','Sym. Orbit'],
+          ['mobius','Möbius'], ['noisedisplace','Noise Disp.'],
+          ['twist','Twist'], ['bend','Bend'], ['repeat','Repeat'],
+        ].forEach(([v, l]) => this._xformSelect.appendChild(_opt(v, l)));
+        this._xformSelect.addEventListener('change', () =>
+          _dispatchAdd(this._xformSelect.value, this._xformSelect));
+        toolbar.appendChild(this._xformSelect);
+
+        // ── Blend dropdown ────────────────────────────────────────────────────
+        this._blendSelect = document.createElement('select');
+        this._blendSelect.style.cssText = _selectStyle;
+        this._blendSelect.title = 'Click a blend mode to add it to the graph';
+        this._blendSelect.appendChild(_ph('Blend ▾'));
+        [
+          ['schurBlend','Schur'], ['rUnion','R-Union'],
+          ['rIntersection','R-Intersect'], ['rDifference','R-Difference'],
+        ].forEach(([v, l]) => this._blendSelect.appendChild(_opt(v, l)));
+        this._blendSelect.addEventListener('change', () =>
+          _dispatchAdd(this._blendSelect.value, this._blendSelect));
+        toolbar.appendChild(this._blendSelect);
+
+        // ── Layout group ───────────────────────────────────────────────────────
+        this._layoutSelect = document.createElement('select');
+        this._layoutSelect.style.cssText = _selectStyle;
+        this._layoutSelect.title = 'Choose auto-layout direction';
         LAYOUT_DIRECTIONS.forEach(dir => {
-        const o = document.createElement('option');
-        o.value = dir;
-        o.textContent = dir;
-        this._layoutSelect.appendChild(o);
+          const o = _opt(dir, dir);
+          this._layoutSelect.appendChild(o);
         });
         this._layoutSelect.addEventListener('change', () => {
-        this._layoutDir = this._layoutSelect.value;
-        this._runAutoLayout();
+          this._layoutDir = this._layoutSelect.value;
+          this._undo.snapshot();
+          this._runAutoLayout();
         });
         toolbar.appendChild(this._layoutSelect);
 
-        // Add Primitive dropdown
-        const primLabel = document.createElement('span');
-        primLabel.textContent = 'Add:';
-        primLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(primLabel);
-
-        this._primSelect = document.createElement('select');
-        this._primSelect.style.cssText = `
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 4px;
-        color: rgba(255,255,255,0.8);
-        font-size: 11px;
-        padding: 2px 6px;
-        `;
-        ['Line', 'Triangle', 'Arc', 'Circle', 'Polygon', 'Polytope',
-         'Sphere', 'Box', 'Cylinder', 'Capsule', 'Torus',
-         'Cone', 'Plane'].forEach(t => {
-        const o = document.createElement('option');
-        o.value = t.toLowerCase();
-        o.textContent = t;
-        this._primSelect.appendChild(o);
+        const _autoLayoutBtn = this._makeButton('Auto', () => {
+          this._undo.snapshot();
+          this._runAutoLayout();
         });
-        toolbar.appendChild(this._primSelect);
+        _autoLayoutBtn.title = 'Auto-arrange all node cards';
+        toolbar.appendChild(_autoLayoutBtn);
 
-        const addBtn = this._makeButton('Add Primitive', () => {
-          this.sceneManager.addPrimitive(this._primSelect.value);
-          setTimeout(() => {
-            this._runAutoLayout();
-            this._drawEdges();
-          }, 50);
+        // "Fit All" — computes the bounding box of every card currently in
+        // the canvas (regardless of position or count) and adjusts zoom+pan
+        // so all cards are visible simultaneously. Useful when cards have
+        // drifted off-screen after heavy editing.
+        const _fitBtn = this._makeButton('Fit All', () => this._fitToScreen());
+        _fitBtn.title = 'Fit all node cards into the visible area';
+        toolbar.appendChild(_fitBtn);
+
+        // ── Node card canvas zoom ─────────────────────────────────────────────
+        const _cardsZoomIn = this._makeButton('+', () => {
+          const newScale = Math.min(3.0, this._transform.scale * 1.25);
+          const cx = (this._bgCanvas.width  || 800) / 2;
+          const cy = (this._bgCanvas.height || 600) / 2;
+          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
+          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
+          this._transform.scale = newScale;
+          this._applyTransform();
+          this._drawEdges();
         });
-        toolbar.appendChild(addBtn);
+        _cardsZoomIn.title = 'Zoom in on node cards';
+        toolbar.appendChild(_cardsZoomIn);
 
-        // Transform node dropdown
-        const xformLabel = document.createElement('span');
-        xformLabel.textContent = 'Transform:';
-        xformLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(xformLabel);
-
-        this._xformSelect = document.createElement('select');
-        this._xformSelect.style.cssText = `
-          background: rgba(255,255,255,0.08);
-          border: 1px solid rgba(255,255,255,0.15);
-          border-radius: 4px;
-          color: rgba(255,255,255,0.8);
-          font-size: 11px;
-          padding: 2px 6px;
-        `;
-        ['Extrude','Revolve','Tiling','SymmetryFold','SymmetryOrbit',
-         'Möbius','NoiseDisplace','Twist','Bend','Repeat'].forEach(t => {
-          const o = document.createElement('option');
-          o.value = t.toLowerCase().replace('ö','o');
-          o.textContent = t;
-          this._xformSelect.appendChild(o);
+        const _cardsZoomOut = this._makeButton('−', () => {
+          const newScale = Math.max(0.2, this._transform.scale * 0.8);
+          const cx = (this._bgCanvas.width  || 800) / 2;
+          const cy = (this._bgCanvas.height || 600) / 2;
+          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
+          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
+          this._transform.scale = newScale;
+          this._applyTransform();
+          this._drawEdges();
         });
-        toolbar.appendChild(this._xformSelect);
+        _cardsZoomOut.title = 'Zoom out on node cards';
+        toolbar.appendChild(_cardsZoomOut);
 
-        const addXformBtn = this._makeButton('Add Transform', () => {
-          this._addTransformNode(this._xformSelect.value);
+        // ── 3D scene zoom ─────────────────────────────────────────────────────
+        // Moves the Three.js camera along its view axis. The ray march
+        // renderer syncs its camera from Three.js each frame so these
+        // buttons affect all three render modes.
+        const _sceneZoomIn = this._makeButton('↑', () => {
+          const cam  = this.sceneManager.camera;
+          const ctrl = this.sceneManager.controls;
+          if (!cam || !ctrl) return;
+          const dist = cam.position.distanceTo(ctrl.target);
+          const dir  = cam.position.clone().sub(ctrl.target).normalize();
+          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 0.8)));
+          ctrl.update();
         });
-        toolbar.appendChild(addXformBtn);
+        _sceneZoomIn.title = 'Zoom in on 3D scene';
+        toolbar.appendChild(_sceneZoomIn);
 
-        // ── Blend node dropdown + button ──────────────────────────────────────
-        const blendLabel = document.createElement('span');
-        blendLabel.textContent = 'Blend:';
-        blendLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(blendLabel);
-
-        this._blendSelect = document.createElement('select');
-        this._blendSelect.style.cssText = `
-          background: rgba(255,255,255,0.08);
-          border: 1px solid rgba(255,255,255,0.15);
-          border-radius: 4px;
-          color: rgba(255,255,255,0.8);
-          font-size: 11px;
-          padding: 2px 6px;
-        `;
-        [
-          ['schurBlend',    'Schur Blend'],
-          ['rUnion',        'R-Union'],
-          ['rIntersection', 'R-Intersection'],
-          ['rDifference',   'R-Difference'],
-        ].forEach(([val, label]) => {
-          const o = document.createElement('option');
-          o.value = val;
-          o.textContent = label;
-          this._blendSelect.appendChild(o);
+        const _sceneZoomOut = this._makeButton('↓', () => {
+          const cam  = this.sceneManager.camera;
+          const ctrl = this.sceneManager.controls;
+          if (!cam || !ctrl) return;
+          const dist = cam.position.distanceTo(ctrl.target);
+          const dir  = cam.position.clone().sub(ctrl.target).normalize();
+          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 1.25)));
+          ctrl.update();
         });
-        toolbar.appendChild(this._blendSelect);
+        _sceneZoomOut.title = 'Zoom out on 3D scene';
+        toolbar.appendChild(_sceneZoomOut);
 
-        const addBlendBtn = this._makeButton('Add Blend', () => {
-          this._addBlendNode(this._blendSelect.value);
+        
+        // ── Section 3: HISTORY ────────────────────────────────────────────────
+        this._undoBtnEl = this._makeButton('↩ Undo', () => this._performUndo());
+        this._undoBtnEl.title    = 'Undo  (Ctrl+Z)';
+        this._undoBtnEl.disabled = true;
+        toolbar.appendChild(this._undoBtnEl);
+
+        this._redoBtnEl = this._makeButton('↪ Redo', () => this._performRedo());
+        this._redoBtnEl.title    = 'Redo  (Ctrl+Y)';
+        this._redoBtnEl.disabled = true;
+        toolbar.appendChild(this._redoBtnEl);
+
+        // Clear Scene: snapshot first so the user can undo the clear.
+        const _clearBtn = this._makeButton('🗑', () => {
+          if (!confirm('Clear the entire scene and start over?')) return;
+          this._undo.snapshot();
+          this._clearAll();
         });
-        addBlendBtn.style.cssText +=
-          'border-color: rgba(180,100,255,0.5); color: rgba(210,160,255,0.9);';
-        toolbar.appendChild(addBlendBtn);
+        _clearBtn.title = 'Clear scene and start over (undoable)';
+        _clearBtn.style.cssText += 'border-color: rgba(255,80,80,0.35); color: rgba(255,150,150,0.9);';
+        toolbar.appendChild(_clearBtn);
 
-        // Remove Last button
-        const removeBtn = this._makeButton('Remove Last', () => {
-        this.sceneManager.removeLast();
-        setTimeout(() => {
-            this._rebuildCards();
-            this._drawEdges();
-        }, 50);
-        });
-        toolbar.appendChild(removeBtn);
-
-        // Clear All button
-        const clearBtn = this._makeButton('Clear All', () => {
-        if (!confirm('Clear all primitives and compositions?')) return;
-        this._clearAll();
-        });
-        clearBtn.style.cssText += 'border-color: rgba(255,80,80,0.4); color: rgba(255,160,160,0.9);';
-        toolbar.appendChild(clearBtn);
-
-        // Auto-layout button
-        const autoBtn = this._makeButton('Auto Layout', () => this._runAutoLayout());
-        toolbar.appendChild(autoBtn);
-
+    
         // Operation defaults (used by legacy _compose() only)
         this._composeOperation = 'union';
 
-        // Compose button
-        const composeBtn = this._makeButton('⬡ Compose', () => this._compose());
-        composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
-        toolbar.appendChild(composeBtn);
+        // ── Section 4: RENDER ─────────────────────────────────────────────────
+        //
+        // "Render (CPU)" — triggers the marching-squares CPU render pipeline.
+        // GLSL and ray march modes render automatically every animation frame;
+        // the CPU path must be triggered explicitly because it is blocking and
+        // can be slow on complex scenes.
+        const _composeBtn = this._makeButton('⬡ Render', () => this._compose());
+        _composeBtn.title = 'Render the current scene via CPU marching squares';
+        _composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
+        toolbar.appendChild(_composeBtn);
 
-        
-        // Iso-step slider (visible only in GLSL mode)
-        const isoLabel = document.createElement('span');
-        isoLabel.textContent = 'Iso:';
-        isoLabel.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(isoLabel);
+        // "Lines" slider — controls iso-contour step size in GLSL mode.
+        // Smaller value → denser contour lines; larger → fewer, spaced further.
+        // Greyed out when not in GLSL mode since it has no effect there.
+        const _isoLabel = document.createElement('span');
+        _isoLabel.textContent = 'Lines:';
+        _isoLabel.style.cssText = 'font-size:13px; color:rgba(255,255,255,0.5);';
+        toolbar.appendChild(_isoLabel);
+        this._isoLabel = _isoLabel;  // stored so _toggleRenderMode can update opacity
 
         this._isoSlider = document.createElement('input');
         this._isoSlider.type  = 'range';
@@ -304,27 +446,26 @@
         this._isoSlider.max   = '2.0';
         this._isoSlider.step  = '0.05';
         this._isoSlider.value = '0.5';
-        this._isoSlider.style.cssText = 'width:80px; cursor:pointer;';
+        this._isoSlider.style.cssText = 'width:72px; cursor:pointer; opacity:0.4;';
+        this._isoSlider.disabled = true;   // enabled only in GLSL mode
+        this._isoSlider.title = 'Contour line density (GLSL mode only)';
         this._isoSlider.addEventListener('input', () => {
-        const v = parseFloat(this._isoSlider.value);
-        this.sceneManager.sdfRenderer.setIsoStep(v);
-        if (this.sceneManager.renderMode === 'glsl') {
+          const v = parseFloat(this._isoSlider.value);
+          this.sceneManager.sdfRenderer.setIsoStep(v);
+          if (this.sceneManager.renderMode === 'glsl') {
             this.sceneManager._renderGLSL();
-        }
+          }
         });
         toolbar.appendChild(this._isoSlider);
 
-        // Render mode toggle
+        // Render mode toggle (cycles marchingSquares → glsl → rayMarch)
         this._renderModeBtn = this._makeButton('⬛ GLSL Mode', () => this._toggleRenderMode());
         this._renderModeBtn.style.cssText += 'border-color: rgba(80,200,120,0.4); color: rgba(160,255,180,0.9);';
         toolbar.appendChild(this._renderModeBtn);
 
-        // Fit to screen button
-        const fitBtn = this._makeButton('Fit', () => this._fitToScreen());
-        toolbar.appendChild(fitBtn);
-
-        // Save button
-    const saveBtn = this._makeButton('💾 Save', async () => {
+            
+        // ── Section 5: FILE ───────────────────────────────────────────────────
+        const saveBtn = this._makeButton('💾 Save', async () => {
       const name = prompt('Scene name:', 'autosave');
       if (!name) return;
       const ok = await saveScene(
@@ -350,6 +491,9 @@
       const name = prompt(`Available scenes:\n${names.join(', ')}\n\nLoad scene:`, names[0]);
       if (!name) return;
 
+      // Snapshot current state so the load can be undone (Ctrl+Z)
+      this._undo.snapshot();
+
       // Clear current state first
       this._clearAll();
 
@@ -358,6 +502,9 @@
         alert(`Could not load scene "${name}"`);
         return;
       }
+
+      // Keep UndoManager tracking the live graph after deserialization
+      this._undo.syncGraph(this.stateStore.nodeGraph);
 
       // ── Rebuild Three.js visual objects from the restored graph ───────────
       // deserialize() restores node graph structure but does not create
@@ -429,11 +576,12 @@
     loadBtn.style.cssText += 'border-color: rgba(80,140,255,0.4); color: rgba(160,200,255,0.9);';
     toolbar.appendChild(loadBtn);
 
-    // Close button
-    const closeBtn = this._makeButton('✕ Close  [Tab]', () => this._doClose());
-    closeBtn.style.marginLeft = '4px';
-    toolbar.appendChild(closeBtn);
+    const _exportBtn = this._makeButton('↗', () => this._toggleExportPanel(_exportBtn));
+    _exportBtn.title = 'Export current scene (PNG · GLSL shader · JSON)';
+    _exportBtn.style.cssText += 'border-color: rgba(255,200,80,0.4); color: rgba(255,230,150,0.9);';
+    toolbar.appendChild(_exportBtn);
 
+    
         this._overlay.appendChild(toolbar);
 
         // ── Canvas area ───────────────────────────────────────────────────────
@@ -560,6 +708,7 @@
 
           if (!confirm(`Delete connection:\n  ${fromLabel} → ${toLabel}?`)) return;
 
+          this._undo.snapshot();
           try { graph.removeEdge(closestEdge.id); } catch(e) {
             console.warn('NodeCanvas: could not remove edge:', e.message);
             return;
@@ -585,8 +734,8 @@
         border: 1px solid rgba(255,255,255,0.15);
         border-radius: 4px;
         color: rgba(255,255,255,0.75);
-        font-size: 11px;
-        padding: 3px 10px;
+        font-size: 13px;
+        padding: 4px 12px;
         cursor: pointer;
         `;
         btn.addEventListener('click', onClick);
@@ -671,6 +820,10 @@
         });
         this._rebuildCards();
         this._drawEdges();
+        // Fit the viewport to the new card positions so no card is ever
+        // off-screen after layout runs. requestAnimationFrame defers the
+        // measurement until the DOM has settled from _rebuildCards().
+        requestAnimationFrame(() => this._fitToScreen());
     }
 
     // ── Card management ───────────────────────────────────────────────────────
@@ -698,7 +851,8 @@
               this.stateStore.nodeGraph.updateNodePosition(nodeId, x, y);
               this._drawEdges();
             },
-            (nodeId, previewCanvas) => this._renderSDFPreview(nodeId, previewCanvas)
+            (nodeId, previewCanvas) => this._renderSDFPreview(nodeId, previewCanvas),
+            this._undo
         );
 
         // Select on header click
@@ -721,6 +875,7 @@
             `Delete "${nodeType}" node #${nodeId} and all its connections?`
           )) return;
 
+          this._undo.snapshot();
           const graph = this.stateStore.nodeGraph;
 
           // Collect all edge IDs touching this node before removing anything
@@ -827,6 +982,7 @@
         e.stopPropagation();
         // Disable OrbitControls so the camera does not move during shape drag
         this.sceneManager.controls.enabled = false;
+        this._undo.snapshot();
         isDragging = true;
         lastX = e.clientX;
         lastY = e.clientY;
@@ -917,6 +1073,9 @@
         this._pendingEdge = { nodeId, portName, dir, x1: x, y1: y, x2: x, y2: y };
 
         const onMouseMove = (e) => {
+        // Guard: _pendingEdge can be nulled by a deferred timeout from a
+        // previous drag that finished just before this mousemove fires.
+        if (!this._pendingEdge) return;
         const r  = getInnerRect();
         const dx = (e.clientX - r.left) / this._transform.scale;
         const dy = (e.clientY - r.top)  / this._transform.scale;
@@ -932,17 +1091,21 @@
         this._drawEdges();
         };
 
+      // Capture the current _pendingEdge reference so the deferred null only
+      // applies to THIS drag operation. Without this, if a second drag starts
+      // before the setTimeout fires, the timeout nulls the new drag's object.
+      const capturedEdge = this._pendingEdge;
+
       const onMouseUp = () => {
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('mouseup',   onMouseUp);
-        // Defer cleanup by one microtask so the port dot's mouseup handler
-        // fires first and can call _completePendingEdge while _pendingEdge
-        // is still set. Without this setTimeout, _pendingEdge is nulled
-        // before _completePendingEdge reads it, silently aborting every
-        // manual drag-connect attempt.
         setTimeout(() => {
           this._edgeRenderer.setPendingEdge(null);
-          this._pendingEdge = null;
+          // Only null _pendingEdge if it still belongs to this drag operation.
+          // A rapid second drag may have already replaced it with a new object.
+          if (this._pendingEdge === capturedEdge) {
+            this._pendingEdge = null;
+          }
           this._drawEdges();
         }, 0);
         };
@@ -979,6 +1142,7 @@
           return;
         }
 
+        this._undo.snapshot();
         try {
           this.stateStore.nodeGraph.addEdge(outNodeId, outPort, inNodeId, inPort);
           // _onGraphChange will rebuild cards and redraw
@@ -999,6 +1163,28 @@
         // smoothness). Always invalidate the shader cache so it recompiles next frame.
         this.sceneManager._lastGLSLSource     = null;
         this.sceneManager._lastRayMarchSource = null;
+
+        // ── Concave polygon guard ─────────────────────────────────────────────────
+        // The Conv. Polygon (polytope) SDF is only valid for convex shapes.
+        // Fire immediately when the user edits vertices so they are not left
+        // wondering why the shape renders incorrectly.
+        const changedNode = this.stateStore.nodeGraph.nodes.get(nodeId);
+        if (changedNode?.type === 'polytope' && paramName === 'vertices') {
+            let parsedVerts = null;
+            try {
+                parsedVerts = typeof value === 'string'
+                    ? JSON.parse(value)
+                    : value;
+            } catch (_) {
+                // Malformed JSON — the geometry code will surface this separately.
+            }
+            if (parsedVerts && Array.isArray(parsedVerts) && !_isConvexPolygon(parsedVerts)) {
+                this._showToast(
+                    '⚠  Concave polygon — geometry reserved for version2.',
+                    6000
+                );
+            }
+        }
 
         // Update the live shape instance for ALL node types that have
         // updateParameters — this includes both geometry and schurBlend nodes.
@@ -1060,6 +1246,17 @@
 
     this.sceneManager.setRenderMode(next);
     this._renderModeBtn.textContent = labels[nextIdx];
+
+    // Enable the Lines slider only in GLSL mode where it has a visible effect.
+    const glslActive = next === 'glsl';
+    if (this._isoSlider) {
+      this._isoSlider.disabled = !glslActive;
+      this._isoSlider.style.opacity = glslActive ? '1' : '0.4';
+      this._isoSlider.style.cursor  = glslActive ? 'pointer' : 'default';
+    }
+    if (this._isoLabel) {
+      this._isoLabel.style.opacity = glslActive ? '1' : '0.4';
+    }
 
     // Explicitly manage canvas visibility to prevent Three.js from
     // overlapping the ray march / GLSL canvases
@@ -1134,6 +1331,7 @@
    * then drag-connect the result port to Output or the next node.
    */
   _addBlendNode(type) {
+    this._undo.snapshot();
     const graph  = this.stateStore.nodeGraph;
     const params = {
       schurBlend:    { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
@@ -1162,6 +1360,52 @@
   }
 
     _addTransformNode(type) {
+    // ── V1 dimensional constraint guard ───────────────────────────────────────
+    // Extrude and Revolve are 2D→3D bridges: they take a flat SDF as input
+    // and produce a volumetric SDF. Applying them to a 3D primitive is
+    // geometrically meaningless in V1. (Expanded in V2.)
+    //
+    // Check the most likely source node (selected card, or the sole primitive
+    // in the scene). If it is 3D, cancel the add and show an explanatory toast
+    // rather than silently creating an invalid graph connection.
+    const _IS_2D_ONLY_OP = new Set(['extrude', 'revolve']);
+    if (_IS_2D_ONLY_OP.has(type)) {
+      const _3D_TYPES = new Set([
+        'sphere','box','cylinder','capsule','torus','cone','plane'
+      ]);
+      const _2D_TYPES = new Set([
+        'circle','regularPolygon','triangle','arc','polytope','lineSegment'
+      ]);
+      const graph0 = this.stateStore.nodeGraph;
+
+      // Priority 1 — user has a card selected; check its type directly.
+      const selId   = [...this._selectedIds].pop();
+      const selNode = selId ? graph0.nodes.get(selId) : null;
+      if (selNode && _3D_TYPES.has(selNode.type)) {
+        this._showToast(
+          `${type[0].toUpperCase() + type.slice(1)} requires a 2D shape as input. ` +
+          `"${selNode.type}" is a 3D primitive — select a 2D shape (circle, polygon, …) first.`
+        );
+        return;
+      }
+
+      // Priority 2 — no selection, but the only primitives in the scene are 3D.
+      let scene2DCount = 0;
+      graph0.nodes.forEach(n => { if (_2D_TYPES.has(n.type)) scene2DCount++; });
+      let scene3DCount = 0;
+      graph0.nodes.forEach(n => { if (_3D_TYPES.has(n.type)) scene3DCount++; });
+
+      if (scene3DCount > 0 && scene2DCount === 0) {
+        this._showToast(
+          `${type[0].toUpperCase() + type.slice(1)} requires a 2D input. ` +
+          `The scene contains only 3D geometry. ` +
+          `Add a 2D shape first. (V1 limitation — dimensional bridging expands in V2.)`
+        );
+        return;
+      }
+    }
+
+    this._undo.snapshot();
     const graph    = this.stateStore.nodeGraph;
     const defaults = {
       extrude:       { type: 'extrudeNode',      params: { height: 2 } },
@@ -1654,19 +1898,26 @@
             document.activeElement.tagName === 'TEXTAREA' ||
             document.activeElement.tagName === 'SELECT') return;
 
-        // Tab toggles the node canvas overlay
-        if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        // Undo / Redo
+        if (e.ctrlKey || e.metaKey) {
+            if (e.key === 'z' && !e.shiftKey) {
             e.preventDefault();
-            this._open ? this._doClose() : this._doOpen();
+            this._performUndo();
+            return;
+            }
+            if (e.key === 'y' || (e.key === 'z' && e.shiftKey)) {
+            e.preventDefault();
+            this._performRedo();
+            return;
+            }
         }
 
-        // Escape: deselect if anything selected, close if nothing selected
+        // Tab key removed: the canvas is always open — no toggle needed.
+
+        // Escape: deselect any selected node cards.
+        // The overlay is permanently visible so Escape no longer closes it.
         if (e.key === 'Escape' && this._open) {
-            if (this._selectedIds.size > 0) {
             this._setSelected(null);
-            } else {
-            this._doClose();
-            }
         }
         });
 
@@ -1678,4 +1929,581 @@
         }
         });
     }
+
+    // ── Toast notifications ───────────────────────────────────────────────────
+
+    /**
+     * Show a non-modal notification at the bottom of the screen.
+     * Fades in, stays for `durationMs` milliseconds, then fades out.
+     * Used for feedback on blocked actions (e.g. dimensional constraint
+     * violations) so the user understands what happened without a dialog.
+     */
+    _showToast(message, durationMs = 3500) {
+        const existing = document.getElementById('nc-toast');
+        if (existing) existing.remove();
+
+        const t = document.createElement('div');
+        t.id = 'nc-toast';
+        t.textContent = message;
+        t.style.cssText = `
+            position: fixed;
+            bottom: 28px;
+            left: 50%;
+            transform: translateX(-50%) translateY(8px);
+            opacity: 0;
+            background: rgba(20,20,28,0.97);
+            border: 1px solid rgba(255,165,60,0.5);
+            color: rgba(255,210,140,0.95);
+            font-size: 13px;
+            font-family: var(--font-sans, sans-serif);
+            padding: 10px 22px;
+            border-radius: 6px;
+            z-index: 3000;
+            pointer-events: none;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.45);
+            max-width: 540px;
+            text-align: center;
+            line-height: 1.45;
+            transition: opacity 0.18s ease, transform 0.18s ease;
+        `;
+        document.body.appendChild(t);
+
+        // Trigger enter transition on next frame
+        requestAnimationFrame(() => {
+            t.style.opacity = '1';
+            t.style.transform = 'translateX(-50%) translateY(0)';
+        });
+
+        setTimeout(() => {
+            t.style.opacity = '0';
+            t.style.transform = 'translateX(-50%) translateY(4px)';
+            setTimeout(() => t.remove(), 220);
+        }, durationMs);
     }
+
+    // ── Export ────────────────────────────────────────────────────────────────
+
+    /**
+     * Toggle the export panel. If already open, close it; otherwise open it
+     * anchored near the top-right of the screen (below the toolbar).
+     */
+    _toggleExportPanel(anchorEl) {
+        const existing = document.getElementById('nc-export-panel');
+        if (existing) { existing.remove(); return; }
+
+        const mode      = this.sceneManager.renderMode;
+        const modeLabel = {
+            marchingSquares: 'Marching Squares (CPU 2D)',
+            glsl:            'GLSL (GPU 2D)',
+            rayMarch:        'Ray March (GPU 3D)',
+        }[mode] || mode;
+
+        const panel = document.createElement('div');
+        panel.id = 'nc-export-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 52px;
+            right: 14px;
+            background: rgba(16,16,22,0.98);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 8px;
+            padding: 18px 20px 14px;
+            z-index: 2000;
+            pointer-events: auto;
+            min-width: 280px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+            font-family: var(--font-sans, sans-serif);
+        `;
+
+        // Header
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;';
+        const ttl = document.createElement('span');
+        ttl.textContent = 'Export';
+        ttl.style.cssText = 'font-size:14px; font-weight:600; color:rgba(255,255,255,0.9);';
+        const cls = document.createElement('button');
+        cls.textContent = '✕';
+        cls.style.cssText = `
+            background:none; border:none; color:rgba(255,255,255,0.4);
+            font-size:13px; cursor:pointer; padding:0;
+        `;
+        cls.addEventListener('click', () => panel.remove());
+        hdr.appendChild(ttl); hdr.appendChild(cls);
+        panel.appendChild(hdr);
+
+        // Mode indicator
+        const modeEl = document.createElement('div');
+        modeEl.textContent = `Active mode: ${modeLabel}`;
+        modeEl.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.38); margin-bottom:14px;';
+        panel.appendChild(modeEl);
+
+        // Helper: styled export button row
+        const _row = (icon, label, sub, onClick, enabled = true) => {
+            const wrap = document.createElement('div');
+            wrap.style.marginBottom = '8px';
+
+            const btn = document.createElement('button');
+            btn.style.cssText = `
+                width:100%; background:${enabled ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.02)'};
+                border:1px solid ${enabled ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.05)'};
+                border-radius:5px;
+                color:${enabled ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)'};
+                font-size:13px; padding:9px 14px; cursor:${enabled ? 'pointer' : 'default'};
+                text-align:left; display:flex; align-items:center; gap:8px;
+            `;
+            btn.innerHTML = `<span style="font-size:15px">${icon}</span><span>${label}</span>`;
+            if (enabled) {
+                btn.addEventListener('click', () => { onClick(); panel.remove(); });
+                btn.addEventListener('mouseenter', () =>
+                    btn.style.background = 'rgba(255,255,255,0.12)');
+                btn.addEventListener('mouseleave', () =>
+                    btn.style.background = 'rgba(255,255,255,0.07)');
+            }
+
+            const desc = document.createElement('div');
+            desc.textContent = sub;
+            desc.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.32); margin-top:3px; padding:0 2px;';
+            wrap.appendChild(btn); wrap.appendChild(desc);
+            return wrap;
+        };
+
+        // ── PNG — always available ────────────────────────────────────────────
+        panel.appendChild(_row(
+            '🖼', 'Export PNG',
+            'Download the current rendered frame as a PNG image.',
+            () => this._exportPNG()
+        ));
+
+        // ── GLSL shader — only in GLSL or ray march mode ──────────────────────
+        const glslAvail = mode === 'glsl' || mode === 'rayMarch';
+        panel.appendChild(_row(
+            '🔷', 'Export GLSL Shader',
+            glslAvail
+                ? 'Download the generated fragment shader — paste into ShaderToy, Three.js, Unity, or any WebGL project.'
+                : 'Switch to GLSL or Ray March mode and render to unlock shader export.',
+            () => this._exportGLSL(),
+            glslAvail
+        ));
+
+        // ── Scene JSON — always available ─────────────────────────────────────
+        panel.appendChild(_row(
+            '📋', 'Export Scene JSON',
+            'Download the full node graph as JSON. Use to back up, share, or import into another Isoline session.',
+            () => this._exportJSON()
+        ));
+
+        // ── SVG — V2 note ─────────────────────────────────────────────────────
+        panel.appendChild(_row(
+            '✏️', 'Export SVG  (V2)',
+            'Vector export of marching-squares contours — coming in V2.',
+            () => {}, false
+        ));
+
+        // Close on outside click (deferred so this click doesn't immediately close)
+        setTimeout(() => {
+            const outside = (e) => {
+                if (!panel.contains(e.target) && e.target !== anchorEl) {
+                    panel.remove();
+                    document.removeEventListener('mousedown', outside);
+                }
+            };
+            document.addEventListener('mousedown', outside);
+        }, 120);
+
+        document.body.appendChild(panel);
+    }
+
+    /**
+     * Export the current rendered frame as a PNG.
+     * Detects the active render mode and grabs the correct canvas element.
+     */
+    _exportPNG() {
+        let canvas = null;
+        const mode = this.sceneManager.renderMode;
+
+        if (mode === 'glsl') {
+            canvas = this.sceneManager.sdfRenderer?._canvas;
+        } else if (mode === 'rayMarch') {
+            canvas = this.sceneManager.rayMarchRenderer?._canvas;
+        }
+        // Fallback: Three.js renderer canvas (marching squares and fallback)
+        if (!canvas) canvas = this.sceneManager.renderer?.domElement;
+
+        if (!canvas) {
+            this._showToast('No rendered canvas found. Render the scene first.');
+            return;
+        }
+
+        try {
+            const url  = canvas.toDataURL('image/png');
+            const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const a    = document.createElement('a');
+            a.href     = url;
+            a.download = `isoline-${ts}.png`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            this._showToast('PNG exported.');
+        } catch (err) {
+            // toDataURL throws if the canvas is tainted by cross-origin content
+            this._showToast(`PNG export failed: ${err.message}`);
+        }
+    }
+
+    /**
+     * Export the generated GLSL fragment shader source.
+     * In GLSL mode this is the 2D SDF + iso-contour shader.
+     * In ray march mode this is the full volumetric ray marching shader.
+     * Both are self-contained and can be pasted into ShaderToy with minimal
+     * wrapping (add a `mainImage` entry point and `iResolution` uniform).
+     */
+    _exportGLSL() {
+        const mode    = this.sceneManager.renderMode;
+        const injected = mode === 'rayMarch'
+            ? this.sceneManager._lastRayMarchSource
+            : this.sceneManager._lastGLSLSource;
+
+        if (!injected) {
+            this._showToast(
+                'No shader source available. ' +
+                'Switch to GLSL or Ray March mode, wire your graph to Output, and render once first.'
+            );
+            return;
+        }
+
+        // Build the COMPLETE fragment shader by combining the injected SDF
+        // functions with the renderer's fixed template (uniforms, void main,
+        // ray march loop, lighting). Without this step the exported file
+        // contains only bare SDF function definitions — not a runnable shader.
+        const renderer = mode === 'rayMarch'
+            ? this.sceneManager.rayMarchRenderer
+            : this.sceneManager.sdfRenderer;
+        const fullFragmentShader = renderer._buildFragmentShader(injected);
+
+        const header = [
+            '// Generated by Isoline — SDF Geometry Workbench',
+            `// Mode: ${mode === 'rayMarch' ? 'Ray March (3D)' : 'GLSL 2D'}`,
+            `// Exported: ${new Date().toISOString()}`,
+            '//',
+            '// ── To run on ShaderToy (shadertoy.com) ─────────────────────────',
+            '//   1. Create a new shader and replace the default fragment code.',
+            '//   2. Change  void main()  →  void mainImage(out vec4 fragColor, in vec2 fragCoord)',
+            '//   3. Change  gl_FragColor  →  fragColor',
+            '//   4. Change  gl_FragCoord  →  fragCoord',
+            '//   iResolution and iTime are ShaderToy built-ins — no changes needed.',
+            '//',
+            '// ── To run in a WebGL project ─────────────────────────────────────',
+            '//   Use this as your fragment shader source directly.',
+            '//   Pair with a simple full-screen quad vertex shader.',
+            '//   Provide uniforms: uResolution (vec2), uTime (float).',
+            '',
+        ].join('\n');
+
+        const full = header + fullFragmentShader;
+        const blob = new Blob([full], { type: 'text/plain;charset=utf-8' });
+        const url  = URL.createObjectURL(blob);
+        const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const a    = document.createElement('a');
+        a.href     = url;
+        a.download = `isoline-shader-${ts}.glsl`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        this._showToast('GLSL shader exported.');
+    }
+
+    /**
+     * Export the node graph as a JSON file.
+     * The JSON is the same format used by Save/Load but written to disk
+     * rather than IndexedDB, making it portable across machines and
+     * shareable with other users.
+     */
+    _exportJSON() {
+        try {
+            const data = {
+                version:    1,
+                exportedAt: new Date().toISOString(),
+                renderMode: this.sceneManager.renderMode,
+                graph:      this.stateStore.nodeGraph.serialize(),
+            };
+            const json = JSON.stringify(data, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url  = URL.createObjectURL(blob);
+            const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const a    = document.createElement('a');
+            a.href     = url;
+            a.download = `isoline-scene-${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            this._showToast('Scene JSON exported.');
+        } catch (err) {
+            this._showToast(`JSON export failed: ${err.message}`);
+        }
+    }
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+
+    _performUndo() {
+        if (!this._undo.undo()) return;
+        this._afterGraphReplaced();
+    }
+
+    _performRedo() {
+        if (!this._undo.redo()) return;
+        this._afterGraphReplaced();
+    }
+
+    /**
+     * Called after the node graph has been replaced wholesale by undo,
+     * redo, or scene load. Brings every downstream consumer of the node
+     * graph back into sync with the restored state in this exact order:
+     *
+     *   1.  THREE.js scene objects cleared
+     *   2.  stateStore shape registry cleared (via clearShapes — graph untouched)
+     *   3.  THREE.js objects rebuilt from restored graph nodes
+     *   4.  CPU evaluator re-pointed and invalidated
+     *   5.  GLSL evaluator re-pointed, shader caches flushed
+     *   6.  UndoManager synced to live graph reference
+     *   7.  NodeCard DOM fully rebuilt
+     *   8.  Edge layer redrawn
+     *
+     * WHY THE ORDER MATTERS:
+     *
+     * Step 1 must precede step 2 so there is never a window where the
+     * THREE.js scene references shape instances that have been removed
+     * from the stateStore registry. Both are cleared before anything is
+     * rebuilt, ensuring a clean slate.
+     *
+     * Step 2 uses clearShapes() and NOT stateStore.clear(). The latter
+     * would wipe the nodeGraph that undo/redo just restored.
+     * clearShapes() removes only the shape instance objects — the stale
+     * ones from the previous graph state — leaving the restored nodeGraph
+     * completely intact for step 3 to read from.
+     *
+     * Step 3 calls _rebuildPrimitiveFromNode() for each geometry node.
+     * That method creates a fresh primitive instance, calls
+     * stateStore.addShape(prim) to register it, and calls
+     * prim.createObject() to build the THREE.js mesh. The result is a
+     * { instance, type, object } entry that gets pushed into
+     * sceneManager.activePrimitives and added to the THREE.js scene.
+     *
+     * V1 KNOWN LIMITATION:
+     * _rebuildPrimitiveFromNode handles the following types:
+     *   circle, regularPolygon, polytope, sphere, box, cylinder,
+     *   capsule, torus, cone, plane.
+     * It does NOT currently handle: arc, triangle, lineSegment.
+     * For those types the method returns null and the loop below skips
+     * them with a warning. SDF evaluation for all node types remains
+     * correct regardless — only the THREE.js wireframe is absent for
+     * the unhandled types. This is addressed in V1.1.
+     */
+    _afterGraphReplaced() {
+        const graph = this.stateStore.nodeGraph;
+
+        // ── Step 1: Remove all existing THREE.js objects from the scene ───────
+        //
+        // currentSchur is the rendered output object currently in the THREE.js
+        // scene — line segments for contours, a fill mesh for 2D fill, or
+        // a surface mesh for 3D. It must be removed before rebuilding so the
+        // scene never contains both the old object and the new one at once.
+        if (this.sceneManager.currentSchur) {
+            this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
+            this.sceneManager.currentSchur = null;
+        }
+
+        // activePrimitives holds the THREE.js entry for each geometry primitive.
+        // Each entry is removed from the scene individually then the array is
+        // emptied. This must happen before clearShapes() so the THREE.js scene
+        // and the stateStore registry are cleared in a consistent order.
+        this.sceneManager.activePrimitives.forEach(entry => {
+            this.sceneManager._removeFromScene(entry);
+        });
+        this.sceneManager.activePrimitives = [];
+
+        // ── Step 2: Clear stateStore shape instances without touching nodeGraph ─
+        //
+        // stateStore.clearShapes() removes the shape objects registered by the
+        // PREVIOUS graph state. Those instances carry the old geometry parameters
+        // (old radius, old position, old blend configuration). If this step is
+        // skipped, _rebuildPrimitiveFromNode in step 3 would attempt to register
+        // new shapes against IDs that are already present in the Map, causing
+        // collisions or stale evaluator lookups.
+        //
+        // clearShapes() does NOT call stateStore.clear(). That would wipe the
+        // nodeGraph that undo/redo deserialized immediately before this method
+        // was called. Only the shape instance Map is affected.
+        this.stateStore.clearShapes();
+
+        // ── Step 3: Rebuild THREE.js objects from the restored graph nodes ─────
+        //
+        // The geometry types that _rebuildPrimitiveFromNode currently supports.
+        // Any node type listed here but not handled in _rebuildPrimitiveFromNode's
+        // switch statement will cause it to return null, which the loop below
+        // catches and logs as a warning.
+        const GEOMETRY_TYPES = new Set([
+            'circle',
+            'regularPolygon',
+            'polytope',
+            'lineSegment',
+            'sphere',
+            'box',
+            'cylinder',
+            'capsule',
+            'torus',
+            'cone',
+            'plane',
+        ]);
+
+        graph.nodes.forEach((node) => {
+            // Transform nodes, blend nodes, output nodes, mapper nodes, and
+            // time nodes do not have direct THREE.js representations.
+            // Only geometry primitive nodes need a mesh rebuilt.
+            if (!GEOMETRY_TYPES.has(node.type)) return;
+
+            let entry = null;
+            try {
+                entry = this.sceneManager._rebuildPrimitiveFromNode(node);
+            } catch (e) {
+                // An exception here means _rebuildPrimitiveFromNode encountered
+                // an internal error (constructor failure, missing dependency, etc.).
+                // Log it with enough context to locate the node, then continue
+                // rebuilding the remaining nodes rather than aborting entirely.
+                console.warn(
+                    `_afterGraphReplaced: exception while rebuilding ` +
+                    `${node.type} node #${node.id}: ${e.message}`
+                );
+                return;
+            }
+
+            if (!entry) {
+                // _rebuildPrimitiveFromNode returned null without throwing.
+                // This happens when the node type is in GEOMETRY_TYPES above
+                // but the switch statement inside the method does not handle it
+                // (currently: arc, triangle, lineSegment return null).
+                // SDF evaluation is unaffected — only the THREE.js wireframe
+                // is absent for this node until V1.1 extends the method.
+                console.warn(
+                    `_afterGraphReplaced: _rebuildPrimitiveFromNode returned null ` +
+                    `for ${node.type} node #${node.id}. ` +
+                    `SDF evaluation is correct; THREE.js wireframe is not restored ` +
+                    `for this node type in V1.`
+                );
+                return;
+            }
+
+            // Both stateStore registration (via _rebuildPrimitiveFromNode internally)
+            // and THREE.js scene addition are completed here. The entry is also
+            // tracked in activePrimitives so future calls to removeLast() or
+            // _clearAll() can find and remove it correctly.
+            this.sceneManager.activePrimitives.push(entry);
+            this.sceneManager._addToScene(entry);
+        });
+
+        // ── Step 4: Re-point the CPU evaluator at the live graph ─────────────
+        //
+        // NodeEvaluator caches SDF closures keyed by node ID. After undo/redo
+        // the node IDs are the same but the param values and graph topology may
+        // have changed. Re-assigning the graph reference and calling invalidate()
+        // clears all caches so the next call to getRootSDF() re-evaluates the
+        // full graph from scratch against the restored node data.
+        this.sceneManager.evaluator.graph = graph;
+        this.sceneManager.evaluator.invalidate();
+
+        // ── Step 5: Re-point the GLSL evaluator and flush shader caches ──────
+        //
+        // The GLSL evaluator generates shader source from the graph node
+        // structure. Nullifying _lastGLSLSource and _lastRayMarchSource forces
+        // a full recompile on the next render frame. This is necessary because
+        // the restored graph may have different node types, different connections,
+        // or different operation parameters that change the generated GLSL.
+        // Without this flush the renderer would continue using a shader compiled
+        // for the previous graph state.
+        if (this.sceneManager.glslEvaluator) {
+            this.sceneManager.glslEvaluator.graph = graph;
+        }
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+
+        // ── Step 6: Sync UndoManager to the live graph reference ─────────────
+        //
+        // UndoManager holds a direct reference to the nodeGraph object.
+        // If deserialization replaced the Map contents in-place (as confirmed
+        // by MT6.1 — the Map object itself is never swapped, only its entries
+        // are), the reference is technically still valid. syncGraph() is called
+        // unconditionally anyway to guard against any implementation change
+        // in NodeGraph.deserialize() that might swap the underlying object.
+        this._undo.syncGraph(graph);
+
+        // ── Step 7: Rebuild the NodeCard DOM ──────────────────────────────────
+        this._rebuildCards();
+
+        // ── Step 8: Redraw the edge layer ──────────────────────────────────────
+        this._drawEdges();
+
+        // ── Step 9: Synchronise GPU canvas visibility with graph renderability ──
+        //
+        // The animation loop stops calling _renderRayMarch() / _renderGLSL()
+        // when _graphIsRenderable() returns false. But "stop calling" is not
+        // the same as "clear the canvas". The last rendered frame sits frozen
+        // in the WebGL canvas until something overwrites it — visible to the
+        // user as a ghost image of the scene that was just undone.
+        //
+        // Two cases:
+        //
+        // CASE A — graph is no longer renderable after this undo/redo step:
+        //   Call setRenderMode('marchingSquares'). That method hides the GPU
+        //   canvases by setting opacity:0 on them, shows the Three.js canvas,
+        //   and flushes the shader caches. The Three.js canvas renders the
+        //   empty scene (solid black) on the next animation frame automatically.
+        //   The mode button text is also updated so it truthfully describes
+        //   what clicking it will do (enter GLSL mode).
+        //
+        // CASE B — graph is still renderable after this undo/redo step
+        //   (e.g. a param change was reverted, but all nodes and edges remain):
+        //   The GPU canvases are still showing the pre-undo render, which is
+        //   now stale. Trigger an explicit re-render so the output immediately
+        //   reflects the restored state rather than the image from before the
+        //   undone action.
+        //   For marchingSquares the Three.js scene was already rebuilt in
+        //   steps 1–3; the user re-composes to update the contours.
+
+        if (!this.sceneManager._graphIsRenderable()) {
+            // ── Case A: graph empty or unwired ─────────────────────────────────
+            // setRenderMode() handles all canvas show/hide logic:
+            //   sdfRenderer.hide() + rayMarchRenderer.hide() — GPU canvases hidden
+            //   threeCanvas opacity:1 — Three.js canvas shown
+            //   _lastGLSLSource / _lastRayMarchSource nulled — shader caches flushed
+            if (this.sceneManager.renderMode !== 'marchingSquares') {
+                this.sceneManager.setRenderMode('marchingSquares');
+
+                // Keep the button text in sync. _renderModeBtn is the DOM button
+                // created in _buildDOM() and stored on the NodeCanvas instance.
+                // Its text must always describe the mode the user will enter
+                // on the NEXT click, not the current mode.
+                this._renderModeBtn.textContent = '⬛ GLSL Mode';
+            }
+            // If already in marchingSquares: the Three.js scene was cleared and
+            // rebuilt empty in steps 1–3. The animation loop renders it black
+            // on the next frame. No further action needed.
+
+        } else {
+            // ── Case B: graph still renderable — re-render to show restored state
+            if (this.sceneManager.renderMode === 'glsl') {
+                // Immediate GLSL re-render. The evaluator was re-pointed in step 4
+                // and the shader cache was flushed in step 5, so this will
+                // recompile if the source changed and render the restored state.
+                this.sceneManager._renderGLSL();
+
+            } else if (this.sceneManager.renderMode === 'rayMarch') {
+                // Immediate ray march re-render. Same conditions as above.
+                this.sceneManager._renderRayMarch();
+            }
+            // marchingSquares: Three.js scene was rebuilt in steps 1–3 and the
+            // animation loop renders it continuously. Composing is explicit in
+            // this mode; no auto-compose is triggered here.
+        }
+    }
+}

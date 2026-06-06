@@ -230,7 +230,7 @@ export class WebGLRenderer {
     this._gl = this._canvas.getContext('webgl', {
       antialias:             false,
       premultipliedAlpha:    false,
-      preserveDrawingBuffer: false,
+      preserveDrawingBuffer: true,   // required for toDataURL() in PNG export
     });
 
     if (!this._gl) {

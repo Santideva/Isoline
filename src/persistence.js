@@ -670,3 +670,23 @@ export function addLoadButtonToGUI(gui, { clearVisuals, createVisual, triggerRen
   folder.open();
 }
 
+// =============================================================================
+// 10. DEV / TEST GLOBAL EXPOSURE
+// =============================================================================
+
+// Expose persistence API for browser-console integration tests.
+// Safe in webpack dev builds; remove or guard for production if desired.
+if (typeof window !== 'undefined') {
+  window._persistence = {
+    db,
+    saveScene,
+    loadScene,
+    listScenes,
+    deleteScene,
+
+    // optional legacy access
+    _legacyLoadScene,
+    _legacySaveScene
+  };
+}
+

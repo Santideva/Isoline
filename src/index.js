@@ -81,8 +81,11 @@ sceneManager.start();
 window._sceneManager = sceneManager;
 window._stateStore   = stateStore;
 
-// ── 11. Node canvas (Tab to open/close) ──────────────────────────────────────
+// ── 11. Node canvas ────────────────────────────────────────────────────────────
+// The overlay is transparent and does not block the 3D viewport.
+// Open immediately on startup — no Tab required.
 const nodeCanvas = new NodeCanvas(
   stateStore, sceneManager, schurParams, renderParams
 );
 window._nodeCanvas = nodeCanvas;
+nodeCanvas.open();

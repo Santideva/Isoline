@@ -52,7 +52,7 @@ export class NodeCard {
    * @param {Function} onPortMouseUp   (nodeId, portName, dir) → void
    * @param {Function} onDragEnd       (nodeId, x, y) → void
    */
-  constructor(node, nodeGraph, onParamChange, onPortMouseDown, onPortMouseUp, onDragEnd, onRequestPreview) {
+  constructor(node, nodeGraph, onParamChange, onPortMouseDown, onPortMouseUp, onDragEnd, onRequestPreview, undoManager = null) {
     this.node             = node;
     this.nodeGraph        = nodeGraph;
     this.onParamChange    = onParamChange;
@@ -60,6 +60,7 @@ export class NodeCard {
     this.onPortMouseUp    = onPortMouseUp;
     this.onDragEnd        = onDragEnd;
     this.onRequestPreview = onRequestPreview || null;
+    this._undo            = undoManager;
 
     this._portEls       = new Map();
     this._previewCanvas = null;
@@ -170,8 +171,25 @@ export class NodeCard {
     `;
     header.dataset.dragHandle = 'true';
 
+    const NODE_DISPLAY_NAMES = {
+      polytope:          'Conv. Polygon',
+      regularPolygon:    'Polygon',
+      lineSegment:       'Line Segment',
+      noiseDisplaceNode: 'Noise Disp.',
+      symmetryFoldNode:  'Sym. Fold',
+      symmetryOrbitNode: 'Sym. Orbit',
+      extrudeNode:       'Extrude',
+      revolveNode:       'Revolve',
+      tilingNode:        'Tiling',
+      mobiusNode:        'Möbius',
+      twistNode:         'Twist',
+      bendNode:          'Bend',
+      repeatNode:        'Repeat',
+    };
+    const displayTitle = NODE_DISPLAY_NAMES[this.node.type] ?? (spec?.label || this.node.type);
+
     const label = document.createElement('span');
-    label.textContent = spec?.label || this.node.type;
+    label.textContent = displayTitle;
     header.appendChild(label);
 
     const idBadge = document.createElement('span');
@@ -409,6 +427,7 @@ export class NodeCard {
       if (e.button !== 0) return;
       e.stopPropagation();
       e.preventDefault();
+      if (this._undo) this._undo.snapshot();
       isDragging  = true;
       startX      = e.clientX;
       startY      = e.clientY;
@@ -568,6 +587,7 @@ export class NodeCard {
       if (e.button !== 0) return;
       e.stopPropagation();
       e.preventDefault();
+      if (this._undo) this._undo.snapshot();
       isDragging = true;
       lastAngle  = getAngleFromEvent(e);
       dial.style.cursor = 'grabbing';
@@ -721,6 +741,11 @@ export class NodeCard {
       ? currentValue.toFixed(2)
       : currentValue;
     display.style.cssText = 'font-size:10px; opacity:0.8; min-width:32px; text-align:right; font-variant-numeric:tabular-nums;';
+
+    // Snapshot once at the start of each drag gesture, not on every tick.
+    slider.addEventListener('mousedown', () => {
+      if (this._undo) this._undo.snapshot();
+    });
 
     slider.addEventListener('input', () => {
       const v = parseFloat(slider.value);

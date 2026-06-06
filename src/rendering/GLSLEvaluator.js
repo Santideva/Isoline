@@ -226,12 +226,28 @@ export class GLSLEvaluator {
     return `// ── GLSLEvaluator generated preamble ──────────────────────────
 
 float rUnion(float a, float b, float s) {
-  return (a + b + sqrt(a*a + b*b)) / s;
+  // Smooth minimum — correct for negative-inside SDF convention.
+  // Returns min(a,b) far from the boundary; smooth transition within k units.
+  // Mapping: k = s*0.05 so that default s=8 gives a 0.4-unit blend zone.
+  //
+  // Correctness check (all cases):
+  //   outside both (a>0,b>0)  → min → positive ✓
+  //   inside A only (a<0,b>0) → min → a (negative) ✓
+  //   inside B only (a>0,b<0) → min → b (negative) ✓
+  //   inside both  (a<0,b<0)  → min → more negative ✓
+  float k = max(s * 0.05, 0.05);
+  float h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
 }
 float rIntersection(float a, float b, float s) {
-  return (a + b - sqrt(a*a + b*b)) / s;
+  // Hard max — correct for all intersection sizes including thin regions.
+  // Smooth max with the previous k=0.4 added +0.1 correction, shrinking
+  // thin intersections to zero and making them invisible.
+  // max(a,b) is Lipschitz-1 and gives exact SDF convention in all cases.
+  return max(a, b);
 }
 float rDifference(float a, float b, float s) {
+  // max(a, −b): positive outside A−B, negative inside crescent.
   return rIntersection(a, -b, s);
 }`;
   }
@@ -275,13 +291,14 @@ float ${fn}(vec3 p) {
         const bx = this._f((p.width  ?? 2) / 2);
         const by = this._f((p.height ?? 2) / 2);
         const bz = this._f((p.depth  ?? 2) / 2);
-        const cx = this._f(p.posX ?? 0);
-        const cy = this._f(p.posY ?? 0);
-        const cz = this._f(p.posZ ?? 0);
+        const cx = this._f(p.posX           ?? 0);
+        const cy = this._f(p.posY           ?? 0);
+        const cz = this._f(p.posZ           ?? 0);
+        const cr = this._f(p.cornerRounding ?? 0);
         return `// box node ${node.id}
 float ${fn}(vec3 p) {
   vec3 q = abs(p - vec3(${cx}, ${cy}, ${cz})) - vec3(${bx}, ${by}, ${bz});
-  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - ${cr};
 }`;
       }
 
@@ -304,12 +321,13 @@ float ${fn}(vec3 p) {
           axis === 'Z' ? 'q = vec3(q.x, q.z, q.y);' :
                          '';   // Y — no swap
 
+        const cr = this._f(p.cornerRounding ?? 0);
         if (!capped) {
           return `// cylinder (infinite, axis=${axis}) node ${node.id}
 float ${fn}(vec3 p) {
   vec3 q = p - vec3(${cx}, ${cy}, ${cz});
   ${swizzle}
-  return length(vec2(q.x, q.z)) - ${r};
+  return length(vec2(q.x, q.z)) - ${r} - ${cr};
 }`;
         }
         return `// cylinder (capped, axis=${axis}) node ${node.id}
@@ -317,28 +335,29 @@ float ${fn}(vec3 p) {
   vec3 q = p - vec3(${cx}, ${cy}, ${cz});
   ${swizzle}
   vec2 d = vec2(length(vec2(q.x, q.z)) - ${r}, abs(q.y) - ${h});
-  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - ${cr};
 }`;
       }
 
       case 'capsule': {
-        const ax = this._f(p.ax ?? 0);
-        const ay = this._f(p.ay ?? -1);
-        const az = this._f(p.az ?? 0);
-        const bx = this._f(p.bx ?? 0);
-        const by = this._f(p.by ?? 1);
-        const bz = this._f(p.bz ?? 0);
-        const r  = this._f(p.radius ?? 0.5);
-        return `// capsule node ${node.id}
-float ${fn}(vec3 p) {
-  vec3 a  = vec3(${ax}, ${ay}, ${az});
-  vec3 b  = vec3(${bx}, ${by}, ${bz});
-  vec3 pa = p - a;
-  vec3 ba = b - a;
-  float t = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-  return length(pa - ba * t) - ${r};
-}`;
-      }
+  const r  = this._f(p.radius ?? 0.5);
+  const h  = this._f(p.height ?? 2);
+  const cx = this._f(p.posX   ?? 0);
+  const cy = this._f(p.posY   ?? 0);
+  const cz = this._f(p.posZ   ?? 0);
+  const half = this._f((p.height ?? 2) / 2);
+
+  return `// capsule node ${node.id}
+  float ${fn}(vec3 p) {
+    vec3 a  = vec3(${cx}, ${cy} - ${half}, ${cz});
+    vec3 b  = vec3(${cx}, ${cy} + ${half}, ${cz});
+    vec3 pa = p - a;
+    vec3 ba = b - a;
+    float denom = max(dot(ba, ba), 1e-10);
+    float t = clamp(dot(pa, ba) / denom, 0.0, 1.0);
+    return length(pa - ba * t) - ${r};
+  }`;
+    }
 
       case 'torus': {
         const R  = this._f(p.majorRadius ?? 2);
@@ -553,11 +572,12 @@ ${edgeLines}
       // ── Curve primitives (SDF >= 0, needs isoOffset) ─────────────────────
 
       case 'triangle': {
-        const sz  = this._f(p.size        ?? 1);
-        const rot = this._f(p.rotation    ?? 0);
-        const cx  = this._f(p.posX        ?? 0);
-        const cy  = this._f(p.posY        ?? 0);
+        const sz  = this._f(p.size           ?? 1);
+        const rot = this._f(p.rotation       ?? 0);
+        const cx  = this._f(p.posX           ?? 0);
+        const cy  = this._f(p.posY           ?? 0);
         const h   = this._f((p.size ?? 1) * Math.sqrt(3) / 2);
+        const cr  = this._f(p.cornerRounding ?? 0);
         return `// triangle node ${node.id}
 float ${fn}(vec2 p) {
   vec2 q=p-vec2(${cx},${cy});
@@ -571,7 +591,7 @@ float ${fn}(vec2 p) {
   float d0=length(q-v0-e0*clamp(dot(q-v0,e0)/dot(e0,e0),0.0,1.0));
   float d1=length(q-v1-e1*clamp(dot(q-v1,e1)/dot(e1,e1),0.0,1.0));
   float d2=length(q-v2-e2*clamp(dot(q-v2,e2)/dot(e2,e2),0.0,1.0));
-  return min(d0,min(d1,d2));
+  return min(d0,min(d1,d2)) - ${cr};
 }`;
       }
 
@@ -641,12 +661,16 @@ float ${fn}(vec2 p) {
           op === 'intersection' ? `rIntersection(dA,dB,${sm})` :
           op === 'difference'   ? `rDifference(dA,dB,${sm})`   :
                                   `rUnion(dA,dB,${sm})`;
-
         // Determine if inputs are 3D
         const aIs3D = nodeA && this._nodeOutputIs3D(nodeA);
         const bIs3D = nodeB && this._nodeOutputIs3D(nodeB);
         const dim   = (aIs3D || bIs3D) ? 'vec3' : 'vec2';
-
+        // isoOffset was applied per-input for curve primitives only (converts
+        // unsigned→signed). For region-only blends subtract it from the final
+        // output so the NodeCard slider expands/contracts the blend boundary.
+        const bothRegion = (nodeA && REGION.has(nodeA.type)) &&
+                           (nodeB && REGION.has(nodeB.type));
+        const outputOff  = bothRegion ? iso : '0.0';
         return `// schurBlend node ${node.id}  (${op})
 float ${fn}(${dim} p) {
   float c=cos(${rot}); float s=sin(${rot});
@@ -656,7 +680,7 @@ float ${fn}(${dim} p) {
   }
   float dA=${fnA}(${aIs3D ? 'tp' : dim==='vec3'?'tp.xy':'tp'})-${offA};
   float dB=${fnB}(${bIs3D ? 'tp' : dim==='vec3'?'tp.xy':'tp'})-${offB};
-  return ${blendCall}/${sc};
+  return ${blendCall}/${sc} - ${outputOff};
 }`;
       }
 
@@ -677,7 +701,10 @@ float ${fn}(${dim} p) {
         const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
         const CURVE    = new Set(['lineSegment','triangle','arc']);
         const isCurve  = baseNode && CURVE.has(baseNode.type);
-        const isoLine  = isCurve ? `  d = d - ${iso};` : '';
+        // Apply isoOffset to all input types: for curve inputs converts unsigned→signed;
+        // for region inputs expands/contracts the tiled boundary. With iso=0.0 (default
+        // for regions) this is a GLSL no-op; non-zero values give visible boundary control.
+        const isoLine  = `  d = d - ${iso};`;
 
         // Detect 3D input — tiling folds XY only, preserves Z
         const is3D = baseNode && this._nodeOutputIs3D(baseNode);

@@ -363,93 +363,113 @@ export class CylinderPrimitive extends SolidPrimitive {
 export class CapsulePrimitive extends SolidPrimitive {
   /**
    * @param {Object} params
-   * @param {number} params.ax     start point X (default 0)
-   * @param {number} params.ay     start point Y (default -1)
-   * @param {number} params.az     start point Z (default 0)
-   * @param {number} params.bx     end point X (default 0)
-   * @param {number} params.by     end point Y (default 1)
-   * @param {number} params.bz     end point Z (default 0)
    * @param {number} params.radius capsule radius (default 0.5)
+   * @param {number} params.height capsule center-to-center segment length (default 2)
+   * @param {number} params.posX   center X (default 0)
+   * @param {number} params.posY   center Y (default 0)
+   * @param {number} params.posZ   center Z (default 0)
    */
   constructor(params = {}) {
     super(params);
     this.type   = 'capsule';
-    this.ax     = params.ax     !== undefined ? params.ax     : 0;
-    this.ay     = params.ay     !== undefined ? params.ay     : -1;
-    this.az     = params.az     !== undefined ? params.az     : 0;
-    this.bx     = params.bx     !== undefined ? params.bx     : 0;
-    this.by     = params.by     !== undefined ? params.by     : 1;
-    this.bz     = params.bz     !== undefined ? params.bz     : 0;
-    this.radius = params.radius !== undefined ? params.radius : 0.5;
-    this._params = { ...params };
 
-    logger.info(`Created CapsulePrimitive id:${this.id} r:${this.radius}`);
+    // New user-facing schema
+    this.radius = params.radius !== undefined ? params.radius : 0.5;
+    this.height = params.height !== undefined ? params.height : 2;
+    this.posX   = params.posX   !== undefined ? params.posX   : 0;
+    this.posY   = params.posY   !== undefined ? params.posY   : 0;
+    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
+
+    this._syncParams();
+
+    logger.info(`Created CapsulePrimitive id:${this.id} r:${this.radius} h:${this.height}`);
+  }
+
+  _syncParams() {
+    this._params = {
+      radius: this.radius,
+      height: this.height,
+      posX: this.posX,
+      posY: this.posY,
+      posZ: this.posZ,
+    };
+  }
+
+  _segmentEnds() {
+    return {
+      a: {
+        x: this.posX,
+        y: this.posY - this.height / 2,
+        z: this.posZ,
+      },
+      b: {
+        x: this.posX,
+        y: this.posY + this.height / 2,
+        z: this.posZ,
+      }
+    };
   }
 
   computeSDF(point) {
+    const { a, b } = this._segmentEnds();
+
     const px = point.x;
     const py = point.y;
     const pz = point.z || 0;
 
-    // Vector from A to point
-    const pax = px - this.ax;
-    const pay = py - this.ay;
-    const paz = pz - this.az;
+    const pax = px - a.x;
+    const pay = py - a.y;
+    const paz = pz - a.z;
 
-    // Vector from A to B
-    const bax = this.bx - this.ax;
-    const bay = this.by - this.ay;
-    const baz = this.bz - this.az;
+    const bax = b.x - a.x;
+    const bay = b.y - a.y;
+    const baz = b.z - a.z;
 
-    // Parameter of nearest point on segment [0,1]
     const dot_ba_ba = bax*bax + bay*bay + baz*baz;
-    const t = dot_ba_ba < 1e-10 ? 0 :
-      Math.max(0, Math.min(1, (pax*bax + pay*bay + paz*baz) / dot_ba_ba));
+    const t = dot_ba_ba < 1e-10
+      ? 0
+      : Math.max(0, Math.min(1, (pax*bax + pay*bay + paz*baz) / dot_ba_ba));
 
-    // Distance from point to nearest point on segment, minus radius
     const qx = pax - bax * t;
     const qy = pay - bay * t;
     const qz = paz - baz * t;
+
     return Math.sqrt(qx*qx + qy*qy + qz*qz) - this.radius;
   }
 
   createObject() {
-    // Approximate proxy: a cylinder between A and B with hemispherical ends
-    const dx  = this.bx - this.ax;
-    const dy  = this.by - this.ay;
-    const dz  = this.bz - this.az;
-    const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    // THREE.CapsuleGeometry(radius, length, capSegments, radialSegments)
+    // "length" is the straight cylindrical middle section, so to match our
+    // logical height (center-to-center segment length) we subtract 2*radius.
+    const cylLen = Math.max(this.height - 2 * this.radius, 0);
 
-    const geo  = typeof THREE.CapsuleGeometry !== 'undefined'
-      ? new THREE.CapsuleGeometry(this.radius, len, 8, 16)
-      : new THREE.CylinderGeometry(this.radius, this.radius, len, 16);
+    const geo = typeof THREE.CapsuleGeometry !== 'undefined'
+      ? new THREE.CapsuleGeometry(this.radius, cylLen, 8, 16)
+      : new THREE.CylinderGeometry(this.radius, this.radius, Math.max(this.height, 0.001), 16);
 
-    const mesh  = new THREE.Mesh(geo, this._wireMaterial());
+    const mesh = new THREE.Mesh(geo, this._wireMaterial());
 
-    // Position at midpoint of A→B, orient along the segment
-    mesh.position.set(
-      (this.ax + this.bx) / 2,
-      (this.ay + this.by) / 2,
-      (this.az + this.bz) / 2
-    );
-    if (len > 1e-6) {
-      mesh.quaternion.setFromUnitVectors(
-        new THREE.Vector3(0, 1, 0),
-        new THREE.Vector3(dx / len, dy / len, dz / len)
-      );
-    }
+    mesh.position.set(this.posX, this.posY, this.posZ);
+
+    // CapsuleGeometry is aligned along Y by default, so no quaternion needed.
     return mesh;
   }
 
   updateParameters(params = {}) {
-    if (params.ax     !== undefined) this.ax     = params.ax;
-    if (params.ay     !== undefined) this.ay     = params.ay;
-    if (params.az     !== undefined) this.az     = params.az;
-    if (params.bx     !== undefined) this.bx     = params.bx;
-    if (params.by     !== undefined) this.by     = params.by;
-    if (params.bz     !== undefined) this.bz     = params.bz;
     if (params.radius !== undefined) this.radius = params.radius;
+    if (params.height !== undefined) this.height = params.height;
+    if (params.posX   !== undefined) this.posX   = params.posX;
+    if (params.posY   !== undefined) this.posY   = params.posY;
+    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
+
+    if (params.position !== undefined) {
+      if (params.position.x !== undefined) this.posX = params.position.x;
+      if (params.position.y !== undefined) this.posY = params.position.y;
+      if (params.position.z !== undefined) this.posZ = params.position.z;
+    }
+
+    this._syncParams();
     logger.info(`Updated CapsulePrimitive ${this.id}`);
     return this;
   }

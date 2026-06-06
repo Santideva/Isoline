@@ -147,7 +147,12 @@ export class NodeEvaluator {
         if (mapper) {
           prim.shapes.forEach(s => { s.distanceMapper = mapper; });
         }
-        return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) };
+        // cornerRounding: subtract from the curve SDF to place the iso-surface at
+        // `cornerRounding` units from each triangle edge, producing rounded corners.
+        // _applyCornerRounding() uses a temporal mapper that is zero at t=0 and has
+        // no geometric rounding effect; this subtraction is the correct implementation.
+        const rounding = cornerRounding ?? 0;
+        return { sdf: (pt, cs = [], t = 0) => prim.computeSDF(pt, cs, t) - rounding };
       }
 
       case 'arc': {
@@ -212,12 +217,14 @@ export class NodeEvaluator {
 
       case 'box': {
         const { width, height, depth, posX, posY, posZ } = node.params;
+        const rounding = node.params.cornerRounding ?? 0;
         const prim = new BoxPrimitive({ width, height, depth, posX, posY, posZ });
-        return { sdf: (pt) => prim.computeSDF(pt) };
+        return { sdf: (pt) => prim.computeSDF(pt) - rounding };
       }
 
       case 'cylinder': {
         const { radius, height, capped, posX, posY, posZ } = node.params;
+        const rounding = node.params.cornerRounding ?? 0;
         const axis = node.params.axis ?? 'Y';
         // Create at origin — we handle position + swizzle manually
         // so the axis rotation and position offset compose correctly.
@@ -228,33 +235,26 @@ export class NodeEvaluator {
         });
         return {
           sdf: (pt) => {
-            // Step 1: translate to local (primitive) coordinates
             const lx = pt.x - (posX || 0);
             const ly = pt.y - (posY || 0);
             const lz = (pt.z || 0) - (posZ || 0);
-            // Step 2: swizzle to match axis selection.
-            // The cylinder formula always treats Y as the long axis internally.
-            // Swizzling maps the chosen world axis onto Y before evaluation.
             let sx, sy, sz;
             if (axis === 'X') {
-              // World X becomes the cylinder axis: swap X and Y
               sx = ly; sy = lx; sz = lz;
             } else if (axis === 'Z') {
-              // World Z becomes the cylinder axis: swap Y and Z
               sx = lx; sy = lz; sz = ly;
             } else {
-              // Default Y axis: no swap
               sx = lx; sy = ly; sz = lz;
             }
-            return prim.computeSDF({ x: sx, y: sy, z: sz });
+            return prim.computeSDF({ x: sx, y: sy, z: sz }) - rounding;
           }
         };
       }
 
       case 'capsule': {
-        const { ax, ay, az, bx, by, bz, radius } = node.params;
-        const prim = new CapsulePrimitive({ ax, ay, az, bx, by, bz, radius });
-        return { sdf: (pt) => prim.computeSDF(pt) };
+      const { radius, height, posX, posY, posZ } = node.params;
+      const prim = new CapsulePrimitive({ radius, height, posX, posY, posZ });
+      return { sdf: (pt) => prim.computeSDF(pt) };
       }
 
       case 'torus': {
@@ -375,13 +375,14 @@ export class NodeEvaluator {
         const aIsRegion = shapeA && REGION_TYPES.has(shapeA.type);
         const bIsRegion = shapeB && REGION_TYPES.has(shapeB.type);
 
+       const iso = isoOffset ?? 0.15;
         const sdfFn = (pt, cs = [], t = 0) => {
           const tp = {
             x: T.a * pt.x + T.b * pt.y + T.tx,
             y: T.c * pt.x + T.d * pt.y + T.ty,
           };
-          const dA = sdfA(tp, cs, t) - (aIsRegion ? 0 : isoOffset);
-          const dB = sdfB(tp, cs, t) - (bIsRegion ? 0 : isoOffset);
+          const dA = sdfA(tp, cs, t) - (aIsRegion ? 0 : iso);
+          const dB = sdfB(tp, cs, t) - (bIsRegion ? 0 : iso);
           let result;
           if (operation === 'intersection') {
             result = weightedRIntersection(dA, dB, smoothness);
@@ -391,7 +392,11 @@ export class NodeEvaluator {
             result = weightedRUnion(dA, dB, smoothness);
           }
           const worldDist = result / scaleFactor;
-          return compMapper ? compMapper(worldDist) : worldDist;
+          // isoOffset was applied per-input for curve primitives only (converts
+          // unsigned→signed). For region-only blends apply it to the final output
+          // so the NodeCard slider expands/contracts the blend boundary visibly.
+          const finalDist = (aIsRegion && bIsRegion) ? worldDist - iso : worldDist;
+          return compMapper ? compMapper(finalDist) : finalDist;
         };
         return { result: sdfFn };
       }
@@ -732,14 +737,17 @@ export class NodeEvaluator {
           'lineSegment','triangle','arc'
         ]);
         const isCurve  = baseNode && CURVE_TYPES.has(baseNode.type);
-        const { isoOffset = 0.15 } = node.params;
-
+        // isoOffset: for curve inputs converts unsigned→signed (iso-surface at offset
+        // distance from curve). For region inputs expands/contracts the tiled boundary.
+        // Curve default 0.15 preserves existing iso-surface; region default 0 is a
+        // no-op unless the user explicitly changes the NodeCard value.
+        const isoOffset = node.params.isoOffset ?? (isCurve ? 0.15 : 0);
         return {
           result: (pt, cs = [], t = 0) => {
             const fp = fold(pt);
             // Forward z — tiling only folds XY, z passes through unchanged
             const d = baseSDF({ x: fp.x, y: fp.y, z: pt.z || 0 }, cs, t);
-            return isCurve ? d - isoOffset : d;
+            return d - isoOffset;
           }
         };
       }

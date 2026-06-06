@@ -28,7 +28,10 @@ export class SceneManager {
     this.cameraManager = new CameraManager();
     this.camera   = this.cameraManager.getCamera();
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer = new THREE.WebGLRenderer({
+      antialias:            true,
+      preserveDrawingBuffer: true,   // required for toDataURL() in PNG export
+    });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     mountElement.appendChild(this.renderer.domElement);
 
@@ -58,12 +61,20 @@ export class SceneManager {
     this.renderMode       = 'marchingSquares';
 
     // ── Animation ─────────────────────────────────────────────────────────
-    this._startTime    = performance.now();
-    this._animating    = false;
-    this._rafHandle    = null;
+        this._startTime    = performance.now();
+        this._animating    = false;
+        this._rafHandle    = null;
 
-    // ── Resize ────────────────────────────────────────────────────────────
-    window.addEventListener("resize", () => this._onResize());
+        // ── Per-frame warning suppression flags ────────────────────────────────
+        // These flags limit each warning to one
+        // occurrence per "source disappears" event rather than per frame.
+        // The flag resets to false as soon as valid source returns, so the
+        // warning will fire again if the graph becomes empty a second time.
+        this._warnedNoGLSLSource     = false;
+        this._warnedNoRayMarchSource = false;
+
+        // ── Resize ────────────────────────────────────────────────────────────
+        window.addEventListener("resize", () => this._onResize());
   }
 
 
@@ -286,23 +297,27 @@ export class SceneManager {
       }
 
       case "capsule": {
-        const count = this.activePrimitives.filter(p => p.type === 'capsule').length;
-        const prim  = new CapsulePrimitive({
-          ax: 0, ay: -1, az: 0,
-          bx: 0, by:  1, bz: 0,
-          radius: 0.5,
-          color: { h: 280, s: 0.7, l: 0.5, a: 1 }
-        });
-        stateStore.addShape(prim);
-        this._registerPrimInGraph(prim, 'capsule', {
-          ax: prim.ax, ay: prim.ay, az: prim.az,
-          bx: prim.bx, by: prim.by, bz: prim.bz,
-          radius: prim.radius,
-        });
-        entry = { instance: prim, type: 'capsule', object: prim.createObject() };
-        logger.info('Capsule primitive instantiated.');
-        break;
-      }
+    const count  = this.activePrimitives.filter(p => p.type === 'capsule').length;
+    const height = 2;
+    const posX   = (count % 3) * 2.5;
+    const posY   = 0;
+    const posZ   = 0;
+    const radius = 0.5;
+
+    const prim = new CapsulePrimitive({
+      radius,
+      height,
+      posX,
+      posY,
+      posZ,
+    });
+
+    stateStore.addShape(prim);
+    this._registerPrimInGraph(prim, 'capsule', { radius, height, posX, posY, posZ });
+    entry = { instance: prim, type: 'capsule', object: prim.createObject() };
+    logger.info('Capsule primitive instantiated.');
+    break;
+  }
 
       case "torus": {
         const count = this.activePrimitives.filter(p => p.type === 'torus').length;
@@ -379,30 +394,7 @@ export class SceneManager {
     return entry;
   }
 
-  /**
-   * Remove the most recently added primitive from the scene and state store.
-   */
-  removeLast() {
-    if (this.activePrimitives.length === 0) return;
-    const entry = this.activePrimitives.pop();
-    this._removeFromScene(entry);
-    stateStore.removeShape(entry.instance.id);
-    logger.info(`Removed last primitive (id: ${entry.instance.id}, type: ${entry.type})`);
-  }
-
-  /**
-   * Remove all active primitives from the scene and state store.
-   */
-  clearAll() {
-    this.activePrimitives.forEach(p => {
-      this._removeFromScene(p);
-      stateStore.removeShape(p.instance.id);
-    });
-    this.activePrimitives = [];
-    logger.info("Cleared all primitives.");
-  }
-
-  /**
+   /**
    * Build a SchurComposition from the given params and render it.
    * @param {Object} schurParams  - { baseIds, operations, weight, rotation, scale, posX, posY }
    * @param {Object} renderParams - { method: "contours (2D)"|"fill (2D)"|"arcs"|"surface (3D)" }
@@ -703,7 +695,13 @@ export class SceneManager {
       if (p.minorRadius !== undefined) r = Math.max(r, p.minorRadius);
       if (p.size !== undefined)        r = Math.max(r, p.size);
       if (p.width !== undefined)       r = Math.max(r, p.width  / 2);
-      if (p.height !== undefined)      r = Math.max(r, p.height / 2);
+      if (p.height !== undefined) {
+      if (node.type === 'capsule') {
+        r = Math.max(r, (p.height / 2) + (p.radius ?? 0));
+      } else {
+        r = Math.max(r, p.height / 2);
+      }
+    }
       if (p.depth !== undefined)       r = Math.max(r, p.depth  / 2);
 
       minX = Math.min(minX, cx - r);
@@ -757,6 +755,17 @@ export class SceneManager {
     searchBounds = [-20, -20, 20, 20],
     gridSize     = 30
   ) {
+    // Pass 1: fine search within normal scene bounds.
+    // Catches thin features (crescents, narrow intersections) that the coarser
+    // large-area grid misses. Step ≈ 12/60 = 0.2 units.
+    const fineResult = this._runCoarseGrid(sdfFn, [-6, -6, 6, 6], 60);
+    if (fineResult) return fineResult;
+
+    // Pass 2: coarser search over the full large area for displaced geometry.
+    return this._runCoarseGrid(sdfFn, searchBounds, gridSize);
+  }
+
+  _runCoarseGrid(sdfFn, searchBounds, gridSize) {
     const [sMinX, sMinY, sMaxX, sMaxY] = searchBounds;
     const stepX = (sMaxX - sMinX) / gridSize;
     const stepY = (sMaxY - sMinY) / gridSize;
@@ -1077,19 +1086,43 @@ export class SceneManager {
 
   /**
    * Compile and render the current node graph using the GLSL pipeline.
-   * Called by NodeCanvas when the user switches to GLSL mode or
-   * after a compose/rerender in GLSL mode.
+   * Called by the animation loop on every frame when renderMode === 'glsl',
+   * and explicitly after a compose or param change in GLSL mode.
+   *
+   * _graphIsRenderable() is checked first so that frames where the graph
+   * is empty or incompletely wired exit immediately with no computation
+   * and no console output. The warning below only fires when the graph
+   * is fully wired but generation still returned nothing — which is a
+   * genuine unexpected condition worth reporting.
    */
   _renderGLSL() {
     const time = (performance.now() - this._startTime) / 1000;
+
+    // Exit silently if the graph is in any state where generation cannot
+    // produce meaningful output (no nodes, no output node, output unwired).
+    // This prevents the animation loop from calling generate() and emitting
+    // a warning on every frame when the graph is empty — a situation that
+    // occurs normally after stateStore.clear() or mid-construction.
+    if (!this._graphIsRenderable()) return;
+
     const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '2d');
 
     if (!source || !rootFn) {
-      console.warn('SDFRenderer: GLSLEvaluator produced no source — nothing to render.');
+      // _graphIsRenderable() confirmed the graph is wired, so a null result
+      // from generate() is unexpected. This indicates an unsupported node
+      // type, a broken evaluator path, or a graph structure that the GLSL
+      // evaluator cannot currently handle.
+      console.warn(
+        'SDFRenderer: graph is wired but GLSLEvaluator produced no source. ' +
+        'Check that all nodes between the geometry and the output node are ' +
+        'of supported types and that their ports are correctly connected.'
+      );
       return;
     }
 
-    // Only recompile if the source changed
+    // Only recompile if the source has changed since the last frame.
+    // Recompilation is expensive; skipping it when the source is identical
+    // keeps the frame rate stable when the graph is not being edited.
     if (source !== this._lastGLSLSource) {
       const result = this.sdfRenderer.compile(source);
       if (!result.ok) {
@@ -1105,19 +1138,49 @@ export class SceneManager {
 
   /**
    * Compile and render using the ray march renderer.
-   * Requires 3D GLSL templates in GLSLEvaluator (Phase 5d).
-   * For now syncs camera from Three.js and renders with existing shader.
+   * Called by the animation loop on every frame when renderMode === 'rayMarch'.
+   *
+   * _graphIsRenderable() is checked before any call to generate() so that
+   * frames where the graph is empty or incompletely wired produce no output
+   * and no console noise. The warning block below this check only fires
+   * when the graph is fully wired but 3D generation still returned nothing,
+   * which is a genuine unexpected condition worth surfacing.
+   *
+   * Step quality is adapted automatically based on which SDF operations
+   * appear in the generated source string. Non-Lipschitz operations (rDifference,
+   * space-warping transforms) require smaller step sizes and more iterations
+   * than clean union/intersection scenes. The required maxSteps value is baked
+   * into the GLSL loop bound, so changes to it force a full shader recompile.
    */
-  _renderRayMarch() {
+    _renderRayMarch() {
     const time = (performance.now() - this._startTime) / 1000;
+
+    // Exit silently if the graph has no nodes, no output node, or the
+    // output node has no incoming connections. All three are expected states
+    // that occur during normal operation and should not produce console output.
+    // Without this guard the animation loop calls generate() and emits a
+    // warning on every frame (~60 fps) whenever the graph is empty —
+    // for example after stateStore.clear() or while the user has not yet
+    // wired any geometry to the output node.
+    if (!this._graphIsRenderable()) return;
+
     const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
 
     if (!source || !rootFn) {
-      console.warn('RayMarchRenderer: no source from GLSLEvaluator.');
+      // _graphIsRenderable() confirmed the graph is wired, so a null result
+      // from generate() is unexpected. Likely causes: a node type in the
+      // graph is not supported in 3D mode, or the 3D GLSL template for a
+      // transform or blend type has not yet been implemented.
+      console.warn(
+        'RayMarchRenderer: graph is wired but GLSLEvaluator produced no 3D source. ' +
+        'Check that all nodes in the graph are supported in 3D ray march mode ' +
+        'and that their ports are correctly connected to the output node.'
+      );
       return;
     }
 
     // ── Step quality adaptation for non-Lipschitz SDFs ───────────────────
+    //
     // rDifference and schurBlend(difference) use the Lp-norm formula:
     //   a − b + (|a|^p + |b|^p)^(1/p)
     // Near the inner boundary of the subtracted shape, b ≈ 0 and the Lp
@@ -1134,7 +1197,9 @@ export class SceneManager {
     // _maxSteps is baked into the GLSL loop bound, so changing it requires
     // recompilation. We detect the change and clear _lastRayMarchSource to
     // force that recompile BEFORE the compile check below.
+    //
     // ── Detect scene complexity for sphere-tracing quality ────────────────
+    //
     // Non-Lipschitz operations — the SDF gradient can exceed 1, causing
     // standard sphere-tracing steps to overshoot the surface.
     //
@@ -1183,7 +1248,9 @@ export class SceneManager {
     }
 
     if (this.rayMarchRenderer._maxSteps !== targetMaxSteps) {
-      // _maxSteps is a loop bound baked into the shader — force recompile
+      // _maxSteps is a loop bound baked into the shader — changing it
+      // requires a full recompile. Clearing _lastRayMarchSource here
+      // ensures the compile check below treats the source as changed.
       this.rayMarchRenderer._maxSteps = targetMaxSteps;
       this._lastRayMarchSource = null;
     }
@@ -1272,10 +1339,17 @@ export class SceneManager {
         break;
       }
       case 'capsule': {
-        prim = new CapsulePrimitive({ id, ax: p.ax ?? 0, ay: p.ay ?? -1, az: p.az ?? 0, bx: p.bx ?? 0, by: p.by ?? 1, bz: p.bz ?? 0, radius: p.radius ?? 0.5 });
-        type = 'capsule';
-        break;
-      }
+      prim = new CapsulePrimitive({
+        id,
+        radius: p.radius ?? 0.5,
+        height: p.height ?? 2,
+        posX:   p.posX   ?? 0,
+        posY:   p.posY   ?? 0,
+        posZ:   p.posZ   ?? 0,
+      });
+      type = 'capsule';
+      break;
+    }
       case 'torus': {
         prim = new TorusPrimitive({ id, majorRadius: p.majorRadius ?? 2, minorRadius: p.minorRadius ?? 0.5, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
         type = 'torus';
@@ -1318,6 +1392,76 @@ export class SceneManager {
     if (!graph.nodes.has(prim.id)) {
       graph.addNode(nodeType, params, { x: 0, y: 0 }, prim.id);
     }
+  }
+
+
+  
+  /**
+   * Returns true only when the graph is in a state where GLSL generation
+   * is worth attempting — meaning an output node exists AND has at least
+   * one incoming connection on its 'sdf' port.
+   *
+   * This method is called at the top of _renderGLSL() and _renderRayMarch()
+   * before any call to glslEvaluator.generate(). Both of those methods are
+   * called by the animation loop on every frame (~60 fps). Without this
+   * guard, every frame where the graph is empty or incompletely wired would
+   * call generate(), get nothing back, and emit a console warning — producing
+   * hundreds of warnings per second during normal states such as canvas
+   * cleared, mid-construction, or right after stateStore.clear().
+   *
+   * The check intentionally costs very little: two Map iterations and a
+   * single array-length check. It returns early as soon as any condition
+   * fails, so the common empty-graph case exits after the first check.
+   *
+   * Four distinct graph states and their expected behaviour:
+   *
+   *   State 1 — graph has no nodes at all.
+   *     The canvas was just cleared or the app just started.
+   *     Expected: silent return, no warning. This is normal.
+   *
+   *   State 2 — graph has nodes but no output node.
+   *     The user has added primitives or blends but has not yet added
+   *     (or the load path has not yet created) an output node.
+   *     Expected: silent return, no warning. Still normal mid-construction.
+   *
+   *   State 3 — output node exists but its 'sdf' port has no incoming edges.
+   *     The user has added a primitive and an output node but has not yet
+   *     connected them.
+   *     Expected: silent return, no warning. Still normal mid-construction.
+   *
+   *   State 4 — output node exists AND has at least one incoming sdf edge.
+   *     The graph is fully wired. Generation should succeed.
+   *     If generate() still returns null, something is wrong with the
+   *     evaluator or with the node types in the graph. In this state only
+   *     does the caller emit a warning.
+   *     Expected: attempt generation; warn if it returns nothing.
+   *
+   * @returns {boolean}
+   */
+  _graphIsRenderable() {
+    // Always read from the evaluator's current graph reference so this check
+    // sees the same graph that generate() will read from.
+    const graph = this.glslEvaluator?.graph ?? stateStore.nodeGraph;
+
+    // State 1: no graph object at all, or graph has zero nodes.
+    if (!graph || graph.nodes.size === 0) return false;
+
+    // State 2: locate the output node.
+    let outputNode = null;
+    graph.nodes.forEach(node => {
+      if (node.type === 'outputNode') outputNode = node;
+    });
+    if (!outputNode) return false;
+
+    // State 3: output node exists but has no incoming sdf connections.
+    // getAllIncomingEdges returns every edge whose toPort matches 'sdf'
+    // and whose toNode matches the output node id. An empty result means
+    // no geometry has been wired to the output yet.
+    const incoming = graph.getAllIncomingEdges?.(outputNode.id, 'sdf') ?? [];
+    if (incoming.length === 0) return false;
+
+    // State 4: output node is present and wired — generation is warranted.
+    return true;
   }
 
   _ensureOutputNode() {
