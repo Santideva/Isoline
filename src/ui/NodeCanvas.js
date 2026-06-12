@@ -47,6 +47,7 @@
     import { SchurComposition } from '../Primitives/SchurComposition.js';
     import { saveScene, loadScene, listScenes } from '../persistence.js';
     import { UndoManager } from '../state/UndoManager.js';
+    import { PRESETS } from '../presets/presets.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
@@ -61,7 +62,8 @@
     'affineTransform', 'tilingNode', 'mobiusNode',
     'symmetryFoldNode', 'symmetryOrbitNode',
     'timeNode', 'oscillatorNode',
-    'outputNode',
+    // outputNode is intentionally excluded — it is managed automatically
+    // by the Render and mode-switch buttons and is never shown as a card.
     ]);
 
     /**
@@ -171,28 +173,42 @@ function _isConvexPolygon(vertices) {
         this._overlay.id = 'node-canvas-overlay';
         this._overlay.style.cssText = `
         position: fixed;
-        inset: 0;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
         z-index: 1000;
         background: transparent;
         display: none;
         flex-direction: column;
         font-family: var(--font-sans, sans-serif);
         pointer-events: none;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+        box-sizing: border-box;
         `;
 
         // ── Toolbar ───────────────────────────────────────────────────────────
         const toolbar = document.createElement('div');
         toolbar.style.cssText = `
-        height: 44px;
-        background: rgba(12,12,14,0.92);
-        border-bottom: 1px solid rgba(255,255,255,0.08);
+        height: 52px;
+        background: rgba(12,12,14,0.96);
+        border-bottom: 1px solid rgba(255,255,255,0.10);
         display: flex;
         align-items: center;
-        padding: 0 10px;
-        gap: 5px;
+        padding: 0 12px;
+        gap: 6px;
         flex-shrink: 0;
         pointer-events: auto;
-        backdrop-filter: blur(4px);
+        backdrop-filter: blur(6px);
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255,255,255,0.15) transparent;
+        min-width: 0;
+        box-sizing: border-box;
+        width: 100%;
         `;
 
         // ── Shared toolbar utilities ───────────────────────────────────────────
@@ -417,6 +433,26 @@ function _isConvexPolygon(vertices) {
         toolbar.appendChild(_clearBtn);
 
     
+        // ── Graph status label ────────────────────────────────────────────────
+        // Persistent warning indicator in the toolbar. Visible only when the
+        // scene has no geometry primitives (the minimum condition for any render
+        // to be meaningful). Hidden as soon as a primitive is added.
+        // Controlled exclusively by _updateGraphStatusLabel().
+        this._graphStatusLabel = document.createElement('span');
+        this._graphStatusLabel.style.cssText = `
+            font-size: 11px;
+            padding: 3px 10px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,180,60,0.45);
+            background: rgba(255,160,30,0.12);
+            color: rgba(255,210,120,0.95);
+            white-space: nowrap;
+            pointer-events: none;
+            flex-shrink: 0;
+        `;
+        this._graphStatusLabel.textContent = '⚠ Add a primitive to render';
+        toolbar.appendChild(this._graphStatusLabel);
+
         // Operation defaults (used by legacy _compose() only)
         this._composeOperation = 'union';
 
@@ -426,10 +462,22 @@ function _isConvexPolygon(vertices) {
         // GLSL and ray march modes render automatically every animation frame;
         // the CPU path must be triggered explicitly because it is blocking and
         // can be slow on complex scenes.
-        const _composeBtn = this._makeButton('⬡ Render', () => this._compose());
-        _composeBtn.title = 'Render the current scene via CPU marching squares';
-        _composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
-        toolbar.appendChild(_composeBtn);
+        this._composeBtn = this._makeButton('⬡ Render', () => this._renderWithAutoOutput());
+        this._composeBtn.title = 'Render the current scene via CPU marching squares';
+        this._composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
+        toolbar.appendChild(this._composeBtn);
+
+        // Gear button — opens the output settings popover (Option 1).
+        // Shares _buildOutputControls() with the bottom drawer so both UIs
+        // always show identical controls at the same values.
+        this._gearBtn = this._makeButton('⚙', () => this._toggleOutputPopover(this._gearBtn));
+        this._gearBtn.title = 'Configure CPU render output settings';
+        this._gearBtn.style.cssText += `
+            padding: 4px 7px;
+            border-color: rgba(150,130,255,0.3);
+            color: rgba(200,185,255,0.75);
+        `;
+        toolbar.appendChild(this._gearBtn);
 
         // "Lines" slider — controls iso-contour step size in GLSL mode.
         // Smaller value → denser contour lines; larger → fewer, spaced further.
@@ -459,11 +507,31 @@ function _isConvexPolygon(vertices) {
         toolbar.appendChild(this._isoSlider);
 
         // Render mode toggle (cycles marchingSquares → glsl → rayMarch)
-        this._renderModeBtn = this._makeButton('⬛ GLSL Mode', () => this._toggleRenderMode());
+        this._renderModeBtn = this._makeButton('⬛ GLSL Mode', () => {
+          // Guard: if no geometry exists the button is greyed out and the
+          // click is a no-op. _updateGraphStatusLabel() controls the visual
+          // disabled state; this guard is belt-and-braces.
+          if (!this._sceneHasGeometry()) return;
+          // Ensure output node exists and all chain tails are wired before
+          // switching mode — the GLSL and ray march renderers both read from
+          // the output node to find the root SDF.
+          this._ensureOutputWired();
+          this._toggleRenderMode();
+        });
         this._renderModeBtn.style.cssText += 'border-color: rgba(80,200,120,0.4); color: rgba(160,255,180,0.9);';
         toolbar.appendChild(this._renderModeBtn);
 
             
+
+        // ── Presets button ────────────────────────────────────────────────────
+        // Opens a small panel listing the three V1 example scenes.
+        // Each preset loads a complete graph and switches to the correct render mode.
+        const _presetsBtn = this._makeButton('⬡ Examples', () =>
+            this._togglePresetPanel(_presetsBtn)
+        );
+        _presetsBtn.title = 'Load an example scene';
+        _presetsBtn.style.cssText += 'border-color: rgba(100,200,255,0.35); color: rgba(180,230,255,0.9);';
+        toolbar.appendChild(_presetsBtn);
         // ── Section 5: FILE ───────────────────────────────────────────────────
         const saveBtn = this._makeButton('💾 Save', async () => {
       const name = prompt('Scene name:', 'autosave');
@@ -550,6 +618,21 @@ function _isConvexPolygon(vertices) {
         this._runAutoLayout();
         this._drawEdges();
         this._fitToScreen();
+
+        // Sync drawer and popover controls with the loaded output node params.
+        // The output node was deserialized by loadScene() so its params now
+        // reflect the saved values. Push those values to both UIs so the
+        // controls display the correct state immediately after load.
+        ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+            this._syncOutputControls(k, this._getOutputParam(k));
+        });
+        // Also populate _pendingOutputParams so values are preserved if the
+        // user edits settings before clicking Render after a load
+        if (!this._pendingOutputParams) this._pendingOutputParams = {};
+        ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+            this._pendingOutputParams[k] = this._getOutputParam(k);
+        });
+        this._updateGraphStatusLabel();
 
         // Restore the render mode that was active when the scene was saved
         if (savedMode === 'rayMarch') {
@@ -724,6 +807,109 @@ function _isConvexPolygon(vertices) {
         
         // ── Pan/zoom on canvas area ───────────────────────────────────────────
         this._attachPanZoom(canvasArea);
+
+        // ── Bottom drawer — render / output settings (Option 2) ───────────────
+        // Built here so it is part of the overlay flex column and naturally
+        // sits below the canvas area. Visibility is controlled by
+        // _updateGraphStatusLabel() — hidden when no geometry exists.
+        this._buildOutputDrawer();
+    }
+
+    /**
+     * Build and append the persistent bottom drawer to the overlay.
+     * The drawer is a thin horizontal strip containing the four output node
+     * parameters as inline labelled controls. It appears only when the scene
+     * has at least one geometry primitive.
+     *
+     * The drawer never shows when the scene is empty so it cannot mislead
+     * the user into thinking settings are active when nothing will render.
+     */
+    _buildOutputDrawer() {
+        const drawer = document.createElement('div');
+        drawer.id = 'nc-output-drawer';
+        drawer.style.cssText = `
+            height: 40px;
+            background: rgba(12,12,18,0.94);
+            border-top: 1px solid rgba(255,255,255,0.08);
+            display: none;
+            align-items: center;
+            padding: 0 16px;
+            gap: 16px;
+            flex-shrink: 0;
+            pointer-events: auto;
+            backdrop-filter: blur(4px);
+            overflow-x: auto;
+            overflow-y: hidden;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.15) transparent;
+            min-width: 0;
+            box-sizing: border-box;
+            width: 100%;
+        `;
+
+        // Section heading — makes clear these are global render settings,
+        // not per-node parameters
+        const heading = document.createElement('span');
+        heading.textContent = 'Render settings';
+        heading.style.cssText = `
+            font-size: 10px;
+            opacity: 0.4;
+            white-space: nowrap;
+            flex-shrink: 0;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: rgba(220,220,230,0.9);
+        `;
+        drawer.appendChild(heading);
+
+        // Visual divider
+        const div0 = document.createElement('div');
+        div0.style.cssText = `
+            width: 1px;
+            height: 20px;
+            background: rgba(255,255,255,0.1);
+            flex-shrink: 0;
+        `;
+        drawer.appendChild(div0);
+
+        // Scope note — reminds the user these only affect the CPU path
+        const note = document.createElement('span');
+        note.textContent = 'CPU path only · GLSL and Ray March use canvas resolution';
+        note.style.cssText = `
+            font-size: 10px;
+            opacity: 0.28;
+            white-space: nowrap;
+            flex-shrink: 0;
+            font-style: italic;
+            color: rgba(220,220,230,0.8);
+        `;
+        drawer.appendChild(note);
+
+        // Visual divider
+        const div1 = document.createElement('div');
+        div1.style.cssText = `
+            width: 1px;
+            height: 20px;
+            background: rgba(255,255,255,0.1);
+            flex-shrink: 0;
+        `;
+        drawer.appendChild(div1);
+
+        // Controls row — flex row so all four controls sit inline
+        const controlsRow = document.createElement('div');
+        controlsRow.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+        `;
+        controlsRow.appendChild(this._buildOutputControls('drawer'));
+        drawer.appendChild(controlsRow);
+
+        this._overlay.appendChild(drawer);
+        this._outputDrawer = drawer;
     }
 
     _makeButton(text, onClick) {
@@ -777,12 +963,13 @@ function _isConvexPolygon(vertices) {
         this._viewportDragAttached = true;
         }
 
-        // Auto-layout on first open, or if new nodes have been added at origin
+    // Auto-layout on first open, or if new nodes have been added at origin
         this._rebuildCards();
         if (needsLayout(this.stateStore.nodeGraph)) {
         this._runAutoLayout();
         }
         this._drawEdges();
+        this._updateGraphStatusLabel();
         // Always fit to screen on open so all cards are visible
         requestAnimationFrame(() => this._fitToScreen());
     }
@@ -1317,10 +1504,11 @@ function _isConvexPolygon(vertices) {
         this.sceneManager._lastGLSLSource = null;
         this.sceneManager._lastRayMarchSource = null;
 
-        // 5. Rebuild the canvas
+      // 5. Rebuild the canvas
         setTimeout(() => {
           this._rebuildCards();
           this._drawEdges();
+          this._updateGraphStatusLabel();
         }, 50);
     }
 
@@ -1330,34 +1518,28 @@ function _isConvexPolygon(vertices) {
    * The user must drag-connect two source branches into sdfA and sdfB,
    * then drag-connect the result port to Output or the next node.
    */
-  _addBlendNode(type) {
-    this._undo.snapshot();
-    const graph  = this.stateStore.nodeGraph;
-    const params = {
-      schurBlend:    { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
-      rUnion:        { smoothness: 8 },
-      rIntersection: { smoothness: 8 },
-      rDifference:   { smoothness: 8 },
-    }[type] || {};
+    _addBlendNode(type) {
+      // Blend nodes require explicit wiring by the user — they have two input
+      // ports (sdfA, sdfB) and one result port. The output node is NOT created
+      // or wired here; that happens automatically when the user clicks Render
+      // or a mode-switch button.
+      this._undo.snapshot();
+      const graph  = this.stateStore.nodeGraph;
+      const params = {
+        schurBlend:    { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
+        rUnion:        { smoothness: 8 },
+        rIntersection: { smoothness: 8 },
+        rDifference:   { smoothness: 8 },
+      }[type] || {};
 
-    const newNode = graph.addNode(type, params);
+      const newNode = graph.addNode(type, params);
 
-    // Always ensure the output node exists so Compose and the GLSL button
-    // can find it. The output node is the terminal of every valid graph.
-    this.sceneManager._ensureOutputNode();
-
-    console.info(
-      `Blend node "${type}" added (id:${newNode.id}).\n` +
-      `  → Drag the blue output dot of one shape to the orange sdfA port.\n` +
-      `  → Drag the blue output dot of another shape to the orange sdfB port.\n` +
-      `  → Drag the blue result port to the orange sdf port of Output.`
-    );
-
-    setTimeout(() => {
-      this._runAutoLayout();
-      this._drawEdges();
-    }, 50);
-  }
+      setTimeout(() => {
+        this._runAutoLayout();
+        this._drawEdges();
+        this._updateGraphStatusLabel();
+      }, 50);
+    }
 
     _addTransformNode(type) {
     // ── V1 dimensional constraint guard ───────────────────────────────────────
@@ -1623,75 +1805,280 @@ function _isConvexPolygon(vertices) {
       );
     }
 
-    // ── Wire new transform → output ────────────────────────────────────────
-    // Determine whether to connect the new transform to the output node.
-    // We do this in three scenarios:
+    // ── Output node is NOT touched here ────────────────────────────────────
+    // The output node is created and wired automatically when the user
+    // clicks Render or a mode-switch button. _addTransformNode only wires
+    // primitives and transforms together into chains; it never reaches the
+    // output node. This keeps the output node lifecycle entirely owned by
+    // the render path.
     //
-    //   Scenario A: The old chain tail was already connected to output.
-    //     In this case the user had a working chain ending at output.
-    //     We remove the old tail→output edge and replace it with
-    //     newNode→output so the chain continues to reach the output.
-    //     Example: sphere→noise→output. User adds twist after noise.
-    //     Result should be: sphere→noise→twist→output.
-    //     Without this, the chain would be sphere→noise→twist (dangling)
-    //     and sphere→noise→output (still present, wrong).
-    //
-    //   Scenario B: Nothing is connected to output yet.
-    //     The new transform becomes the first thing wired to output.
-    //     This happens when the user adds a transform to a fresh scene.
-    //
-    //   Scenario C: Output is already wired from a different branch.
-    //     Do not touch output — the user has a deliberate multi-branch
-    //     scene and must wire manually.
+    // Exception: if an output node already exists from a previous render
+    // (e.g. after undo/redo or scene load) and the chain tail was previously
+    // wired to it, we repair that edge here so an existing working graph
+    // stays valid after a transform is inserted mid-chain.
+    const existingOutNode = (() => {
+      let found = null;
+      graph.nodes.forEach(n => { if (n.type === 'outputNode') found = n; });
+      return found;
+    })();
 
-    const outNode   = this.sceneManager._ensureOutputNode();
-    const outEdges  = graph.getAllIncomingEdges(outNode.id, 'sdf') || [];
-
-    // Scenario A: was the chain tail previously wired to output?
-    const tailWasToOutput = chainTailId
-      ? outEdges.some(e => e.fromNode === chainTailId)
-      : false;
-
-    // Scenario B: is output completely unconnected?
-    const outputIsEmpty = outEdges.length === 0;
-
-    if (tailWasToOutput) {
-      // Remove the old tail→output edge before adding newNode→output.
-      const oldEdge = outEdges.find(e => e.fromNode === chainTailId);
-      if (oldEdge) {
-        graph.removeEdge(oldEdge.id);
-        console.log(
-          `Removed old edge: ${chainTailId}(${chainTailPort}) → output`
-        );
+    if (existingOutNode && chainTailId) {
+      const outEdges = graph.getAllIncomingEdges(existingOutNode.id, 'sdf') || [];
+      const tailWasToOutput = outEdges.some(e => e.fromNode === chainTailId);
+      if (tailWasToOutput) {
+        // The chain tail was wired to output before we inserted this transform.
+        // Remove the stale tail→output edge and re-wire newNode→output so the
+        // chain continues to reach the output without user intervention.
+        const oldEdge = outEdges.find(e => e.fromNode === chainTailId);
+        if (oldEdge) {
+          graph.removeEdge(oldEdge.id);
+        }
+        try {
+          graph.addEdge(newNode.id, 'result', existingOutNode.id, 'sdf');
+        } catch(e) { /* edge already exists */ }
       }
-      try {
-        graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
-        console.log(
-          `Auto-wired: ${newNode.id}(result) → output(sdf) [replaced tail]`
-        );
-      } catch(e) { /* edge exists, fine */ }
-    } else if (outputIsEmpty) {
-      // Nothing wired to output — connect new node as the first output source.
-      try {
-        graph.addEdge(newNode.id, 'result', outNode.id, 'sdf');
-        console.log(
-          `Auto-wired: ${newNode.id}(result) → output(sdf) [first connection]`
-        );
-      } catch(e) { /* fine */ }
-    } else {
-      // Scenario C: output already has connections from other branches.
-      // Do not auto-wire — inform the user.
-      console.info(
-        `Output already wired from another branch. ` +
-        `Connect ${newNode.id} to output manually if needed.`
-      );
     }
 
     setTimeout(() => {
       this._runAutoLayout();
       this._drawEdges();
+      this._updateGraphStatusLabel();
     }, 50);
   }
+
+    /**
+     * Build the four output parameter controls and return a DocumentFragment.
+     * Called by both _buildOutputDrawer() (Option 2) and _toggleOutputPopover()
+     * (Option 1) so the controls are always structurally identical and share
+     * the same data-output-param attribute contract used by _syncOutputControls().
+     *
+     * Each interactive element carries:
+     *   data-output-param="<paramName>"         — read/written by _syncOutputControls
+     *   data-output-param-display="<paramName>" — value readout span
+     *
+     * @param {'drawer'|'popover'} context
+     *   Controls layout density: drawer uses tighter margins for the horizontal
+     *   strip; popover uses more generous vertical spacing.
+     * @returns {DocumentFragment}
+     */
+    _buildOutputControls(context) {
+        const frag = document.createDocumentFragment();
+        const isDrawer = context === 'drawer';
+
+        // ── Row builder ───────────────────────────────────────────────────────
+        // Creates one labelled control row and appends it to the fragment.
+        const _row = (labelText, controlEl, displayEl, hint) => {
+            const row = document.createElement('div');
+            row.style.cssText = `
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: ${isDrawer ? '0' : '10px'};
+                ${isDrawer ? 'flex-shrink: 0;' : ''}
+            `;
+
+            const lbl = document.createElement('label');
+            lbl.textContent = labelText;
+            lbl.title = hint;
+            lbl.style.cssText = `
+                font-size: 11px;
+                opacity: 0.75;
+                min-width: ${isDrawer ? '76px' : '92px'};
+                flex-shrink: 0;
+                cursor: help;
+                white-space: nowrap;
+                color: rgba(220,220,230,0.9);
+            `;
+
+            row.appendChild(lbl);
+            row.appendChild(controlEl);
+            if (displayEl) row.appendChild(displayEl);
+            frag.appendChild(row);
+        };
+
+        // ── Value readout builder ─────────────────────────────────────────────
+        const _display = (paramName, formatter) => {
+            const sp = document.createElement('span');
+            sp.dataset.outputParamDisplay = paramName;
+            const raw = this._getOutputParam(paramName);
+            sp.textContent = formatter ? formatter(raw) : raw;
+            sp.style.cssText = `
+                font-size: 10px;
+                opacity: 0.8;
+                min-width: 34px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+                flex-shrink: 0;
+                color: rgba(220,220,230,0.85);
+            `;
+            return sp;
+        };
+
+        // ── 1. Render method ──────────────────────────────────────────────────
+        // Controls which CPU marching-squares pipeline runs when the user
+        // clicks ⬡ Render. Has no effect on GLSL or Ray March modes.
+        const methodSel = document.createElement('select');
+        methodSel.dataset.outputParam = 'renderMethod';
+        methodSel.style.cssText = `
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 4px;
+            color: rgba(220,220,230,0.9);
+            font-size: 11px;
+            padding: 2px 4px;
+            flex: 1;
+            min-width: 0;
+            cursor: pointer;
+        `;
+        [
+            ['contours (2D)', 'Contours — iso-lines (2D)'],
+            ['fill (2D)',     'Fill — solid regions (2D)'],
+            ['arcs',          'Arcs — fitted arc segments (2D)'],
+            ['surface (3D)',  'Surface mesh (3D, slow)'],
+        ].forEach(([val, label]) => {
+            const o = document.createElement('option');
+            o.value       = val;
+            o.textContent = label;
+            o.style.backgroundColor = '#1c1c22';
+            o.style.color           = 'rgba(220,220,230,0.95)';
+            if (val === this._getOutputParam('renderMethod')) o.selected = true;
+            methodSel.appendChild(o);
+        });
+        methodSel.addEventListener('change', () =>
+            this._setOutputParam('renderMethod', methodSel.value)
+        );
+        _row(
+            'Render as',
+            methodSel,
+            null,
+            'CPU render style — controls how the marching-squares output is drawn.\n' +
+            'Contours: iso-lines (fastest).\n' +
+            'Fill: solid filled regions.\n' +
+            'Arcs: arc-fitted contours.\n' +
+            'Surface (3D): marching-cubes mesh (slowest).\n' +
+            'This setting has NO effect in GLSL or Ray March mode.'
+        );
+
+        // ── 2. Resolution ─────────────────────────────────────────────────────
+        // The marching-squares grid density. Higher values produce more detail
+        // at the cost of render time. Only affects the CPU render path.
+        const resSlider = document.createElement('input');
+        resSlider.type                = 'range';
+        resSlider.dataset.outputParam = 'resolution';
+        resSlider.min   = '20';
+        resSlider.max   = '400';
+        resSlider.step  = '10';
+        resSlider.value = this._getOutputParam('resolution');
+        resSlider.style.cssText = `
+            flex: 1;
+            min-width: 0;
+            height: 14px;
+            accent-color: #378ADD;
+            cursor: pointer;
+        `;
+        const resDisplay = _display('resolution', v => Math.round(v));
+        resSlider.addEventListener('mousedown', () => {
+            if (this._undo) this._undo.snapshot();
+        });
+        resSlider.addEventListener('input', () => {
+            const v = parseInt(resSlider.value, 10);
+            resDisplay.textContent = v;
+            this._setOutputParam('resolution', v);
+        });
+        _row(
+            'CPU resolution',
+            resSlider,
+            resDisplay,
+            'Marching-squares grid density (20 – 400).\n' +
+            'Higher = more detail, slower CPU render.\n' +
+            'Has no effect in GLSL or Ray March mode.\n' +
+            'Default: 150.'
+        );
+
+        // ── 3. Scan bounds min ────────────────────────────────────────────────
+        // The left/bottom edge of the world-space window the CPU evaluator
+        // scans. Shapes outside [boundsMin, boundsMax] are invisible in CPU
+        // renders. The render path auto-expands this when primitives are placed
+        // outside the current window, but the user can set it manually too.
+        const bMinSlider = document.createElement('input');
+        bMinSlider.type                = 'range';
+        bMinSlider.dataset.outputParam = 'boundsMin';
+        bMinSlider.min   = '-20';
+        bMinSlider.max   = '0';
+        bMinSlider.step  = '0.5';
+        bMinSlider.value = this._getOutputParam('boundsMin');
+        bMinSlider.style.cssText = `
+            flex: 1;
+            min-width: 0;
+            height: 14px;
+            accent-color: #378ADD;
+            cursor: pointer;
+        `;
+        const bMinDisplay = _display('boundsMin', v => parseFloat(v).toFixed(1));
+        bMinSlider.addEventListener('mousedown', () => {
+            if (this._undo) this._undo.snapshot();
+        });
+        bMinSlider.addEventListener('input', () => {
+            const v        = parseFloat(bMinSlider.value);
+            const maxVal   = this._getOutputParam('boundsMax');
+            // Prevent min from meeting or exceeding max
+            const clamped  = Math.min(v, maxVal - 0.5);
+            bMinSlider.value          = clamped;
+            bMinDisplay.textContent   = clamped.toFixed(1);
+            this._setOutputParam('boundsMin', clamped);
+        });
+        _row(
+            'Scan min',
+            bMinSlider,
+            bMinDisplay,
+            'Left / bottom edge of the CPU scan window (world units).\n' +
+            'Primitives placed below or left of this value will not appear\n' +
+            'in CPU renders. The render path auto-expands this value when\n' +
+            'primitives are outside the current bounds.\n' +
+            'Range: -20 … 0. Default: -4.'
+        );
+
+        // ── 4. Scan bounds max ────────────────────────────────────────────────
+        const bMaxSlider = document.createElement('input');
+        bMaxSlider.type                = 'range';
+        bMaxSlider.dataset.outputParam = 'boundsMax';
+        bMaxSlider.min   = '0';
+        bMaxSlider.max   = '20';
+        bMaxSlider.step  = '0.5';
+        bMaxSlider.value = this._getOutputParam('boundsMax');
+        bMaxSlider.style.cssText = `
+            flex: 1;
+            min-width: 0;
+            height: 14px;
+            accent-color: #378ADD;
+            cursor: pointer;
+        `;
+        const bMaxDisplay = _display('boundsMax', v => parseFloat(v).toFixed(1));
+        bMaxSlider.addEventListener('mousedown', () => {
+            if (this._undo) this._undo.snapshot();
+        });
+        bMaxSlider.addEventListener('input', () => {
+            const v        = parseFloat(bMaxSlider.value);
+            const minVal   = this._getOutputParam('boundsMin');
+            // Prevent max from meeting or falling below min
+            const clamped  = Math.max(v, minVal + 0.5);
+            bMaxSlider.value          = clamped;
+            bMaxDisplay.textContent   = clamped.toFixed(1);
+            this._setOutputParam('boundsMax', clamped);
+        });
+        _row(
+            'Scan max',
+            bMaxSlider,
+            bMaxDisplay,
+            'Right / top edge of the CPU scan window (world units).\n' +
+            'Primitives placed above or right of this value will not appear\n' +
+            'in CPU renders. The render path auto-expands this value when\n' +
+            'primitives are outside the current bounds.\n' +
+            'Range: 0 … 20. Default: 4.'
+        );
+
+        return frag;
+    }
 
     _compose() {
     // Compose renders whatever the node graph currently describes.
@@ -1755,10 +2142,13 @@ function _isConvexPolygon(vertices) {
     this.sceneManager.rayMarchRenderer?._canvas &&
       (this.sceneManager.rayMarchRenderer._canvas.style.display = 'none');
 
-    // Render
+// Render — use the method selected in the output drawer / gear popover.
+    // _getOutputParam reads from _pendingOutputParams first, then the live
+    // output node, then falls back to the NodeSpec default 'contours (2D)'.
     try {
-      this.sceneManager.renderSDF(sdf, 'contours (2D)');
-      console.log('Compose: rendered via CPU marching squares');
+      const method = this._getOutputParam('renderMethod');
+      this.sceneManager.renderSDF(sdf, method);
+      console.log(`Compose: rendered via CPU — method: ${method}`);
     } catch(e) {
       console.error('Compose: render error:', e.message);
     }
@@ -1779,6 +2169,124 @@ function _isConvexPolygon(vertices) {
         });
     }
 
+    // ── Output parameter management ───────────────────────────────────────────
+    //
+    // These three methods are the single point of truth for reading and writing
+    // output node parameters. Both the bottom drawer (Option 2) and the gear
+    // popover (Option 1) call _setOutputParam() exclusively — they never write
+    // to the graph directly. This guarantees the two UIs stay in sync and that
+    // pending values set before the output node exists are applied correctly
+    // when it is first created by _ensureOutputWired().
+
+    /**
+     * Write a single output node parameter and invalidate evaluator caches.
+     *
+     * If no output node exists yet (scene not yet rendered for the first time)
+     * the value is stored in _pendingOutputParams and applied the moment
+     * _ensureOutputWired() creates the node. This means the user can configure
+     * output settings before ever clicking Render and those settings will be
+     * honoured on the first render.
+     *
+     * @param {string} paramName  One of: renderMethod, resolution, boundsMin, boundsMax
+     * @param {*}      value
+     */
+    _setOutputParam(paramName, value) {
+        // Always keep a local mirror so we can apply it when the node is created
+        if (!this._pendingOutputParams) this._pendingOutputParams = {};
+        this._pendingOutputParams[paramName] = value;
+
+        // Write to the live node if it already exists
+        const graph = this.stateStore.nodeGraph;
+        let outputNode = null;
+        graph.nodes.forEach(n => { if (n.type === 'outputNode') outputNode = n; });
+
+        if (outputNode) {
+            graph.updateNodeParam(outputNode.id, paramName, value);
+            // Invalidate so the next render picks up the change
+            this.sceneManager._lastGLSLSource     = null;
+            this.sceneManager._lastRayMarchSource = null;
+            this.sceneManager.evaluator.invalidate();
+        }
+
+        // Keep both drawer and popover in sync if both happen to be open
+        this._syncOutputControls(paramName, value);
+    }
+
+    /**
+     * Read the current value of an output node parameter.
+     * Priority order:
+     *   1. _pendingOutputParams (values set by the user before first render)
+     *   2. The live output node in the graph (set by a previous render or load)
+     *   3. NodeSpec hard-coded defaults
+     *
+     * Safe to call at any time, including before the output node exists.
+     *
+     * @param {string} paramName
+     * @returns {*}
+     */
+    _getOutputParam(paramName) {
+        const DEFAULTS = {
+            renderMethod: 'contours (2D)',
+            resolution:   150,
+            boundsMin:    -4,
+            boundsMax:     4,
+        };
+
+        // Pending local overrides take highest priority
+        if (this._pendingOutputParams?.[paramName] !== undefined) {
+            return this._pendingOutputParams[paramName];
+        }
+
+        // Then the live node if it exists
+        const graph = this.stateStore.nodeGraph;
+        let outputNode = null;
+        graph.nodes.forEach(n => { if (n.type === 'outputNode') outputNode = n; });
+        if (outputNode?.params[paramName] !== undefined) {
+            return outputNode.params[paramName];
+        }
+
+        return DEFAULTS[paramName];
+    }
+
+    /**
+     * Push a single param value to all live output control elements without
+     * triggering a recursive _setOutputParam call.
+     *
+     * Targets elements carrying:
+     *   data-output-param="<paramName>"         — the input/select element
+     *   data-output-param-display="<paramName>" — the value readout span
+     *
+     * Both the drawer (#nc-output-drawer) and the popover (#nc-output-popover)
+     * are updated if they are present in the DOM.
+     *
+     * @param {string} paramName
+     * @param {*}      value
+     */
+    _syncOutputControls(paramName, value) {
+        ['nc-output-drawer', 'nc-output-popover'].forEach(containerId => {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            const inputEl = container.querySelector(
+                `[data-output-param="${paramName}"]`
+            );
+            if (inputEl) inputEl.value = value;
+
+            const displayEl = container.querySelector(
+                `[data-output-param-display="${paramName}"]`
+            );
+            if (displayEl) {
+                if (paramName === 'resolution') {
+                    displayEl.textContent = Math.round(value);
+                } else if (paramName === 'boundsMin' || paramName === 'boundsMax') {
+                    displayEl.textContent = parseFloat(value).toFixed(1);
+                } else {
+                    displayEl.textContent = value;
+                }
+            }
+        });
+    }
+
     _onGraphChange(event) {
         // Rebuild cards and redraw edges whenever the graph structure changes.
         // Parameter changes (paramChanged) don't need a full rebuild.
@@ -1787,6 +2295,210 @@ function _isConvexPolygon(vertices) {
         this._rebuildCards();
         }
         this._drawEdges();
+        this._updateGraphStatusLabel();
+    }
+
+    // ── Scene geometry check ──────────────────────────────────────────────────
+
+    /**
+     * Returns true if the graph contains at least one geometry primitive node.
+     *
+     * This is the minimum condition for the Render and mode-switch buttons to
+     * be active. A graph containing only transform or blend nodes cannot
+     * produce a valid SDF without a geometry input, so those cases also return
+     * false.
+     *
+     * Called by _updateGraphStatusLabel() on every graph change and by the
+     * Render and mode-switch button handlers as a belt-and-braces guard.
+     *
+     * @returns {boolean}
+     */
+_sceneHasGeometry() {
+        const GEOM_TYPES = new Set([
+            'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
+            'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
+        ]);
+        let found = false;
+        this.stateStore.nodeGraph.nodes.forEach(n => {
+            if (GEOM_TYPES.has(n.type)) found = true;
+        });
+        return found;
+    }
+
+    // ── Output node lifecycle — owned exclusively by the render path ──────────
+
+    /**
+     * Ensure an output node exists and that every dangling chain tail in the
+     * graph is wired to it. Called by both _renderWithAutoOutput() and the
+     * mode-switch button handler immediately before any render is triggered.
+     *
+     * A "dangling chain tail" is a node whose output port (sdf or result) has
+     * no outgoing edges AND which is not itself the output node. These are
+     * the terminal nodes of chains the user has built but not yet connected
+     * to anything downstream.
+     *
+     * Algorithm:
+     *   1. Ensure the output node exists (create if absent via _ensureOutputNode).
+     *   2. Apply any pending output param values set by the user before the
+     *      node existed (values stored in _pendingOutputParams).
+     *   3. Walk every non-output node in the graph.
+     *   4. For each node whose output port has no outgoing edges AND which is
+     *      not already directly wired to the output node, wire it to
+     *      output(sdf). This handles:
+     *        - A bare primitive (primitive → output)
+     *        - A primitive+transform chain wired at the tail (tail → output)
+     *        - A blend node whose result port is dangling (blend → output)
+     *        - Multiple independent chains (each tail → output, union at output)
+     *   5. Invalidate evaluator and shader caches.
+     *
+     * This method is idempotent: calling it repeatedly on an already-wired
+     * graph produces no duplicate edges (addEdge throws on duplicates, which
+     * are caught and silently ignored).
+     */
+    _ensureOutputWired() {
+        const graph = this.stateStore.nodeGraph;
+
+        // Step 1: ensure the output node exists
+        const outNode = this.sceneManager._ensureOutputNode();
+
+        // Step 2: apply any pending output params the user configured before
+        // the output node was created
+        if (this._pendingOutputParams) {
+            Object.entries(this._pendingOutputParams).forEach(([k, v]) => {
+                graph.updateNodeParam(outNode.id, k, v);
+            });
+        }
+
+        // Step 3 & 4: find dangling tails and wire them to the output node
+        const GEOM_TYPES = new Set([
+            'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
+            'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
+        ]);
+        const TRANSFORM_TYPES = new Set([
+            'extrudeNode', 'revolveNode', 'noiseDisplaceNode', 'twistNode', 'bendNode',
+            'repeatNode', 'tilingNode', 'mobiusNode', 'symmetryFoldNode',
+            'symmetryOrbitNode', 'ifsBlend',
+        ]);
+        const BLEND_TYPES = new Set([
+            'schurBlend', 'rUnion', 'rIntersection', 'rDifference',
+        ]);
+
+        graph.nodes.forEach((node, id) => {
+            if (node.type === 'outputNode') return;
+
+            // Determine the output port name for this node type
+            let outPort = null;
+            if (GEOM_TYPES.has(node.type))      outPort = 'sdf';
+            if (TRANSFORM_TYPES.has(node.type)) outPort = 'result';
+            if (BLEND_TYPES.has(node.type))     outPort = 'result';
+            if (!outPort) return;
+
+            // If this output port already has outgoing edges, this node is
+            // mid-chain — it feeds into something else and is not a tail
+            const outgoing = graph.getOutgoingEdges(id, outPort) || [];
+            if (outgoing.length > 0) return;
+
+            // If this node is already directly wired to the output node,
+            // skip it to avoid duplicate edge errors
+            const alreadyToOutput = (graph.getAllIncomingEdges(outNode.id, 'sdf') || [])
+                .some(e => e.fromNode === id);
+            if (alreadyToOutput) return;
+
+            // Wire this dangling tail to the output node
+            try {
+                graph.addEdge(id, outPort, outNode.id, 'sdf');
+            } catch(_) {
+                // Edge already exists or graph validation rejected it — safe to ignore
+            }
+        });
+
+        // Step 5: invalidate all caches so the next render reads the new wiring
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
+    }
+
+    /**
+     * Called by the Render button. Ensures output is wired then runs the
+     * CPU marching-squares compose pipeline.
+     * The geometry guard is also checked here as belt-and-braces even though
+     * the button is visually disabled when no geometry exists.
+     */
+    _renderWithAutoOutput() {
+        if (!this._sceneHasGeometry()) return;
+        this._ensureOutputWired();
+        this._compose();
+    }
+
+    // ── Status label and button grey-out ──────────────────────────────────────
+
+    /**
+     * Update the persistent status label and the enabled/disabled visual state
+     * of the Render button, gear button, and mode-switch button based on
+     * whether the scene currently contains any geometry primitives.
+     *
+     * Grey-out condition: no geometry primitive node exists in the graph.
+     * This is the only condition that disables the buttons — the output node
+     * is created on demand by the render path so its absence is never an error
+     * state the user needs to resolve manually.
+     *
+     * Called from:
+     *   - _onGraphChange()       — on every structural graph mutation
+     *   - _doOpen()              — when the canvas is first opened
+     *   - _clearAll() timeout    — after the scene is cleared
+     *   - _afterGraphReplaced()  — after undo/redo restores a graph state
+     *   - _addBlendNode()        — after a blend node is added
+     *   - _addTransformNode()    — after a transform node is added
+     *   - scene load handler     — after a saved scene is loaded
+     */
+    _updateGraphStatusLabel() {
+        if (!this._graphStatusLabel) return;
+
+        const hasGeom = this._sceneHasGeometry();
+
+        // ── Render button ─────────────────────────────────────────────────────
+        if (this._composeBtn) {
+            this._composeBtn.disabled          = !hasGeom;
+            this._composeBtn.style.opacity     = hasGeom ? '1' : '0.38';
+            this._composeBtn.style.cursor      = hasGeom ? 'pointer' : 'not-allowed';
+            this._composeBtn.title             = hasGeom
+                ? 'Render the current scene via CPU marching squares'
+                : 'Add at least one primitive before rendering';
+        }
+
+        // ── Gear button ───────────────────────────────────────────────────────
+        if (this._gearBtn) {
+            this._gearBtn.disabled          = !hasGeom;
+            this._gearBtn.style.opacity     = hasGeom ? '1' : '0.38';
+            this._gearBtn.style.cursor      = hasGeom ? 'pointer' : 'not-allowed';
+        }
+
+        // ── Mode-switch button ────────────────────────────────────────────────
+        if (this._renderModeBtn) {
+            this._renderModeBtn.disabled          = !hasGeom;
+            this._renderModeBtn.style.opacity     = hasGeom ? '1' : '0.38';
+            this._renderModeBtn.style.cursor      = hasGeom ? 'pointer' : 'not-allowed';
+            this._renderModeBtn.title             = hasGeom
+                ? 'Switch render mode (Marching Squares → GLSL → Ray March)'
+                : 'Add at least one primitive before switching render mode';
+        }
+
+        // ── Status label ──────────────────────────────────────────────────────
+        if (!hasGeom) {
+            this._graphStatusLabel.textContent = '⚠ Add a primitive to render';
+            this._graphStatusLabel.style.display = '';
+            // Hide the drawer — no point showing render settings when there
+            // is nothing to render
+            if (this._outputDrawer) this._outputDrawer.style.display = 'none';
+            // Close the popover too if it is open
+            const popover = document.getElementById('nc-output-popover');
+            if (popover) popover.remove();
+            return;
+        }
+
+        // Geometry exists — scene is renderable
+        this._graphStatusLabel.style.display = 'none';
+        if (this._outputDrawer) this._outputDrawer.style.display = 'flex';
     }
 
     // ── Pan and zoom ──────────────────────────────────────────────────────────
@@ -1984,6 +2696,363 @@ function _isConvexPolygon(vertices) {
     // ── Export ────────────────────────────────────────────────────────────────
 
     /**
+     * Toggle the output settings popover (Option 1 — gear button companion).
+     * If the popover is already open, close it. Otherwise build and open it
+     * anchored below the gear button.
+     *
+     * The popover contains the same four output parameter controls as the
+     * bottom drawer, built by _buildOutputControls('popover'). Both UIs stay
+     * in sync through _syncOutputControls() which is called by _setOutputParam
+     * whenever any control changes a value.
+     *
+     * @param {HTMLElement} anchorEl  The gear button element used to position the panel
+     */
+    _toggleOutputPopover(anchorEl) {
+        const existing = document.getElementById('nc-output-popover');
+        if (existing) { existing.remove(); return; }
+
+        const anchorRect = anchorEl.getBoundingClientRect();
+
+        const panel = document.createElement('div');
+        panel.id = 'nc-output-popover';
+        panel.style.cssText = `
+            position: fixed;
+            top: ${anchorRect.bottom + 6}px;
+            left: ${anchorRect.left}px;
+            background: rgba(16,16,22,0.98);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 8px;
+            padding: 16px 18px 14px;
+            z-index: 2000;
+            pointer-events: auto;
+            min-width: 330px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+            font-family: var(--font-sans, sans-serif);
+        `;
+
+        // ── Header ────────────────────────────────────────────────────────────
+        const hdr = document.createElement('div');
+        hdr.style.cssText = `
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 14px;
+            gap: 10px;
+        `;
+
+        const titleCol = document.createElement('div');
+        titleCol.style.cssText = 'display:flex; flex-direction:column; gap:3px;';
+
+        const ttl = document.createElement('span');
+        ttl.textContent = 'Render settings';
+        ttl.style.cssText = `
+            font-size: 13px;
+            font-weight: 600;
+            color: rgba(255,255,255,0.9);
+        `;
+
+        const sub = document.createElement('span');
+        sub.textContent = 'CPU path only · GLSL and Ray March use canvas resolution';
+        sub.style.cssText = `
+            font-size: 10px;
+            opacity: 0.38;
+            font-style: italic;
+            color: rgba(220,220,230,0.8);
+        `;
+
+        titleCol.appendChild(ttl);
+        titleCol.appendChild(sub);
+
+        const cls = document.createElement('button');
+        cls.textContent = '✕';
+        cls.style.cssText = `
+            background: none;
+            border: none;
+            color: rgba(255,255,255,0.4);
+            font-size: 13px;
+            cursor: pointer;
+            padding: 0;
+            flex-shrink: 0;
+            line-height: 1;
+        `;
+        cls.addEventListener('click', () => panel.remove());
+
+        hdr.appendChild(titleCol);
+        hdr.appendChild(cls);
+        panel.appendChild(hdr);
+
+        // ── Controls ──────────────────────────────────────────────────────────
+        panel.appendChild(this._buildOutputControls('popover'));
+
+        // ── Close on outside click ────────────────────────────────────────────
+        // Deferred so this mousedown event does not immediately close the panel
+        setTimeout(() => {
+            const outside = (e) => {
+                if (!panel.contains(e.target) && e.target !== anchorEl) {
+                    panel.remove();
+                    document.removeEventListener('mousedown', outside);
+                }
+            };
+            document.addEventListener('mousedown', outside);
+        }, 120);
+
+        document.body.appendChild(panel);
+    }
+
+    /**
+     * Toggle the preset panel. Shows the three V1 example scenes with
+     * a description and audience label for each. Clicking a preset loads
+     * it immediately after confirming the current scene can be discarded.
+     */
+    _togglePresetPanel(anchorEl) {
+        const existing = document.getElementById('nc-preset-panel');
+        if (existing) { existing.remove(); return; }
+
+        const anchorRect = anchorEl.getBoundingClientRect();
+
+        const panel = document.createElement('div');
+        panel.id = 'nc-preset-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: ${anchorRect.bottom + 6}px;
+            left: ${anchorRect.left}px;
+            background: rgba(16,16,22,0.98);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 8px;
+            padding: 16px 18px 14px;
+            z-index: 2000;
+            pointer-events: auto;
+            min-width: 340px;
+            max-width: 400px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+            font-family: var(--font-sans, sans-serif);
+        `;
+
+        // Header
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;';
+
+        const ttl = document.createElement('span');
+        ttl.textContent = 'Example scenes';
+        ttl.style.cssText = 'font-size:13px; font-weight:600; color:rgba(255,255,255,0.9);';
+
+        const cls = document.createElement('button');
+        cls.textContent = '✕';
+        cls.style.cssText = 'background:none; border:none; color:rgba(255,255,255,0.4); font-size:13px; cursor:pointer; padding:0;';
+        cls.addEventListener('click', () => panel.remove());
+
+        hdr.appendChild(ttl);
+        hdr.appendChild(cls);
+        panel.appendChild(hdr);
+
+        // One card per preset
+        PRESETS.forEach(preset => {
+            const card = document.createElement('div');
+            card.style.cssText = `
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 6px;
+                padding: 12px 14px;
+                margin-bottom: 8px;
+                cursor: pointer;
+                transition: background 0.15s ease;
+            `;
+            card.addEventListener('mouseenter', () =>
+                card.style.background = 'rgba(255,255,255,0.10)'
+            );
+            card.addEventListener('mouseleave', () =>
+                card.style.background = 'rgba(255,255,255,0.05)'
+            );
+
+            const titleRow = document.createElement('div');
+            titleRow.style.cssText = 'display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px;';
+
+            const titleEl = document.createElement('span');
+            titleEl.textContent = preset.meta.label;
+            titleEl.style.cssText = 'font-size:13px; font-weight:600; color:rgba(255,255,255,0.9);';
+
+            const audienceEl = document.createElement('span');
+            audienceEl.textContent = preset.meta.audience;
+            audienceEl.style.cssText = 'font-size:10px; opacity:0.5; color:rgba(180,230,255,0.9);';
+
+            titleRow.appendChild(titleEl);
+            titleRow.appendChild(audienceEl);
+
+            const descEl = document.createElement('div');
+            descEl.textContent = preset.meta.description;
+            descEl.style.cssText = 'font-size:11px; opacity:0.6; line-height:1.45; color:rgba(220,220,230,0.85);';
+
+            card.appendChild(titleRow);
+            card.appendChild(descEl);
+
+            card.addEventListener('click', () => {
+                panel.remove();
+                this._loadPreset(preset);
+            });
+
+            panel.appendChild(card);
+        });
+
+        // Close on outside click
+        setTimeout(() => {
+            const outside = (e) => {
+                if (!panel.contains(e.target) && e.target !== anchorEl) {
+                    panel.remove();
+                    document.removeEventListener('mousedown', outside);
+                }
+            };
+            document.addEventListener('mousedown', outside);
+        }, 120);
+
+        document.body.appendChild(panel);
+    }
+
+    /**
+     * Load a preset scene directly into the graph.
+     *
+     * Process:
+     *   1. Snapshot current state for undo.
+     *   2. Clear the scene (same as the clear button).
+     *   3. Deserialize the preset's graph JSON into the node graph.
+     *   4. Rebuild Three.js primitives for any geometry nodes.
+     *   5. Switch to the preset's recommended render mode.
+     *   6. Re-layout and fit to screen.
+     *
+     * @param {object} preset  One entry from the PRESETS array
+     */
+    _loadPreset(preset) {
+        // Snapshot so the user can undo back to their previous scene
+        this._undo.snapshot();
+
+        // Clear current state
+        this._clearAll();
+
+        // Small delay to let _clearAll's internal setTimeout settle
+        setTimeout(() => {
+            const graph = this.stateStore.nodeGraph;
+
+            // Build the graph directly from the preset data using addNode/addEdge.
+            // This bypasses deserialize() entirely so the preset format is
+            // independent of the serialization schema — no format mismatch possible.
+            try {
+                // Add nodes first, using forceId so edge references stay valid
+                for (const nodeDef of preset.graph.nodes) {
+                    graph.addNode(
+                        nodeDef.type,
+                        { ...nodeDef.params },
+                        nodeDef.uiPos || { x: 0, y: 0 },
+                        nodeDef.id
+                    );
+                }
+                // Add edges after all nodes exist
+                for (const edgeDef of preset.graph.edges) {
+                    try {
+                        graph.addEdge(
+                            edgeDef.fromNode,
+                            edgeDef.fromPort,
+                            edgeDef.toNode,
+                            edgeDef.toPort
+                        );
+                    } catch(edgeErr) {
+                        // Log but continue — a single bad edge should not abort the preset
+                        console.warn(
+                            `Preset edge ${edgeDef.id} ` +
+                            `(${edgeDef.fromNode}:${edgeDef.fromPort} → ` +
+                            `${edgeDef.toNode}:${edgeDef.toPort}) skipped: ` +
+                            edgeErr.message
+                        );
+                    }
+                }
+            } catch(e) {
+                console.error('Preset load failed:', e.message);
+                this._showToast(
+                    `Failed to load preset "${preset.meta.label}": ${e.message}`,
+                    5000
+                );
+                return;
+            }
+
+            // Keep UndoManager in sync
+            this._undo.syncGraph(graph);
+
+            // Rebuild Three.js objects for geometry nodes
+            const GEOM_TYPES = new Set([
+                'circle','regularPolygon','triangle','arc','polytope','lineSegment',
+                'sphere','box','cylinder','capsule','torus','cone','plane'
+            ]);
+
+            graph.nodes.forEach((node) => {
+                if (!GEOM_TYPES.has(node.type)) return;
+                try {
+                    const entry = this.sceneManager._rebuildPrimitiveFromNode(node);
+                    if (entry) {
+                        this.sceneManager.activePrimitives.push(entry);
+                        this.sceneManager._addToScene(entry);
+                    }
+                } catch(e) {
+                    console.warn(
+                        `Preset: could not rebuild primitive for node ` +
+                        `${node.id} (${node.type}): ${e.message}`
+                    );
+                }
+            });
+
+            // Re-point evaluators at the restored graph
+            this.sceneManager.evaluator.graph     = graph;
+            this.sceneManager.evaluator.invalidate();
+            this.sceneManager.glslEvaluator.graph = graph;
+            this.sceneManager._lastGLSLSource     = null;
+            this.sceneManager._lastRayMarchSource = null;
+
+            // Sync output params from the preset's output node
+            if (!this._pendingOutputParams) this._pendingOutputParams = {};
+            ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+                this._pendingOutputParams[k] = this._getOutputParam(k);
+                this._syncOutputControls(k, this._getOutputParam(k));
+            });
+
+            // Rebuild cards, layout, edges
+            this._rebuildCards();
+            this._runAutoLayout();
+            this._drawEdges();
+            this._fitToScreen();
+            this._updateGraphStatusLabel();
+
+            // Switch to the preset's recommended render mode and trigger render
+            const savedMode = preset.meta.renderMode || 'marchingSquares';
+
+            if (savedMode === 'rayMarch') {
+                this.sceneManager.setRenderMode('rayMarch');
+                this.sceneManager.rayMarchRenderer?.show();
+                // Ensure output is wired then render
+                this._ensureOutputWired();
+                this.sceneManager._renderRayMarch();
+                this._renderModeBtn.textContent = '▣ Marching Squares';
+            } else if (savedMode === 'glsl') {
+                this.sceneManager.setRenderMode('glsl');
+                this.sceneManager.sdfRenderer?.show();
+                this._ensureOutputWired();
+                this.sceneManager._renderGLSL();
+                this._renderModeBtn.textContent = '⬜ Ray March';
+            } else {
+                this.sceneManager.setRenderMode('marchingSquares');
+                this._renderModeBtn.textContent = '⬛ GLSL Mode';
+                this._ensureOutputWired();
+                const sdf = this.sceneManager.evaluator.getRootSDF();
+                if (sdf) {
+                    this.sceneManager.renderSDF(sdf, this._getOutputParam('renderMethod'));
+                }
+            }
+
+            this._showToast(
+                `✓ Loaded "${preset.meta.label}" — ${preset.meta.description}`,
+                4000
+            );
+
+        }, 80);
+    }
+
+    /**
      * Toggle the export panel. If already open, close it; otherwise open it
      * anchored near the top-right of the screen (below the toolbar).
      */
@@ -2090,6 +3159,20 @@ function _isConvexPolygon(vertices) {
             '📋', 'Export Scene JSON',
             'Download the full node graph as JSON. Use to back up, share, or import into another Isoline session.',
             () => this._exportJSON()
+        ));
+
+        // ── STL — 3D printing export ──────────────────────────────────────────
+        // Available when the scene contains 3D geometry (solid primitives or
+        // bridge nodes). The STL is generated by running marching cubes on the
+        // CPU evaluator at the selected resolution.
+        const stlAvail = this.sceneManager._sceneHas3D();
+        panel.appendChild(_row(
+            '🖨', 'Export STL  (3D Print)',
+            stlAvail
+                ? 'Download a binary STL mesh for 3D printing. Compatible with Cura, PrusaSlicer, Bambu Studio, and Chitubox.'
+                : 'Add a 3D primitive (sphere, box, cylinder…) or use Extrude/Revolve to enable STL export.',
+            () => this._exportSTLWithUI(),
+            stlAvail
         ));
 
         // ── SVG — V2 note ─────────────────────────────────────────────────────
@@ -2211,6 +3294,68 @@ function _isConvexPolygon(vertices) {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
         this._showToast('GLSL shader exported.');
+    }
+
+    /**
+     * STL export entry point called from the export panel.
+     * Shows a resolution picker dialog, shows a progress toast, runs the
+     * export, then shows a completion or error toast.
+     *
+     * Resolution options presented to the user:
+     *   Fast (64)   — ~262k cells, suitable for previewing printability
+     *   Medium (96) — ~884k cells, good balance for most scenes
+     *   High (128)  — ~2M cells, maximum detail, may take several seconds
+     *
+     * The user is also reminded that 3D printing requires a manifold (watertight)
+     * mesh. SDF zero-crossings produce manifold meshes for well-formed SDFs.
+     */
+    _exportSTLWithUI() {
+        // Ask the user to pick a resolution
+        // A native prompt is used here because it is universally understood
+        // and requires no additional DOM construction.
+        const choice = prompt(
+            'STL Export — 3D Print Quality\n\n' +
+            'Choose resolution (cells per axis):\n' +
+            '  1 = Fast   (64)  — quick preview, coarser detail\n' +
+            '  2 = Medium (96)  — good for most prints\n' +
+            '  3 = High   (128) — maximum detail, may take a few seconds\n\n' +
+            'Note: For best print results, use Ray March mode to verify\n' +
+            'the geometry looks correct before exporting.\n\n' +
+            'Enter 1, 2, or 3:',
+            '2'
+        );
+
+        if (!choice) return;  // User cancelled
+
+        const resolutions = { '1': 64, '2': 96, '3': 128 };
+        const resolution  = resolutions[choice.trim()] ?? 96;
+
+        // Show a working toast immediately so the user knows something is happening.
+        // The marching cubes step is synchronous and can take 1-5 seconds.
+        this._showToast(
+            `⏳ Generating STL mesh at resolution ${resolution}… this may take a moment.`,
+            8000
+        );
+
+        // Defer the export by one frame so the toast renders before the
+        // blocking marching cubes computation begins.
+        setTimeout(async () => {
+            const result = await this.sceneManager._exportSTL(resolution);
+
+            if (result.ok) {
+                this._showToast(
+                    `✓ STL exported — ${result.triangles.toLocaleString()} triangles, ` +
+                    `${result.sizeKB.toLocaleString()} KB. ` +
+                    `Open in your slicer (Cura, PrusaSlicer, Bambu Studio) to prepare for printing.`,
+                    6000
+                );
+            } else {
+                this._showToast(
+                    `✗ STL export failed: ${result.error}`,
+                    6000
+                );
+            }
+        }, 50);
     }
 
     /**
@@ -2440,8 +3585,11 @@ function _isConvexPolygon(vertices) {
         // ── Step 7: Rebuild the NodeCard DOM ──────────────────────────────────
         this._rebuildCards();
 
-        // ── Step 8: Redraw the edge layer ──────────────────────────────────────
+// ── Step 8: Redraw the edge layer ──────────────────────────────────────
         this._drawEdges();
+
+        // ── Step 8b: Sync button states and drawer with restored graph ─────────
+        this._updateGraphStatusLabel();
 
         // ── Step 9: Synchronise GPU canvas visibility with graph renderability ──
         //

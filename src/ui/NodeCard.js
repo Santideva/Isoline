@@ -645,8 +645,17 @@ export class NodeCard {
     row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:6px;';
 
     const label = document.createElement('label');
-    label.textContent = paramSpec.name;
-    label.style.cssText = 'font-size:11px; opacity:0.75; min-width:50px; flex-shrink:0;';
+    // Use the optional human-readable label from NodeSpec if provided,
+    // otherwise fall back to the raw param name.
+    label.textContent = paramSpec.label || paramSpec.name;
+    label.style.cssText = 'font-size:11px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:default;';
+
+    // If a hint string is defined in NodeSpec, attach it as a tooltip.
+    // The cursor:help style signals to the user that hovering gives info.
+    if (paramSpec.hint) {
+      label.title = paramSpec.hint;
+      label.style.cssText = 'font-size:11px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:help;';
+    }
 
     row.appendChild(label);
     row.appendChild(this._buildParamControl(paramSpec));
@@ -669,6 +678,7 @@ export class NodeCard {
         flex: 1;
         min-width: 0;
       `;
+      if (paramSpec.hint) sel.title = paramSpec.hint;
       (paramSpec.options || []).forEach(opt => {
         const o = document.createElement('option');
         o.value = opt;
@@ -734,6 +744,9 @@ export class NodeCard {
     slider.step       = paramSpec.step ?? 0.01;
     slider.value      = currentValue;
     slider.style.cssText = 'flex:1; min-width:0; height:14px; accent-color: #378ADD;';
+    // Mirror the hint onto the slider itself so the tooltip fires on hover
+    // regardless of whether the user hovers the label or the track.
+    if (paramSpec.hint) slider.title = paramSpec.hint;
 
     const display = document.createElement('span');
     display.dataset.paramDisplay = paramSpec.name;

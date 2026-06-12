@@ -315,11 +315,29 @@ export class CylinderPrimitive extends SolidPrimitive {
   }
 
   createObject() {
+    // THREE.CylinderGeometry is always along Y internally.
+    // For uncapped cylinders we use openEnded=true.
+    // For axis rotation we apply a quaternion to the mesh after creation.
+    const openEnded = !this.capped;
     const geo  = new THREE.CylinderGeometry(
-      this.radius, this.radius, this.height, 24
+      this.radius, this.radius, this.height, 24, 1, openEnded
     );
     const mesh = new THREE.Mesh(geo, this._wireMaterial());
-    return this._positioned(mesh);
+
+    // Apply axis rotation so the proxy matches the SDF orientation.
+    // The SDF swizzles the query point; here we rotate the mesh instead.
+    // Y is the natural axis — no rotation needed.
+    // X: rotate 90° around Z so the cylinder lies along X.
+    // Z: rotate 90° around X so the cylinder lies along Z.
+    const axis = this._params?.axis ?? 'Y';
+    if (axis === 'X') {
+      mesh.rotation.z = Math.PI / 2;
+    } else if (axis === 'Z') {
+      mesh.rotation.x = Math.PI / 2;
+    }
+
+    mesh.position.set(this.posX || 0, this.posY || 0, this.posZ || 0);
+    return mesh;
   }
 
   updateParameters(params = {}) {
@@ -330,6 +348,11 @@ export class CylinderPrimitive extends SolidPrimitive {
     if (params.posY   !== undefined) this.posY   = params.posY;
     if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
+    // Keep _params in sync so createObject() reads the latest axis value
+    if (params.axis   !== undefined) {
+      if (!this._params) this._params = {};
+      this._params.axis = params.axis;
+    }
     if (params.position !== undefined) {
       if (params.position.x !== undefined) this.posX = params.position.x;
       if (params.position.y !== undefined) this.posY = params.position.y;
@@ -652,10 +675,27 @@ export class ConePrimitive extends SolidPrimitive {
   createObject() {
     const geo  = new THREE.ConeGeometry(this.radius, this.height, 24);
     const mesh = new THREE.Mesh(geo, this._wireMaterial());
-    mesh.position.set(this.posX, this.posY + this.height / 2, this.posZ);
+
+    // THREE.ConeGeometry apex points along +Y by default.
+    // The SDF has the base at the primitive's position and apex at +Y.
+    // For X and Z axes we rotate the proxy to match the SDF orientation.
+    const axis = this._params?.axis ?? 'Y';
+
+    if (axis === 'Y') {
+      // Default: base at posY, apex at posY + height.
+      // THREE.ConeGeometry is centred at its midpoint so offset by height/2.
+      mesh.position.set(this.posX, this.posY + this.height / 2, this.posZ);
+    } else if (axis === 'X') {
+      // Cone points along +X: rotate 90° around Z, offset along X.
+      mesh.rotation.z = -Math.PI / 2;
+      mesh.position.set(this.posX + this.height / 2, this.posY, this.posZ);
+    } else if (axis === 'Z') {
+      // Cone points along +Z: rotate 90° around X, offset along Z.
+      mesh.rotation.x = Math.PI / 2;
+      mesh.position.set(this.posX, this.posY, this.posZ + this.height / 2);
+    }
+
     return mesh;
-    // Note: position set manually here, not via _positioned() to account
-    // for the height/2 center offset of THREE.ConeGeometry
   }
 
   updateParameters(params = {}) {
@@ -665,6 +705,11 @@ export class ConePrimitive extends SolidPrimitive {
     if (params.posY   !== undefined) this.posY   = params.posY;
     if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
+    // Keep _params in sync so createObject() reads the latest axis value
+    if (params.axis   !== undefined) {
+      if (!this._params) this._params = {};
+      this._params.axis = params.axis;
+    }
     logger.info(`Updated ConePrimitive ${this.id}`);
     return this;
   }

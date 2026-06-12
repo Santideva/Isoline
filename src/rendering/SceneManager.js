@@ -17,6 +17,8 @@ import { NodeEvaluator }  from "../graph/NodeEvaluator.js";
 import { GLSLEvaluator }  from "./GLSLEvaluator.js";
 import { SDFRenderer }      from "./SDFRenderer.js";
 import { RayMarchRenderer } from "./RayMarchRenderer.js";
+import { marchingCubes }    from "../utils/marchingCubes.js";
+import { trianglesToSTL, downloadSTL } from "../utils/stlExport.js";
 
 
 export class SceneManager {
@@ -276,6 +278,7 @@ export class SceneManager {
         const count = this.activePrimitives.filter(p => p.type === 'cylinder').length;
         const prim  = new CylinderPrimitive({
           radius: 1, height: 2, capped: true,
+          axis:   'Y',
           posX: (count % 3) * 2.5, posY: 0, posZ: 0,
           color: { h: 120, s: 0.7, l: 0.5, a: 1 }
         });
@@ -289,9 +292,7 @@ export class SceneManager {
           posY:   prim.posY ?? 0,
           posZ:   prim.posZ ?? 0,
         });
-        const cylObj = prim.createObject();
-        // Default cylinder is along Y — no rotation needed for Y axis
-        entry = { instance: prim, type: 'cylinder', object: cylObj };
+        entry = { instance: prim, type: 'cylinder', object: prim.createObject() };
         logger.info('Cylinder primitive instantiated.');
         break;
       }
@@ -344,6 +345,7 @@ export class SceneManager {
         const prim  = new ConePrimitive({
           radius: 1,
           height: 2,
+          axis:   'Y',
           posX: (count % 3) * 2.5,
           posY: 0,
           posZ: 0,
@@ -601,11 +603,15 @@ export class SceneManager {
     if (entry.instance) entry.instance.rendered = false;
   }
 
-  _buildSchurObject(schur, method, sdfOverride = null, bounds2D = null, bounds3D = null) {
+  _buildSchurObject(schur, method, sdfOverride = null, bounds2D = null, bounds3D = null, resolution = 150) {
     // Use caller-supplied bounds (from adaptive logic in renderSDF) if provided,
     // otherwise fall back to the hardcoded defaults.
     bounds2D = bounds2D ?? [-4, -4, 4, 4];
     bounds3D = bounds3D ?? [-4, -4, -4, 4, 4, 4];
+
+    // Clamp resolution to a safe integer range so bad values from the slider
+    // never crash the marching-squares scan.
+    const safeResolution = Math.max(20, Math.min(400, Math.round(resolution)));
 
     let sdfFn;
     if (sdfOverride) {
@@ -619,7 +625,7 @@ export class SceneManager {
     switch (method) {
       case "contours (2D)": {
         const loops = meshCreator.marchingSquares(
-          sdfFn, bounds2D, 150
+          sdfFn, bounds2D, safeResolution
         );
         const geometry = meshCreator.buildLineSegments(loops);
         return new THREE.LineSegments(
@@ -629,21 +635,25 @@ export class SceneManager {
       }
       case "fill (2D)": {
         const loops = meshCreator.marchingSquares(
-          sdfFn, bounds2D, 150
+          sdfFn, bounds2D, safeResolution
         );
         return meshCreator.createContourMesh(loops);
       }
       case "arcs": {
         const loops = meshCreator.marchingSquares(
-          sdfFn, bounds2D, 150
+          sdfFn, bounds2D, safeResolution
         );
         const arcs = meshCreator.fitArcs(loops.flat());
         return meshCreator.createArcObject(arcs, { segments: 64 });
       }
       case "surface (3D)": {
+        // surface (3D) uses its own resolution scale — marching cubes is
+        // much more expensive than marching squares so we cap it at 80
+        // regardless of the slider value to keep interactive performance.
+        const meshResolution = Math.min(Math.round(safeResolution / 4), 80);
         return meshCreator.createSDFMesh(
           { computeSDF: sdfFn }, bounds3D,
-          { resolution: 50, wireframe: false, isoLevel: 0 }
+          { resolution: meshResolution, wireframe: false, isoLevel: 0 }
         );
       }
       default:
@@ -1015,7 +1025,20 @@ export class SceneManager {
       this.currentSchur = null;
     }
 
-    const threeObj = this._buildSchurObject(null, method, sdfFn, bounds2D);
+    // Read the resolution from the output node so the slider value is honoured.
+    // Falls back to 150 if the output node does not exist yet (first render
+    // before _ensureOutputWired has run) or has no resolution param.
+    let _renderResolution = 150;
+    const _graph = this.evaluator?.graph;
+    if (_graph) {
+      _graph.nodes.forEach(n => {
+        if (n.type === 'outputNode' && n.params?.resolution !== undefined) {
+          _renderResolution = n.params.resolution;
+        }
+      });
+    }
+
+    const threeObj = this._buildSchurObject(null, method, sdfFn, bounds2D, null, _renderResolution);
     const entry    = {
       instance: { computeSDF: sdfFn, family: 'region' },
       type:     'schur',
@@ -1282,10 +1305,25 @@ export class SceneManager {
 
     this._removeFromScene(this.currentSchur);
 
+    // Read resolution from the output node so the slider is honoured on
+    // re-renders triggered by param changes (e.g. moving a shape).
+    let _rerenderResolution = 150;
+    const _graph = this.evaluator?.graph;
+    if (_graph) {
+      _graph.nodes.forEach(n => {
+        if (n.type === 'outputNode' && n.params?.resolution !== undefined) {
+          _rerenderResolution = n.params.resolution;
+        }
+      });
+    }
+
     const threeObj = this._buildSchurObject(
       this.currentSchur.instance,
       method,
-      sdfOverride
+      sdfOverride,
+      null,
+      null,
+      _rerenderResolution
     );
     this.currentSchur.object = threeObj;
     this._addToScene(this.currentSchur);
@@ -1334,7 +1372,16 @@ export class SceneManager {
         break;
       }
       case 'cylinder': {
-        prim = new CylinderPrimitive({ id, radius: p.radius ?? 1, height: p.height ?? 2, capped: p.capped !== 'no', posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        prim = new CylinderPrimitive({
+          id,
+          radius: p.radius ?? 1,
+          height: p.height ?? 2,
+          capped: p.capped !== 'no',
+          axis:   p.axis   ?? 'Y',
+          posX:   p.posX   ?? 0,
+          posY:   p.posY   ?? 0,
+          posZ:   p.posZ   ?? 0,
+        });
         type = 'cylinder';
         break;
       }
@@ -1356,7 +1403,15 @@ export class SceneManager {
         break;
       }
       case 'cone': {
-        prim = new ConePrimitive({ id, radius: p.radius ?? 1, height: p.height ?? 2, posX: p.posX ?? 0, posY: p.posY ?? 0, posZ: p.posZ ?? 0 });
+        prim = new ConePrimitive({
+          id,
+          radius: p.radius ?? 1,
+          height: p.height ?? 2,
+          axis:   p.axis   ?? 'Y',
+          posX:   p.posX   ?? 0,
+          posY:   p.posY   ?? 0,
+          posZ:   p.posZ   ?? 0,
+        });
         type = 'cone';
         break;
       }
@@ -1462,6 +1517,129 @@ export class SceneManager {
 
     // State 4: output node is present and wired — generation is warranted.
     return true;
+  }
+
+  /**
+   * Returns true if the node graph contains at least one 3D geometry node
+   * or a bridge node (extrude/revolve) that produces 3D output.
+   * Used by the export panel to decide whether to enable the STL button.
+   */
+  _sceneHas3D() {
+    const TYPES_3D = new Set([
+      'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
+      'extrudeNode', 'revolveNode',
+    ]);
+    let found = false;
+    stateStore.nodeGraph.nodes.forEach(n => {
+      if (TYPES_3D.has(n.type)) found = true;
+    });
+    return found;
+  }
+
+  /**
+   * Export the current scene as a binary STL file for 3D printing.
+   *
+   * Process:
+   *   1. Get the root SDF from the CPU evaluator (same path as marching squares).
+   *   2. Determine 3D scan bounds from the output node or fall back to [-4,4]³.
+   *   3. Run marching cubes at the requested resolution to extract a triangle mesh.
+   *   4. Encode the mesh as binary STL.
+   *   5. Trigger a browser download.
+   *
+   * Why CPU evaluator not GLSL:
+   *   The CPU evaluator supports every node type including mapper nodes.
+   *   GLSL source is generated but not easily sampled from JavaScript.
+   *   The CPU path is the correct choice for mesh extraction.
+   *
+   * Resolution guide (passed as parameter from the UI):
+   *   64  — fast, suitable for previewing printability (~262k cells)
+   *   96  — good balance for most scenes
+   *   128 — high detail, may take 2-5 seconds on complex scenes (~2M cells)
+   *
+   * @param {number} resolution   Cells per axis (default 64)
+   * @param {Function} onProgress Optional callback(fraction 0-1) for progress
+   */
+  async _exportSTL(resolution = 64, onProgress = null) {
+    // ── Step 1: get root SDF ──────────────────────────────────────────────
+    this.evaluator.invalidate();
+    let sdfFn = null;
+    try {
+      sdfFn = this.evaluator.getRootSDF();
+    } catch(e) {
+      console.error('STL export: evaluator error:', e.message);
+      return { ok: false, error: e.message };
+    }
+
+    if (!sdfFn) {
+      return { ok: false, error: 'No renderable SDF found. Wire geometry to the output node first.' };
+    }
+
+    // ── Step 2: determine 3D scan bounds ─────────────────────────────────
+    // Read from the output node params if available. The bounds stored there
+    // are 2D bounds [min, max] applied symmetrically to all three axes.
+    // This is appropriate for most SDF scenes which are roughly centred.
+    let boundsMin = -4;
+    let boundsMax =  4;
+
+    const graph = this.evaluator.graph;
+    if (graph) {
+      graph.nodes.forEach(n => {
+        if (n.type === 'outputNode') {
+          if (n.params.boundsMin !== undefined) boundsMin = n.params.boundsMin;
+          if (n.params.boundsMax !== undefined) boundsMax = n.params.boundsMax;
+        }
+      });
+    }
+
+    // Add a small margin so surface features at the exact boundary are captured
+    const margin = (boundsMax - boundsMin) * 0.05;
+    const bounds = [
+      boundsMin - margin,
+      boundsMin - margin,
+      boundsMin - margin,
+      boundsMax + margin,
+      boundsMax + margin,
+      boundsMax + margin,
+    ];
+
+    // ── Step 3: run marching cubes ────────────────────────────────────────
+    // This is synchronous and can take 1-5 seconds for high resolutions.
+    // We use a setTimeout(0) to let the UI update (show the toast) before
+    // the blocking computation starts.
+    let triangles;
+    try {
+      triangles = marchingCubes(sdfFn, bounds, resolution);
+    } catch(e) {
+      console.error('STL export: marching cubes error:', e.message);
+      return { ok: false, error: e.message };
+    }
+
+    if (triangles.length === 0) {
+      return { ok: false, error: 'No surface found within the scan bounds. Try widening the scan bounds in Render Settings.' };
+    }
+
+    // ── Step 4: encode as binary STL ─────────────────────────────────────
+    let buffer;
+    try {
+      buffer = trianglesToSTL(triangles);
+    } catch(e) {
+      console.error('STL export: serialisation error:', e.message);
+      return { ok: false, error: e.message };
+    }
+
+    // ── Step 5: download ──────────────────────────────────────────────────
+    const ts       = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `isoline-${ts}.stl`;
+    downloadSTL(buffer, filename);
+
+    const sizeKB   = Math.round(buffer.byteLength / 1024);
+    const triCount = triangles.length;
+    console.info(
+      `STL export complete: ${triCount.toLocaleString()} triangles, ` +
+      `${sizeKB.toLocaleString()} KB → ${filename}`
+    );
+
+    return { ok: true, triangles: triCount, sizeKB, filename };
   }
 
   _ensureOutputNode() {

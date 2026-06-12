@@ -889,19 +889,29 @@ float ${fn}(${dim} p) {
       }
 
       case 'noiseDisplaceNode': {
-        const inputFn = this._resolveInputFn(node, 'sdf');
+        const inputFn  = this._resolveInputFn(node, 'sdf');
         if (!inputFn) return this._fallback3D(fn, node.id, 'noiseDisplace missing sdf');
-        const amp  = this._f(node.params.amplitude ?? 0.3);
-        const freq = this._f(node.params.frequency  ?? 3.0);
+        const amp      = this._f(node.params.amplitude ?? 0.3);
+        const freq     = this._f(node.params.frequency  ?? 3.0);
+        const animated = (node.params.animated ?? 'no') === 'yes';
+
         // Determine if input is 3D
         const edge     = this.graph.getIncomingEdge(node.id, 'sdf');
         const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
         const is3D     = baseNode && this._nodeOutputIs3D(baseNode);
         const dim      = is3D ? 'vec3' : 'vec2';
+
+        // When animated=yes, add uTime to the Z (or Y for 2D) noise coordinate
+        // so the pattern shifts over time. uTime is provided as a uniform by
+        // the renderer each frame. The 0.5 factor keeps the animation speed
+        // comfortable — fast enough to be visible, slow enough to read.
+        const timeOffset = animated ? '+ uTime * 0.5' : '';
+
         const sampleCoord = is3D
-          ? `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq})`
-          : `vec2(p.x * ${freq}, p.y * ${freq})`;
-        return `// noiseDisplaceNode ${node.id}
+          ? `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq} ${timeOffset})`
+          : `vec2(p.x * ${freq}, p.y * ${freq} ${timeOffset})`;
+
+        return `// noiseDisplaceNode ${node.id}  (animated=${animated})
 float ndHash(float n) { return fract(sin(n) * 43758.5453); }
 float ndNoise(${dim} p) {
   ${is3D
