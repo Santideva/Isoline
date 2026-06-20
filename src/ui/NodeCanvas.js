@@ -1384,6 +1384,53 @@ function _isConvexPolygon(vertices) {
         }, 50);
     }
 
+    /**
+     * Toggle "presentation mode" — hides the toolbar and sidebar so only
+     * the rendered geometry fills the screen, with no UI chrome in frame.
+     * Intended for capturing clean screenshots, video, or GIFs (e.g. for
+     * the README, demo videos, or social posts) without manually hiding
+     * elements via DevTools each time.
+     *
+     * Toggled by the 'F' key (and exited via Escape or 'F' again).
+     * Node cards, edges, and the canvas-area background grid are also
+     * hidden — only the Three.js / GLSL / Ray March render canvas remains
+     * visible, exactly as the user composed it.
+     *
+     * Does not pause rendering, change render mode, or affect camera state —
+     * purely a DOM visibility toggle, fully reversible with no side effects
+     * on the underlying scene or graph.
+     */
+    _togglePresentationMode() {
+        this._presentationMode = !this._presentationMode;
+
+        const toolbar = this._overlay.querySelector(':scope > div:first-child');
+        const canvasArea = this._bgCanvas?.parentElement;
+
+        if (this._presentationMode) {
+            // Hide toolbar
+            if (toolbar) toolbar.style.display = 'none';
+            // Hide sidebar
+            if (this._sidebar) this._sidebar.style.display = 'none';
+            // Hide the node-graph background canvas (grid + edges) and the
+            // card container — leaves only the render canvas(es) visible.
+            if (this._bgCanvas) this._bgCanvas.style.display = 'none';
+            if (this._inner)    this._inner.style.display    = 'none';
+            // Hide any open popovers/panels that might be lingering
+            ['nc-export-panel', 'nc-preset-panel', 'nc-view-menu', 'nc-toast']
+                .forEach(id => document.getElementById(id)?.remove());
+
+            // Small unobtrusive indicator so the user knows the hotkey is
+            // active and how to exit — fades out on its own after a moment
+            // so it does not itself end up in a screenshot taken quickly.
+            this._showToast('Presentation mode — press F or Esc to restore UI', 2200);
+        } else {
+            if (toolbar) toolbar.style.display = '';
+            if (this._sidebar) this._sidebar.style.display = '';
+            if (this._bgCanvas) this._bgCanvas.style.display = '';
+            if (this._inner)    this._inner.style.display    = '';
+        }
+    }
+
     _setSelected(nodeId, addToSelection = false) {
         if (!addToSelection) {
         // Deselect all first
@@ -3060,10 +3107,15 @@ _sceneHasGeometry() {
 
         // Tab key removed: the canvas is always open — no toggle needed.
 
-        // Escape: deselect any selected node cards.
-        // The overlay is permanently visible so Escape no longer closes it.
+        // Escape: exit presentation mode if active, otherwise deselect any
+        // selected node cards. The overlay is permanently visible so Escape
+        // no longer closes it.
         if (e.key === 'Escape' && this._open) {
-            this._setSelected(null);
+            if (this._presentationMode) {
+                this._togglePresentationMode();
+            } else {
+                this._setSelected(null);
+            }
         }
 
         // Delete / Backspace: remove all currently selected node cards
@@ -3075,6 +3127,17 @@ _sceneHasGeometry() {
             this._open && this._selectedIds.size > 0) {
             e.preventDefault();
             this._deleteSelectedNodes();
+        }
+
+        // 'F' key: toggle "presentation mode" — hides the toolbar and
+        // sidebar so only the rendered geometry is visible, full-bleed.
+        // Intended for capturing clean screenshots/video/GIFs without any
+        // UI chrome in frame. Press F again (or Escape) to restore the UI.
+        // Does not affect the underlying render in any way — purely a
+        // visibility toggle on the toolbar/sidebar DOM elements.
+        if (e.key === 'f' || e.key === 'F') {
+            e.preventDefault();
+            this._togglePresentationMode();
         }
         });
 
