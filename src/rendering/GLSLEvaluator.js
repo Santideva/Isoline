@@ -148,6 +148,59 @@ export class GLSLEvaluator {
       }
     }
 
+    // ── Output-level placement transform ─────────────────────────────────
+    // Rename the combined body to sceneSDF_raw, then generate a wrapper
+    // sceneSDF that applies the inverse output-transform before delegating.
+    // This applies once to the FULLY COMBINED result regardless of how many
+    // source branches feed into the output node — identical semantics to
+    // the CPU getRootSDF() wrapper in NodeEvaluator.js.
+    sceneSDFStr = sceneSDFStr.replace(/sceneSDF/g, 'sceneSDF_raw');
+
+    const op = outputNode.params;
+    const placeTx = this._f(op.posX    ?? 0);
+    const placeTy = this._f(op.posY    ?? 0);
+    const placeTz = this._f(op.posZ    ?? 0);
+    const placeRx = this._f(op.rotateX ?? 0);
+    const placeRy = this._f(op.rotateY ?? 0);
+    const placeRz = this._f(op.rotateZ ?? 0);
+
+    let placementWrapper;
+    if (mode === '3d') {
+      // Full 3D placement — translation + all three rotation axes.
+      placementWrapper = `
+float sceneSDF(vec3 p) {
+  vec3 q = p - vec3(${placeTx}, ${placeTy}, ${placeTz});
+
+  // Inverse Z rotation (undo roll)
+  { float cz = cos(-${placeRz}); float sz = sin(-${placeRz});
+    q = vec3(q.x*cz - q.y*sz, q.x*sz + q.y*cz, q.z); }
+
+  // Inverse Y rotation (undo yaw)
+  { float cy = cos(-${placeRy}); float sy = sin(-${placeRy});
+    q = vec3(q.x*cy + q.z*sy, q.y, -q.x*sy + q.z*cy); }
+
+  // Inverse X rotation (undo pitch)
+  { float cx = cos(-${placeRx}); float sx = sin(-${placeRx});
+    q = vec3(q.x, q.y*cx - q.z*sx, q.y*sx + q.z*cx); }
+
+  return sceneSDF_raw(q);
+}
+float sceneSDF(vec2 p) { return sceneSDF(vec3(p.x, p.y, 0.0)); }`;
+    } else {
+      // 2D placement — translation in XY + rotation around Z only.
+      // posZ/rotateX/rotateY are not meaningful in 2D render modes
+      // (contours/fill/arcs) and are intentionally ignored here.
+      placementWrapper = `
+float sceneSDF(vec2 p) {
+  vec2 q = p - vec2(${placeTx}, ${placeTy});
+  { float c = cos(-${placeRz}); float s = sin(-${placeRz});
+    q = vec2(q.x*c - q.y*s, q.x*s + q.y*c); }
+  return sceneSDF_raw(q);
+}`;
+    }
+
+    sceneSDFStr += '\n' + placementWrapper;
+
     const source = [this._preamble(), ...functions, sceneSDFStr].join('\n\n');
     return { source, uniforms: this.uniforms, rootFn };
   }
@@ -198,10 +251,11 @@ export class GLSLEvaluator {
       return false;
     }
 
-    // twistNode and bendNode always emit float fn(vec3 p) regardless of input —
-    // their GLSL templates are inherently 3D (they rotate in 3D space).
-    // _nodeOutputIs3D must return true for them unconditionally.
-    const ALWAYS_3D_OUTPUT = new Set(['twistNode', 'bendNode']);
+    // twistNode, bendNode, and transform3DNode always emit float fn(vec3 p)
+    // regardless of input — their GLSL templates are inherently 3D
+    // (they translate/rotate in 3D space). _nodeOutputIs3D must return
+    // true for them unconditionally.
+    const ALWAYS_3D_OUTPUT = new Set(['twistNode', 'bendNode', 'transform3DNode']);
     if (ALWAYS_3D_OUTPUT.has(node.type)) return true;
 
     // Passthrough transform nodes inherit dimensionality from their input
@@ -477,12 +531,37 @@ float ${fn}(vec3 p) {
           );
         }
 
-        const off = this._f(p.offset ?? 0);
-        return `// revolveNode ${node.id}
+        const off  = this._f(p.offset ?? 0);
+        const axis = p.axis ?? 'Y';
+
+        // For each axis, compute the radial distance from that axis (q)
+        // and the axial coordinate (h), then evaluate the 2D profile SDF
+        // at (q, h). This is the standard surface-of-revolution formula
+        // applied to whichever world axis the user selected.
+        // Y (default): revolves around the vertical axis — profile in XY
+        //              plane, sweeping around Y, same as a standard lathe.
+        // X: revolves around the horizontal axis — useful for shapes that
+        //    are naturally described in side view (a dome, an arch profile).
+        // Z: revolves around the depth axis — useful for front-facing profiles.
+        if (axis === 'X') {
+          return `// revolveNode (axis=X) ${node.id}
+float ${fn}(vec3 p) {
+  float q = length(vec2(p.y, p.z)) - ${off};
+  return ${inputFn}(vec2(q, p.x));
+}`;
+        } else if (axis === 'Z') {
+          return `// revolveNode (axis=Z) ${node.id}
+float ${fn}(vec3 p) {
+  float q = length(vec2(p.x, p.y)) - ${off};
+  return ${inputFn}(vec2(q, p.z));
+}`;
+        } else {
+          return `// revolveNode (axis=Y) ${node.id}
 float ${fn}(vec3 p) {
   float q = length(vec2(p.x, p.z)) - ${off};
   return ${inputFn}(vec2(q, p.y));
 }`;
+        }
       }
 
       default:
@@ -855,14 +934,18 @@ ${reflBlock}
         const inputFn = this._resolveInputFn(node, 'sdf');
         if (!inputFn) return this._fallback2D(fn, node.id, 'mobiusNode missing sdf');
 
-        const aRe = this._f(p.aRe ?? 1);
-        const aIm = this._f(p.aIm ?? 0);
-        const bRe = this._f(p.bRe ?? 0);
-        const bIm = this._f(p.bIm ?? 0);
-        const cRe = this._f(p.cRe ?? 0);
-        const cIm = this._f(p.cIm ?? 0);
-        const dRe = this._f(p.dRe ?? 1);
-        const dIm = this._f(p.dIm ?? 0);
+        // Wrap each coefficient in parentheses so that negative values
+        // like -1.87 produce (1.0)*x+(-1.87)*y rather than 1.0*x--1.87*y.
+        // The double-minus (--) is a GLSL parse error on some drivers even
+        // though it is mathematically identical to subtraction.
+        const aRe = `(${this._f(p.aRe ?? 1)})`;
+        const aIm = `(${this._f(p.aIm ?? 0)})`;
+        const bRe = `(${this._f(p.bRe ?? 0)})`;
+        const bIm = `(${this._f(p.bIm ?? 0)})`;
+        const cRe = `(${this._f(p.cRe ?? 0)})`;
+        const cIm = `(${this._f(p.cIm ?? 0)})`;
+        const dRe = `(${this._f(p.dRe ?? 1)})`;
+        const dIm = `(${this._f(p.dIm ?? 0)})`;
 
         // Detect 3D input — Möbius operates on XY complex plane, preserves Z
         const edge     = this.graph.getIncomingEdge(node.id, 'sdf');
@@ -873,17 +956,19 @@ ${reflBlock}
           ? `${inputFn}(vec3(tx,ty,p.z))`
           : `${inputFn}(vec2(tx,ty))`;
 
+        // Use only addition throughout — all signs are carried by the
+        // parenthesised coefficient literals, so no -- can ever appear.
         return `// mobiusNode ${node.id}
 float ${fn}(${dim} p) {
-  float x=p.x; float y=p.y;
-  float nRe=${aRe}*x-${aIm}*y+${bRe};
-  float nIm=${aRe}*y+${aIm}*x+${bIm};
-  float dnRe=${cRe}*x-${cIm}*y+${dRe};
-  float dnIm=${cRe}*y+${cIm}*x+${dIm};
-  float denom=dnRe*dnRe+dnIm*dnIm;
-  if(denom<1e-10) return 1e10;
-  float tx=(nRe*dnRe+nIm*dnIm)/denom;
-  float ty=(nIm*dnRe-nRe*dnIm)/denom;
+  float x = p.x; float y = p.y;
+  float nRe  = ${aRe}*x + (${this._f(-(p.aIm ?? 0))})*y + ${bRe};
+  float nIm  = ${aRe}*y + ${aIm}*x + ${bIm};
+  float dnRe = ${cRe}*x + (${this._f(-(p.cIm ?? 0))})*y + ${dRe};
+  float dnIm = ${cRe}*y + ${cIm}*x + ${dIm};
+  float denom = dnRe*dnRe + dnIm*dnIm;
+  if (denom < 1e-10) return 1e10;
+  float tx = (nRe*dnRe + nIm*dnIm) / denom;
+  float ty = (nIm*dnRe - nRe*dnIm) / denom;
   return ${callExpr};
 }`;
       }
@@ -970,6 +1055,49 @@ float ${fn}(vec3 p) {
   float angle = p.x * ${strength};
   float c = cos(angle); float s = sin(angle);
   vec3 tp = vec3(c*p.x - s*p.y, s*p.x + c*p.y, p.z);
+  return ${inputCall};
+}`;
+      }
+
+      case 'transform3DNode': {
+        const inputFn = this._resolveInputFn(node, 'sdf');
+        if (!inputFn) return this._fallback3D(fn, node.id, 'transform3DNode missing sdf');
+
+        const tx = this._f(p.posX    ?? 0);
+        const ty = this._f(p.posY    ?? 0);
+        const tz = this._f(p.posZ    ?? 0);
+        const rx = this._f(p.rotateX ?? 0);
+        const ry = this._f(p.rotateY ?? 0);
+        const rz = this._f(p.rotateZ ?? 0);
+
+        const edge      = this.graph.getIncomingEdge(node.id, 'sdf');
+        const baseNode  = edge ? this.graph.nodes.get(edge.fromNode) : null;
+        const inputIs3D = baseNode && this._nodeOutputIs3D(baseNode);
+        const inputCall = inputIs3D ? `${inputFn}(q)` : `${inputFn}(q.xy)`;
+
+        // Inverse transform applied to the query point — identical math to
+        // the CPU evaluator (transform3DNode case in NodeEvaluator.js) and
+        // to the output-level placement wrapper generated below in
+        // generate(). Applied in order: translate, inverse-Z, inverse-Y,
+        // inverse-X. Each step reassigns q from a vec3 constructor, so all
+        // components on the right-hand side are read BEFORE any are
+        // overwritten — sequential rotation composition is correct.
+        return `// transform3DNode ${node.id}
+float ${fn}(vec3 p) {
+  vec3 q = p - vec3(${tx}, ${ty}, ${tz});
+
+  // Inverse Z rotation (undo roll)
+  { float cz = cos(-${rz}); float sz = sin(-${rz});
+    q = vec3(q.x*cz - q.y*sz, q.x*sz + q.y*cz, q.z); }
+
+  // Inverse Y rotation (undo yaw)
+  { float cy = cos(-${ry}); float sy = sin(-${ry});
+    q = vec3(q.x*cy + q.z*sy, q.y, -q.x*sy + q.z*cy); }
+
+  // Inverse X rotation (undo pitch)
+  { float cx = cos(-${rx}); float sx = sin(-${rx});
+    q = vec3(q.x, q.y*cx - q.z*sx, q.y*sx + q.z*cx); }
+
   return ${inputCall};
 }`;
       }
@@ -1109,6 +1237,11 @@ float ${fn}(${dim} p) {
     if (!isFinite(v)) return '1e10';
     let s = Number(v).toFixed(7);
     if (!s.includes('.')) s += '.0';
+    // Wrap negative literals in parentheses so they never produce a double
+    // operator when interpolated into arithmetic expressions.
+    // Example: without wrapping,  a - _f(-1.87)  →  a--1.87  (GLSL parse error)
+    //          with wrapping,     a - _f(-1.87)  →  a-(-1.87)  (valid GLSL)
+    if (s.startsWith('-')) return `(${s})`;
     return s;
   }
 

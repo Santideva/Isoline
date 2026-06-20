@@ -32,16 +32,36 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._camTarget = [0, 0, 0];
     this._fov       = 45;              // degrees
 
-    // Directional light
-    this._lightDir   = [0.6, 0.8, 0.4];   // world direction (will be normalised)
-    this._lightColor = [1.0, 0.95, 0.9];
-    this._ambient    = [0.08, 0.08, 0.10];
+    // Directional light — acts as the "key" light in a three-point setup.
+    // Slightly warm so it pairs naturally against the cool blue fill light below.
+    this._lightDir   = [0.55, 0.75, 0.45];   // world direction (will be normalised)
+    this._lightColor = [1.0, 0.96, 0.88];
+    this._ambient    = [0.06, 0.065, 0.085]; // slightly cool, low — most fill now comes from the rim/fill lights below
 
-    // Material
-    this._matColor = [0.40, 0.55, 0.70];
+    // Material — base albedo plus simple non-metallic PBR-ish response controls.
+    // These are intentionally simple (not a full metallic/roughness pipeline)
+    // but give surfaces a sense of material rather than flat Lambertian shading.
+    this._matColor     = [0.42, 0.52, 0.68];
+    this._roughness    = 0.45;   // 0 = mirror-tight specular, 1 = very soft/broad highlight
+    this._specularInt  = 0.55;   // overall specular highlight strength
+    this._fresnelPower = 2.5;    // rim-light falloff curve — lower = wider rim
+    this._fresnelInt   = 0.35;   // rim brightness strength
 
-    // Point lights — array of { pos:[x,y,z], color:[r,g,b], radius:number }
-    this._pointLights = [];
+    // Point lights — array of { pos:[x,y,z], color:[r,g,b], radius:number }.
+    // Default to a classic three-point rig (key handled by the directional
+    // light above; these two act as fill + rim) so geometry reads with depth
+    // and separation out of the box, without requiring the caller to set
+    // up lighting manually. Particularly important for repeated/tiled
+    // geometry, where a single flat light makes adjacent tiles indistinguishable.
+    this._pointLights = [
+      // Cool fill light, opposite-ish side from the key light, soft and dim —
+      // lifts shadow detail without flattening the form.
+      { pos: [-4, 2, -3], color: [0.55, 0.65, 0.85], radius: 14 },
+      // Warm rim/back light — catches edges and separates the silhouette
+      // from the background, and gives adjacent tiled elements distinct
+      // highlighted edges even when their face-on shading is similar.
+      { pos: [2, 3, -5],  color: [0.9, 0.55, 0.35],  radius: 12 },
+    ];
 
     // Ray march tuning — changing maxSteps forces recompile (it is baked)
     this._maxSteps  = 128;
@@ -76,8 +96,12 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._u3f('uLightColor', ...this._lightColor);
     this._u3f('uAmbient',    ...this._ambient);
 
-    // Material colour
-    this._u3f('uMatColor', ...this._matColor);
+    // Material colour + simple PBR-ish response parameters
+    this._u3f('uMatColor',     ...this._matColor);
+    this._u1f('uRoughness',    this._roughness    ?? 0.45);
+    this._u1f('uSpecularInt',  this._specularInt  ?? 0.55);
+    this._u1f('uFresnelPower', this._fresnelPower ?? 2.5);
+    this._u1f('uFresnelInt',   this._fresnelInt   ?? 0.35);
 
     // Ray march tuning
     this._u1f('uMaxDist',   this._maxDist);
@@ -143,6 +167,22 @@ export class RayMarchRenderer extends WebGLRenderer {
    */
   setMaterialColor(r, g, b) {
     this._matColor = [r, g, b];
+  }
+
+  /**
+   * Adjust the material's surface response. All params optional — pass
+   * only the ones you want to change.
+   * @param {object} opts
+   * @param {number} [opts.roughness]    0 (mirror-tight) – 1 (very soft). Default 0.45.
+   * @param {number} [opts.specularInt]  Overall specular highlight strength. Default 0.55.
+   * @param {number} [opts.fresnelPower] Rim falloff curve — lower = wider rim. Default 2.5.
+   * @param {number} [opts.fresnelInt]   Rim brightness strength. Default 0.35.
+   */
+  setMaterial(opts = {}) {
+    if (opts.roughness    !== undefined) this._roughness    = opts.roughness;
+    if (opts.specularInt  !== undefined) this._specularInt  = opts.specularInt;
+    if (opts.fresnelPower !== undefined) this._fresnelPower = opts.fresnelPower;
+    if (opts.fresnelInt   !== undefined) this._fresnelInt   = opts.fresnelInt;
   }
 
   /**
@@ -216,6 +256,10 @@ uniform vec3  uAmbient;
 
 // Material
 uniform vec3  uMatColor;
+uniform float uRoughness;
+uniform float uSpecularInt;
+uniform float uFresnelPower;
+uniform float uFresnelInt;
 
 // Ray march tuning
 uniform float uMaxDist;
@@ -257,15 +301,20 @@ float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
 }
 
 // ── Ambient occlusion ─────────────────────────────────────────────────────────
+// Wider sample spacing and a steeper response than a minimal implementation —
+// tuned specifically so that gaps between tiled/repeated geometry (e.g. the
+// Tiling, Repeat, and Symmetry Orbit nodes) read as clearly shadowed creases
+// rather than washing out into flat grey. A single directional light alone
+// cannot separate adjacent same-orientation tiles; AO is what does that work.
 float ambientOcclusion(vec3 p, vec3 n) {
   float occ = 0.0;
   float w   = 1.0;
-  for (int i = 1; i <= 5; i++) {
-    float d  = float(i) * 0.08;
+  for (int i = 1; i <= 6; i++) {
+    float d  = float(i) * 0.12;
     occ     += w * (d - sceneSDF(p + n * d));
-    w       *= 0.5;
+    w       *= 0.55;
   }
-  return clamp(1.0 - 2.0 * occ, 0.0, 1.0);
+  return clamp(1.0 - 2.6 * occ, 0.0, 1.0);
 }
 
 // ── Sphere-tracing loop ───────────────────────────────────────────────
@@ -313,21 +362,41 @@ void main() {
   }
 
   // ── Surface shading ──────────────────────────────────────────────────────────
-  vec3 p      = uCamPos + t * rd;
-  vec3 normal = calcNormal(p);
+  vec3 p       = uCamPos + t * rd;
+  vec3 normal  = calcNormal(p);
+  vec3 viewDir = normalize(uCamPos - p);
 
-  // Directional light
+  // Specular exponent derived from roughness: low roughness → tight, bright
+  // highlight (shiny); high roughness → broad, soft highlight (matte).
+  // Range chosen so uRoughness=0.45 (default) lands near the old fixed 32.0.
+  float specExp = mix(128.0, 4.0, clamp(uRoughness, 0.0, 1.0));
+
+  // ── Fresnel / rim term ────────────────────────────────────────────────────
+  // Brightens surfaces at grazing angles to the camera. This is the single
+  // biggest legibility win for tiled/repeated geometry (Tiling, Repeat,
+  // Symmetry Orbit/Fold nodes): even when two adjacent tiles have nearly
+  // identical diffuse shading from the key light, their silhouette edges
+  // relative to the camera differ, so the rim term gives each tile a
+  // distinct highlighted boundary, making individual components readable
+  // at a glance instead of blurring into a single textured mass.
+  float fresnel = pow(1.0 - clamp(dot(normal, viewDir), 0.0, 1.0), uFresnelPower) * uFresnelInt;
+
+  // Directional (key) light
   float diff   = max(dot(normal, uLightDir), 0.0);
-  vec3  halfV  = normalize(uLightDir - rd);
-  float spec   = pow(max(dot(normal, halfV), 0.0), 32.0);
+  vec3  halfV  = normalize(uLightDir + viewDir);
+  float spec   = pow(max(dot(normal, halfV), 0.0), specExp) * uSpecularInt;
   float shadow = softShadow(p + normal * 0.002, uLightDir, 0.01, 6.0, 12.0);
   float ao     = ambientOcclusion(p, normal);
 
   vec3 col = uMatColor * (uAmbient * ao
            + uLightColor * diff * shadow)
-           + uLightColor * spec * shadow * 0.3;
+           + uLightColor * spec * shadow
+           + uLightColor * fresnel * ao;
 
-  // Point lights
+  // Point lights (fill + rim by default — see RayMarchRenderer constructor).
+  // Each point light also contributes its own (cheaper, unshadowed) specular
+  // and Fresnel term so multi-light material response stays consistent
+  // rather than only the key light showing highlights.
   for (int i = 0; i < 4; i++) {
     if (i >= uPointLightCount) break;
     vec3  toLight  = uPointLightPos[i] - p;
@@ -338,7 +407,12 @@ void main() {
                     (uPointLightRadius[i] * uPointLightRadius[i]));
     float diffL    = max(dot(normal, dirL), 0.0);
     float shadowL  = softShadow(p + normal * 0.002, dirL, 0.01, distL, 8.0);
-    col           += uMatColor * uPointLightColor[i] * diffL * atten * shadowL;
+
+    vec3  halfL    = normalize(dirL + viewDir);
+    float specL    = pow(max(dot(normal, halfL), 0.0), specExp) * uSpecularInt * 0.6;
+
+    col += uMatColor * uPointLightColor[i] * diffL * atten * shadowL;
+    col += uPointLightColor[i] * specL * atten * shadowL;
   }
 
   // Distance fog

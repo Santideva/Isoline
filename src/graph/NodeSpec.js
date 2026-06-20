@@ -299,6 +299,8 @@ export const NODE_TYPES = {
     params: [
       { name: 'offset', type: 'number', default: 0, min: -5, max: 5, step: 0.01,
         hint: 'Distance from the revolution axis to the 2D profile. Increase to create a hollow tube rather than a solid.' },
+      { name: 'axis', type: 'select', default: 'Y', options: ['Y', 'X', 'Z'],
+        hint: 'The world axis the 2D profile is swept around. Y = vertical axis (default torus), X = horizontal axis, Z = depth axis.' },
     ],
   },
 
@@ -709,6 +711,36 @@ export const NODE_TYPES = {
 
   // ── Transform ─────────────────────────────────────────────────────────────
 
+  transform3DNode: {
+    type: 'transform3DNode',
+    category: 'transform',
+    label: 'Position / Orient',
+    hint: 'Moves and rotates the incoming geometry in 3D space without changing ' +
+          'its internal structure. Use this to position sub-assemblies relative ' +
+          'to each other before blending — e.g. placing "wing" geometry relative ' +
+          'to a "body" before a smooth union. Works on both 2D and 3D inputs; ' +
+          'posZ/rotateX/rotateY only affect 3D render modes.',
+    timeVarying: false,
+    ports: [
+      { name: 'sdf',    type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      { name: 'result', type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
+    ],
+    params: [
+      { name: 'posX', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        hint: 'Move this branch along the X axis (left / right).' },
+      { name: 'posY', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        hint: 'Move this branch along the Y axis (up / down).' },
+      { name: 'posZ', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        hint: 'Move this branch along the Z axis (toward / away from camera). Only affects 3D render modes.' },
+      { name: 'rotateX', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        hint: 'Rotate this branch around the X axis (pitch). Only affects 3D render modes.' },
+      { name: 'rotateY', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        hint: 'Rotate this branch around the Y axis (yaw). Only affects 3D render modes.' },
+      { name: 'rotateZ', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        hint: 'Rotate this branch around the Z axis (roll).' },
+    ],
+  },
+
   affineTransform: {
     type: 'affineTransform',
     category: 'transform',
@@ -845,6 +877,31 @@ export const NODE_TYPES = {
       { name: 'resolution',   type: 'number', default: 150, min: 20, max: 400, step: 10 },
       { name: 'boundsMin',    type: 'number', default: -4,  min: -20, max: 0,  step: 0.5 },
       { name: 'boundsMax',    type: 'number', default: 4,   min: 0,   max: 20, step: 0.5 },
+
+      // ── Object placement ─────────────────────────────────────────────────
+      // Repositions the ENTIRE final composed shape as a single rigid body,
+      // after every blend and transform in the graph. Always available in
+      // the render drawer, no wiring required. This is the "where is my
+      // model in the world" control, complementary to the camera-view
+      // controls which control "where is my eye looking from".
+      { name: 'posX', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        label: 'placeX',
+        hint: 'Moves the final composed geometry along X. Affects all render modes and STL export.' },
+      { name: 'posY', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        label: 'placeY',
+        hint: 'Moves the final composed geometry along Y. Affects all render modes and STL export.' },
+      { name: 'posZ', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        label: 'placeZ',
+        hint: 'Moves the final composed geometry along Z. Only affects 3D render modes (Surface, Ray March) and STL export.' },
+      { name: 'rotateX', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        label: 'rotateX',
+        hint: 'Rotates the final geometry around X (pitch). Only affects 3D render modes and STL export.' },
+      { name: 'rotateY', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        label: 'rotateY',
+        hint: 'Rotates the final geometry around Y (yaw). Only affects 3D render modes and STL export.' },
+      { name: 'rotateZ', type: 'number', default: 0, min: 0, max: 6.28, step: 0.01,
+        label: 'rotateZ',
+        hint: 'Rotates the final geometry around Z (roll). Affects all render modes and STL export.' },
     ],
   },
 };

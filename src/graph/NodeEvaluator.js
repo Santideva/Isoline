@@ -24,6 +24,7 @@ import {
   invertAffine,
   isInvertible,
 } from '../utils/affine.js';
+import { applyInverseTransform3D } from '../utils/transform3D.js';
 import { ComplexShape2D } from '../Geometry/ComplexShape2d.js';
 import { TrianglePrimitive, ArcPrimitive } from '../Primitives/primaryDerivativePrimitives.js';
 import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from '../Primitives/regionPrimitives.js';
@@ -106,12 +107,36 @@ export class NodeEvaluator {
     }).filter(Boolean);
 
     if (sdfs.length === 0) return null;
-    if (sdfs.length === 1) return sdfs[0];
+
+    const combinedSDF = sdfs.length === 1
+      ? sdfs[0]
+      : (pt, cs = [], t = 0) => {
+          let d = Infinity;
+          for (const fn of sdfs) d = Math.min(d, fn(pt, cs, t));
+          return d;
+        };
+
+    // ── Output-level placement transform ───────────────────────────────────
+    // Applies once to the FULLY COMBINED result, after every blend and
+    // transform in the graph and after every source branch has been merged.
+    // Repositions the whole scene as a single rigid body. Implemented via
+    // the same inverse-point trick as transform3DNode, so a Position/Orient
+    // node mid-graph and the output drawer sliders behave identically.
+    const op = outputNode.params;
+    const placement = {
+      posX:    op.posX    ?? 0,
+      posY:    op.posY    ?? 0,
+      posZ:    op.posZ    ?? 0,
+      rotateX: op.rotateX ?? 0,
+      rotateY: op.rotateY ?? 0,
+      rotateZ: op.rotateZ ?? 0,
+    };
+    const isIdentity = Object.values(placement).every(v => v === 0);
+    if (isIdentity) return combinedSDF;
 
     return (pt, cs = [], t = 0) => {
-      let d = Infinity;
-      for (const fn of sdfs) d = Math.min(d, fn(pt, cs, t));
-      return d;
+      const local = applyInverseTransform3D(pt, placement);
+      return combinedSDF(local, cs, t);
     };
   }
 
@@ -312,12 +337,27 @@ export class NodeEvaluator {
       case 'revolveNode': {
         const baseSDF = this._resolveSDF(node, 'sdf');
         if (!baseSDF) return { result: () => Infinity };
-        const { offset } = node.params;
-        const off = offset ?? 0;
+        const off  = node.params.offset ?? 0;
+        const axis = node.params.axis   ?? 'Y';
         return {
           result: (pt) => {
-            const q = Math.sqrt(pt.x * pt.x + (pt.z || 0) * (pt.z || 0)) - off;
-            return baseSDF({ x: q, y: pt.y });
+            const x = pt.x, y = pt.y, z = pt.z || 0;
+            // For each axis, compute the radial distance from that axis
+            // and pass it as the first component to the 2D profile SDF.
+            // The second component is the coordinate along the axis.
+            // This is the standard surface-of-revolution formula, applied
+            // to whichever axis the user selected.
+            if (axis === 'X') {
+              const q = Math.sqrt(y * y + z * z) - off;
+              return baseSDF({ x: q, y: x });
+            } else if (axis === 'Z') {
+              const q = Math.sqrt(x * x + y * y) - off;
+              return baseSDF({ x: q, y: z });
+            } else {
+              // Y (default)
+              const q = Math.sqrt(x * x + z * z) - off;
+              return baseSDF({ x: q, y });
+            }
           }
         };
       }
@@ -748,6 +788,27 @@ export class NodeEvaluator {
             // Forward z — tiling only folds XY, z passes through unchanged
             const d = baseSDF({ x: fp.x, y: fp.y, z: pt.z || 0 }, cs, t);
             return d - isoOffset;
+          }
+        };
+      }
+
+      case 'transform3DNode': {
+        const baseSDF = this._resolveSDF(node, 'sdf');
+        if (!baseSDF) return { result: () => Infinity };
+
+        const params = {
+          posX:    node.params.posX    ?? 0,
+          posY:    node.params.posY    ?? 0,
+          posZ:    node.params.posZ    ?? 0,
+          rotateX: node.params.rotateX ?? 0,
+          rotateY: node.params.rotateY ?? 0,
+          rotateZ: node.params.rotateZ ?? 0,
+        };
+
+        return {
+          result: (pt, cs = [], t = 0) => {
+            const local = applyInverseTransform3D(pt, params);
+            return baseSDF(local, cs, t);
           }
         };
       }

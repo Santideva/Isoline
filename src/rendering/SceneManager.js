@@ -19,6 +19,7 @@ import { SDFRenderer }      from "./SDFRenderer.js";
 import { RayMarchRenderer } from "./RayMarchRenderer.js";
 import { marchingCubes }    from "../utils/marchingCubes.js";
 import { trianglesToSTL, downloadSTL } from "../utils/stlExport.js";
+import { computeWorldBounds2D, computeWorldBounds3D } from "../utils/transform3D.js";
 
 
 export class SceneManager {
@@ -605,9 +606,13 @@ export class SceneManager {
 
   _buildSchurObject(schur, method, sdfOverride = null, bounds2D = null, bounds3D = null, resolution = 150) {
     // Use caller-supplied bounds (from adaptive logic in renderSDF) if provided,
-    // otherwise fall back to the hardcoded defaults.
-    bounds2D = bounds2D ?? [-4, -4, 4, 4];
-    bounds3D = bounds3D ?? [-4, -4, -4, 4, 4, 4];
+    // otherwise fall back to effective bounds computed from the output node's
+    // boundsMin/boundsMax AND the output placement transform (posX/Y/Z,
+    // rotateX/Y/Z). This ensures contour rendering, surface rendering, and
+    // STL export never clip geometry that has been repositioned via the
+    // output node's placement controls.
+    bounds2D = bounds2D ?? this._getEffectiveBounds('2d');
+    bounds3D = bounds3D ?? this._getEffectiveBounds('3d');
 
     // Clamp resolution to a safe integer range so bad values from the slider
     // never crash the marching-squares scan.
@@ -1537,6 +1542,51 @@ export class SceneManager {
   }
 
   /**
+   * Read the output node's boundsMin/boundsMax AND placement params
+   * (posX/Y/Z, rotateX/Y/Z), and return effective world-space scan bounds
+   * for marching squares (2D) or marching cubes / ray march (3D).
+   *
+   * Bounds are shifted by the placement translation exactly, and expanded
+   * to a bounding sphere if any rotation is present — this guarantees that
+   * geometry repositioned via the output drawer's placement sliders is
+   * never clipped during rendering or STL export.
+   *
+   * @param {'2d'|'3d'} dims
+   * @returns {number[]}
+   *   2D: [minX, minY, maxX, maxY]
+   *   3D: [minX, minY, minZ, maxX, maxY, maxZ]
+   */
+  _getEffectiveBounds(dims) {
+    let outputNode = null;
+    this.evaluator?.graph?.nodes?.forEach(n => {
+      if (n.type === 'outputNode') outputNode = n;
+    });
+    const p    = outputNode?.params ?? {};
+    const bMin = p.boundsMin ?? -4;
+    const bMax = p.boundsMax ??  4;
+
+    if (dims === '3d') {
+      const b = computeWorldBounds3D(bMin, bMax, p);
+      if (b.expanded) {
+        logger.info(
+          'Render bounds expanded to cover rotation from the output ' +
+          'placement transform — effective resolution will appear coarser.'
+        );
+      }
+      return [b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ];
+    } else {
+      const b = computeWorldBounds2D(bMin, bMax, p);
+      if (b.expanded) {
+        logger.info(
+          'Render bounds expanded to cover rotation from the output ' +
+          'placement transform — effective resolution will appear coarser.'
+        );
+      }
+      return [b.minX, b.minY, b.maxX, b.maxY];
+    }
+  }
+
+  /**
    * Export the current scene as a binary STL file for 3D printing.
    *
    * Process:
@@ -1575,31 +1625,15 @@ export class SceneManager {
     }
 
     // ── Step 2: determine 3D scan bounds ─────────────────────────────────
-    // Read from the output node params if available. The bounds stored there
-    // are 2D bounds [min, max] applied symmetrically to all three axes.
-    // This is appropriate for most SDF scenes which are roughly centred.
-    let boundsMin = -4;
-    let boundsMax =  4;
-
-    const graph = this.evaluator.graph;
-    if (graph) {
-      graph.nodes.forEach(n => {
-        if (n.type === 'outputNode') {
-          if (n.params.boundsMin !== undefined) boundsMin = n.params.boundsMin;
-          if (n.params.boundsMax !== undefined) boundsMax = n.params.boundsMax;
-        }
-      });
-    }
-
-    // Add a small margin so surface features at the exact boundary are captured
-    const margin = (boundsMax - boundsMin) * 0.05;
+    // Effective bounds already account for the output placement transform
+    // (translation shift, rotation expansion) via _getEffectiveBounds.
+    // Add a small margin on top so surface features at the exact boundary
+    // are captured.
+    const [ex0, ey0, ez0, ex1, ey1, ez1] = this._getEffectiveBounds('3d');
+    const margin = (ex1 - ex0) * 0.05;
     const bounds = [
-      boundsMin - margin,
-      boundsMin - margin,
-      boundsMin - margin,
-      boundsMax + margin,
-      boundsMax + margin,
-      boundsMax + margin,
+      ex0 - margin, ey0 - margin, ez0 - margin,
+      ex1 + margin, ey1 + margin, ez1 + margin,
     ];
 
     // ── Step 3: run marching cubes ────────────────────────────────────────

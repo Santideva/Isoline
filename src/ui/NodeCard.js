@@ -648,13 +648,13 @@ export class NodeCard {
     // Use the optional human-readable label from NodeSpec if provided,
     // otherwise fall back to the raw param name.
     label.textContent = paramSpec.label || paramSpec.name;
-    label.style.cssText = 'font-size:11px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:default;';
+    label.style.cssText = 'font-size:12px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:default;';
 
     // If a hint string is defined in NodeSpec, attach it as a tooltip.
     // The cursor:help style signals to the user that hovering gives info.
     if (paramSpec.hint) {
       label.title = paramSpec.hint;
-      label.style.cssText = 'font-size:11px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:help;';
+      label.style.cssText = 'font-size:12px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:help;';
     }
 
     row.appendChild(label);

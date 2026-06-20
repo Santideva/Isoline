@@ -398,106 +398,102 @@ export const PRESET_WINGED_FORM = {
     },
     graph: {
         nodes: [
-            // ── Central dome ──────────────────────────────────────────────────
-            // The sphere forms the tall central dome — the raised mass that
-            // dominates the form when viewed from any angle. Radius 1.0 makes
-            // it visually larger than the torus equatorial bulge so the dome
-            // clearly rises above the wing plane.
+            // ── Wing ring — torus folded into 4 lobes BEFORE merging ──────────
+            // Key insight: fold the torus first, then merge with sphere.
+            // This keeps the sphere perfectly round (the dome stays clean)
+            // while only the torus ring gets pinched into 4 distinct wing lobes.
+            // If the fold is applied after the merge, the sphere also gets
+            // folded and the dome becomes lumpy.
+
+            // The torus: majorRadius controls wing span, minorRadius controls
+            // wing thickness. 1.45 / 0.38 gives distinct, well-separated wings
+            // that read as four separate lobes rather than a continuous ring.
             {
                 id:    1,
-                type:  'sphere',
-                params: { radius: 1.0, posX: 0, posY: 0, posZ: 0 },
+                type:  'torus',
+                params: {
+                    majorRadius: 1.45,
+                    minorRadius: 0.38,
+                    posX: 0, posY: 0, posZ: 0,
+                },
                 uiPos: { x: 60, y: 60 },
             },
 
-            // ── Wing lobe ring ────────────────────────────────────────────────
-            // The torus sits at the equator of the sphere. Its major radius
-            // determines how far the wings extend outward; its minor radius
-            // determines the thickness/volume of each lobe.
-            // majorRadius 1.4 places the lobe centres well outside the sphere
-            // surface so they read as distinct wings rather than a simple bulge.
-            // minorRadius 0.55 gives them substantial volume.
+            // 4-fold symmetry fold on the torus ONLY.
+            // This pinches the continuous ring into 4 discrete wing bulges.
+            // rotation 0 places wings at N/S/E/W — adjust to taste.
+            // reflectX: 'no' keeps each wing as a single lobe without
+            // subdividing it further.
             {
                 id:    2,
-                type:  'torus',
+                type:  'symmetryFoldNode',
                 params: {
-                    majorRadius: 1.4,
-                    minorRadius: 0.55,
-                    posX: 0, posY: 0, posZ: 0,
+                    folds:    4,
+                    centerX:  0,
+                    centerY:  0,
+                    rotation: 0,
+                    reflectX: 'no',
+                    reflectY: 'no',
                 },
-                uiPos: { x: 60, y: 260 },
+                uiPos: { x: 300, y: 60 },
             },
 
-            // ── Merge dome and wing ring ──────────────────────────────────────
-            // High smoothness (20) creates an extremely wide blending zone.
-            // This is the key parameter: it makes the torus lobes appear to
-            // grow organically out of the sphere rather than being attached
-            // to it. The result is the characteristic fluid continuity between
-            // dome and lobes visible in the reference image.
-            // isoOffset 0.15 compensates for the schurBlend boundary shift.
+            // ── Central dome — sphere untouched by the fold ───────────────────
+            // Radius 0.88 makes the dome visibly larger than the torus tube
+            // so it rises clearly above the wing plane. The sphere is NOT
+            // connected through the fold node so it stays perfectly round.
             {
                 id:    3,
+                type:  'sphere',
+                params: { radius: 0.88, posX: 0, posY: 0, posZ: 0 },
+                uiPos: { x: 60, y: 280 },
+            },
+
+            // ── Merge folded wings with round dome ────────────────────────────
+            // smoothness 16 creates a wide enough blending zone that the wings
+            // flow organically out of the sphere. Too low (< 8) and the join
+            // is visible as a hard crease. Too high (> 24) and the wings merge
+            // into the sphere and lose definition.
+            {
+                id:    4,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
-                    smoothness: 20,
+                    smoothness: 16,
                     rotation:   0,
                     scale:      1,
                     posX:       0,
                     posY:       0,
                     isoOffset:  0.15,
                 },
-                uiPos: { x: 320, y: 160 },
+                uiPos: { x: 560, y: 170 },
             },
 
-            // ── 4-fold symmetry fold ──────────────────────────────────────────
-            // The torus has continuous rotational symmetry — it looks the same
-            // from every angle around Y. The symmetry fold breaks this into
-            // 4 discrete sectors, pinching the torus into 4 distinct lobes at
-            // 0°, 90°, 180°, 270°. This creates the 4-wing silhouette.
-            // Applied AFTER the schurBlend so the sphere is also folded,
-            // maintaining the smooth merge at the lobe roots.
-            // rotation 0.785 (45°) rotates the fold axes so lobes point
-            // diagonally rather than along the world axes — more dynamic.
-            {
-                id:    4,
-                type:  'symmetryFoldNode',
-                params: {
-                    folds:    4,
-                    centerX:  0,
-                    centerY:  0,
-                    rotation: 0.785,
-                    reflectX: 'no',
-                    reflectY: 'no',
-                },
-                uiPos: { x: 560, y: 160 },
-            },
-
-            // ── Organic asymmetry twist ───────────────────────────────────────
-            // A very low twist strength introduces subtle rotational asymmetry.
-            // Without this the form has perfect 4-fold mechanical symmetry.
-            // The reference image shows the wings have a slight spiral quality —
-            // they do not droop at identical angles. Strength 0.15 is barely
-            // perceptible but changes the feeling from "constructed" to "grown".
+            // ── Slight twist for organic asymmetry ────────────────────────────
+            // strength 0.12 is barely perceptible but breaks the mechanical
+            // perfect symmetry. The reference image has a slight spiral quality
+            // to the wing arrangement — this is what produces it.
+            // Increase to 0.3-0.5 for a more dramatically twisted form.
             {
                 id:    5,
                 type:  'twistNode',
-                params: { strength: 0.15 },
-                uiPos: { x: 800, y: 160 },
+                params: { strength: 0.12 },
+                uiPos: { x: 800, y: 170 },
             },
 
-            // ── Cellular surface texture ──────────────────────────────────────
-            // High frequency (13.0) produces small, dense noise cells that
-            // approximate the scale of the pocking in the reference.
-            // Amplitude 0.06 creates visible groove depth without destroying
-            // the overall form silhouette.
-            // The noise at this frequency reads as cellular/reptilian skin.
-            // A true voronoi cell pattern with sharp grooves is planned for V2.
+            // ── Fine surface texture ──────────────────────────────────────────
+            // amplitude 0.022 is conservative — enough to read as surface
+            // texture without fragmenting the silhouette into blobs.
+            // frequency 16.0 produces fine-grain pocking at the scale of
+            // the reference image cells.
+            // The noise at this amplitude/frequency reads as a hammered or
+            // cast metal surface rather than the sharp voronoi cells of the
+            // reference. Voronoi surface patterning is planned for V2.
             {
                 id:    6,
                 type:  'noiseDisplaceNode',
-                params: { amplitude: 0.06, frequency: 13.0, animated: 'no' },
-                uiPos: { x: 1040, y: 160 },
+                params: { amplitude: 0.022, frequency: 16.0, animated: 'no' },
+                uiPos: { x: 1040, y: 170 },
             },
 
             {
@@ -509,19 +505,19 @@ export const PRESET_WINGED_FORM = {
                     boundsMin:    -4,
                     boundsMax:     4,
                 },
-                uiPos: { x: 1280, y: 160 },
+                uiPos: { x: 1280, y: 170 },
             },
         ],
         edges: [
-            // sphere → schurBlend A (dome input)
-            { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 3, toPort: 'sdfA'   },
-            // torus → schurBlend B (wing ring input)
-            { id: 'e2', fromNode: 2, fromPort: 'sdf',    toNode: 3, toPort: 'sdfB'   },
-            // merged form → 4-fold fold (pinches torus into 4 distinct wings)
-            { id: 'e3', fromNode: 3, fromPort: 'result', toNode: 4, toPort: 'sdf'    },
-            // folded form → slight twist (organic asymmetry)
+            // torus → 4-fold fold (creates 4 distinct wing lobes from ring)
+            { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 2, toPort: 'sdf'    },
+            // folded wings → schurBlend A
+            { id: 'e2', fromNode: 2, fromPort: 'result', toNode: 4, toPort: 'sdfA'   },
+            // round sphere dome → schurBlend B (bypasses fold — stays round)
+            { id: 'e3', fromNode: 3, fromPort: 'sdf',    toNode: 4, toPort: 'sdfB'   },
+            // merged form → slight twist
             { id: 'e4', fromNode: 4, fromPort: 'result', toNode: 5, toPort: 'sdf'    },
-            // twisted form → cellular surface noise
+            // twisted form → fine surface noise
             { id: 'e5', fromNode: 5, fromPort: 'result', toNode: 6, toPort: 'sdf'    },
             // textured form → output
             { id: 'e6', fromNode: 6, fromPort: 'result', toNode: 7, toPort: 'sdf'    },

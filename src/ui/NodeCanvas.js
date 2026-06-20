@@ -48,13 +48,17 @@
     import { saveScene, loadScene, listScenes } from '../persistence.js';
     import { UndoManager } from '../state/UndoManager.js';
     import { PRESETS } from '../presets/presets.js';
+    import * as THREE from 'three';
+    import { NODE_TYPES } from '../graph/NodeSpec.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
     'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
     'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
     'extrudeNode', 'revolveNode',
-    'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode','rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
+    'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode',
+    'transform3DNode',
+    'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
     'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
     'exponentialMapper', 'logarithmicMapper', 'powerMapper',
     'periodicMapper', 'temporalMapper', 'recursiveMapper',
@@ -218,8 +222,9 @@ function _isConvexPolygon(vertices) {
           border-radius: 4px;
           color: rgba(255,255,255,0.8);
           font-size: 12px;
-          padding: 3px 5px;
+          padding: 3px 8px;
           cursor: pointer;
+          min-width: fit-content;
         `;
 
         // Create an <option> with explicit background/color so the native
@@ -251,7 +256,7 @@ function _isConvexPolygon(vertices) {
         ]);
         const _XFORM = new Set([
           'extrude','revolve','tiling','symmetryfold','symmetryorbit',
-          'mobius','noisedisplace','twist','bend','repeat'
+          'mobius','noisedisplace','twist','bend','repeat','position3d'
         ]);
         const _BLEND = new Set([
           'schurBlend','rUnion','rIntersection','rDifference'
@@ -275,7 +280,7 @@ function _isConvexPolygon(vertices) {
         this._2dSelect = document.createElement('select');
         this._2dSelect.style.cssText = _selectStyle;
         this._2dSelect.title = 'Click a 2D primitive to add it to the graph';
-        this._2dSelect.appendChild(_ph('2D ▾'));
+        this._2dSelect.appendChild(_ph('2D Primitive ▾'));
         [
           ['line','Line'], ['triangle','Triangle'], ['arc','Arc'],
           ['circle','Circle'], ['polygon','Polygon'], ['polytope','Conv. Polygon'],
@@ -288,7 +293,7 @@ function _isConvexPolygon(vertices) {
         this._3dSelect = document.createElement('select');
         this._3dSelect.style.cssText = _selectStyle;
         this._3dSelect.title = 'Click a 3D primitive to add it to the graph';
-        this._3dSelect.appendChild(_ph('3D ▾'));
+        this._3dSelect.appendChild(_ph('3D Primitive ▾'));
         [
           ['sphere','Sphere'], ['box','Box'], ['cylinder','Cylinder'],
           ['capsule','Capsule'], ['torus','Torus'], ['cone','Cone'], ['plane','Plane'],
@@ -301,12 +306,13 @@ function _isConvexPolygon(vertices) {
         this._xformSelect = document.createElement('select');
         this._xformSelect.style.cssText = _selectStyle;
         this._xformSelect.title = 'Click an operation to add it to the graph';
-        this._xformSelect.appendChild(_ph('Op ▾'));
+        this._xformSelect.appendChild(_ph('Transform / Operation ▾'));
         [
           ['extrude','Extrude'], ['revolve','Revolve'], ['tiling','Tiling'],
           ['symmetryfold','Sym. Fold'], ['symmetryorbit','Sym. Orbit'],
           ['mobius','Möbius'], ['noisedisplace','Noise Disp.'],
           ['twist','Twist'], ['bend','Bend'], ['repeat','Repeat'],
+          ['position3d','Position / Orient'],
         ].forEach(([v, l]) => this._xformSelect.appendChild(_opt(v, l)));
         this._xformSelect.addEventListener('change', () =>
           _dispatchAdd(this._xformSelect.value, this._xformSelect));
@@ -316,7 +322,7 @@ function _isConvexPolygon(vertices) {
         this._blendSelect = document.createElement('select');
         this._blendSelect.style.cssText = _selectStyle;
         this._blendSelect.title = 'Click a blend mode to add it to the graph';
-        this._blendSelect.appendChild(_ph('Blend ▾'));
+        this._blendSelect.appendChild(_ph('Blend Mode ▾'));
         [
           ['schurBlend','Schur'], ['rUnion','R-Union'],
           ['rIntersection','R-Intersect'], ['rDifference','R-Difference'],
@@ -325,93 +331,11 @@ function _isConvexPolygon(vertices) {
           _dispatchAdd(this._blendSelect.value, this._blendSelect));
         toolbar.appendChild(this._blendSelect);
 
-        // ── Layout group ───────────────────────────────────────────────────────
-        this._layoutSelect = document.createElement('select');
-        this._layoutSelect.style.cssText = _selectStyle;
-        this._layoutSelect.title = 'Choose auto-layout direction';
-        LAYOUT_DIRECTIONS.forEach(dir => {
-          const o = _opt(dir, dir);
-          this._layoutSelect.appendChild(o);
-        });
-        this._layoutSelect.addEventListener('change', () => {
-          this._layoutDir = this._layoutSelect.value;
-          this._undo.snapshot();
-          this._runAutoLayout();
-        });
-        toolbar.appendChild(this._layoutSelect);
-
-        const _autoLayoutBtn = this._makeButton('Auto', () => {
-          this._undo.snapshot();
-          this._runAutoLayout();
-        });
-        _autoLayoutBtn.title = 'Auto-arrange all node cards';
-        toolbar.appendChild(_autoLayoutBtn);
-
-        // "Fit All" — computes the bounding box of every card currently in
-        // the canvas (regardless of position or count) and adjusts zoom+pan
-        // so all cards are visible simultaneously. Useful when cards have
-        // drifted off-screen after heavy editing.
-        const _fitBtn = this._makeButton('Fit All', () => this._fitToScreen());
-        _fitBtn.title = 'Fit all node cards into the visible area';
-        toolbar.appendChild(_fitBtn);
-
-        // ── Node card canvas zoom ─────────────────────────────────────────────
-        const _cardsZoomIn = this._makeButton('+', () => {
-          const newScale = Math.min(3.0, this._transform.scale * 1.25);
-          const cx = (this._bgCanvas.width  || 800) / 2;
-          const cy = (this._bgCanvas.height || 600) / 2;
-          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
-          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
-          this._transform.scale = newScale;
-          this._applyTransform();
-          this._drawEdges();
-        });
-        _cardsZoomIn.title = 'Zoom in on node cards';
-        toolbar.appendChild(_cardsZoomIn);
-
-        const _cardsZoomOut = this._makeButton('−', () => {
-          const newScale = Math.max(0.2, this._transform.scale * 0.8);
-          const cx = (this._bgCanvas.width  || 800) / 2;
-          const cy = (this._bgCanvas.height || 600) / 2;
-          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
-          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
-          this._transform.scale = newScale;
-          this._applyTransform();
-          this._drawEdges();
-        });
-        _cardsZoomOut.title = 'Zoom out on node cards';
-        toolbar.appendChild(_cardsZoomOut);
-
-        // ── 3D scene zoom ─────────────────────────────────────────────────────
-        // Moves the Three.js camera along its view axis. The ray march
-        // renderer syncs its camera from Three.js each frame so these
-        // buttons affect all three render modes.
-        const _sceneZoomIn = this._makeButton('↑', () => {
-          const cam  = this.sceneManager.camera;
-          const ctrl = this.sceneManager.controls;
-          if (!cam || !ctrl) return;
-          const dist = cam.position.distanceTo(ctrl.target);
-          const dir  = cam.position.clone().sub(ctrl.target).normalize();
-          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 0.8)));
-          ctrl.update();
-        });
-        _sceneZoomIn.title = 'Zoom in on 3D scene';
-        toolbar.appendChild(_sceneZoomIn);
-
-        const _sceneZoomOut = this._makeButton('↓', () => {
-          const cam  = this.sceneManager.camera;
-          const ctrl = this.sceneManager.controls;
-          if (!cam || !ctrl) return;
-          const dist = cam.position.distanceTo(ctrl.target);
-          const dir  = cam.position.clone().sub(ctrl.target).normalize();
-          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 1.25)));
-          ctrl.update();
-        });
-        _sceneZoomOut.title = 'Zoom out on 3D scene';
-        toolbar.appendChild(_sceneZoomOut);
-
-        
         // ── Section 3: HISTORY ────────────────────────────────────────────────
+        // Camera zoom, view presets, card layout, and card zoom have all moved
+        // to the right-hand sidebar (see _buildSidebar) to reduce top-bar
+        // clutter. The sidebar builds its own instances of these controls;
+        // this._viewBtn etc. are now created inside _buildSidebar() instead.
         this._undoBtnEl = this._makeButton('↩ Undo', () => this._performUndo());
         this._undoBtnEl.title    = 'Undo  (Ctrl+Z)';
         this._undoBtnEl.disabled = true;
@@ -467,44 +391,10 @@ function _isConvexPolygon(vertices) {
         this._composeBtn.style.cssText += 'background: rgba(83,58,183,0.4); border-color: rgba(150,130,255,0.4);';
         toolbar.appendChild(this._composeBtn);
 
-        // Gear button — opens the output settings popover (Option 1).
-        // Shares _buildOutputControls() with the bottom drawer so both UIs
-        // always show identical controls at the same values.
-        this._gearBtn = this._makeButton('⚙', () => this._toggleOutputPopover(this._gearBtn));
-        this._gearBtn.title = 'Configure CPU render output settings';
-        this._gearBtn.style.cssText += `
-            padding: 4px 7px;
-            border-color: rgba(150,130,255,0.3);
-            color: rgba(200,185,255,0.75);
-        `;
-        toolbar.appendChild(this._gearBtn);
-
-        // "Lines" slider — controls iso-contour step size in GLSL mode.
-        // Smaller value → denser contour lines; larger → fewer, spaced further.
-        // Greyed out when not in GLSL mode since it has no effect there.
-        const _isoLabel = document.createElement('span');
-        _isoLabel.textContent = 'Lines:';
-        _isoLabel.style.cssText = 'font-size:13px; color:rgba(255,255,255,0.5);';
-        toolbar.appendChild(_isoLabel);
-        this._isoLabel = _isoLabel;  // stored so _toggleRenderMode can update opacity
-
-        this._isoSlider = document.createElement('input');
-        this._isoSlider.type  = 'range';
-        this._isoSlider.min   = '0.1';
-        this._isoSlider.max   = '2.0';
-        this._isoSlider.step  = '0.05';
-        this._isoSlider.value = '0.5';
-        this._isoSlider.style.cssText = 'width:72px; cursor:pointer; opacity:0.4;';
-        this._isoSlider.disabled = true;   // enabled only in GLSL mode
-        this._isoSlider.title = 'Contour line density (GLSL mode only)';
-        this._isoSlider.addEventListener('input', () => {
-          const v = parseFloat(this._isoSlider.value);
-          this.sceneManager.sdfRenderer.setIsoStep(v);
-          if (this.sceneManager.renderMode === 'glsl') {
-            this.sceneManager._renderGLSL();
-          }
-        });
-        toolbar.appendChild(this._isoSlider);
+        // Gear button and Lines slider have moved to the sidebar's Output
+        // section (see _buildSidebar). this._isoSlider / this._isoLabel are
+        // now created there; _toggleRenderMode() still references them by
+        // the same instance properties so no other code needs to change.
 
         // Render mode toggle (cycles marchingSquares → glsl → rayMarch)
         this._renderModeBtn = this._makeButton('⬛ GLSL Mode', () => {
@@ -623,13 +513,17 @@ function _isConvexPolygon(vertices) {
         // The output node was deserialized by loadScene() so its params now
         // reflect the saved values. Push those values to both UIs so the
         // controls display the correct state immediately after load.
-        ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+        const ALL_OUTPUT_PARAMS = [
+            'renderMethod', 'resolution', 'boundsMin', 'boundsMax',
+            'posX', 'posY', 'posZ', 'rotateX', 'rotateY', 'rotateZ',
+        ];
+        ALL_OUTPUT_PARAMS.forEach(k => {
             this._syncOutputControls(k, this._getOutputParam(k));
         });
         // Also populate _pendingOutputParams so values are preserved if the
         // user edits settings before clicking Render after a load
         if (!this._pendingOutputParams) this._pendingOutputParams = {};
-        ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+        ALL_OUTPUT_PARAMS.forEach(k => {
             this._pendingOutputParams[k] = this._getOutputParam(k);
         });
         this._updateGraphStatusLabel();
@@ -808,108 +702,361 @@ function _isConvexPolygon(vertices) {
         // ── Pan/zoom on canvas area ───────────────────────────────────────────
         this._attachPanZoom(canvasArea);
 
-        // ── Bottom drawer — render / output settings (Option 2) ───────────────
-        // Built here so it is part of the overlay flex column and naturally
-        // sits below the canvas area. Visibility is controlled by
-        // _updateGraphStatusLabel() — hidden when no geometry exists.
-        this._buildOutputDrawer();
+        // ── Right-hand sidebar — replaces the former bottom drawer and absorbs
+        // camera, layout, and output controls that previously crowded the
+        // top toolbar. See _buildSidebar() for full contents.
+        this._buildSidebar();
     }
 
     /**
-     * Build and append the persistent bottom drawer to the overlay.
-     * The drawer is a thin horizontal strip containing the four output node
-     * parameters as inline labelled controls. It appears only when the scene
-     * has at least one geometry primitive.
+     * Build the right-hand sidebar. Replaces the former bottom drawer and
+     * absorbs camera/layout/output controls previously crowding the top
+     * toolbar. The sidebar auto-collapses to a thin edge tab and expands on
+     * hover or when pinned open.
      *
-     * The drawer never shows when the scene is empty so it cannot mislead
-     * the user into thinking settings are active when nothing will render.
+     * Structure:
+     *   Section 1 — Camera   (scene zoom, view presets, home)
+     *   Section 2 — Layout   (card direction, auto, fit, card zoom, stack)
+     *   Section 3 — Output   (render method, resolution, bounds, lines, placement)
+     *
+     * Collapsed width: 14px (just the edge tab, always visible as a grab handle).
+     * Expanded width: 260px.
      */
-    _buildOutputDrawer() {
-        const drawer = document.createElement('div');
-        drawer.id = 'nc-output-drawer';
-        drawer.style.cssText = `
-            height: 40px;
-            background: rgba(12,12,18,0.94);
-            border-top: 1px solid rgba(255,255,255,0.08);
-            display: none;
-            align-items: center;
-            padding: 0 16px;
-            gap: 16px;
-            flex-shrink: 0;
+    _buildSidebar() {
+        const SIDEBAR_COLLAPSED_W = 14;
+        const SIDEBAR_EXPANDED_W  = 260;
+
+        const sidebar = document.createElement('div');
+        sidebar.id = 'nc-sidebar';
+        sidebar.style.cssText = `
+            position: fixed;
+            top: 52px;
+            right: 0;
+            bottom: 0;
+            width: ${SIDEBAR_COLLAPSED_W}px;
+            background: rgba(12,12,18,0.96);
+            border-left: 1px solid rgba(255,255,255,0.10);
+            backdrop-filter: blur(6px);
+            z-index: 1500;
             pointer-events: auto;
-            backdrop-filter: blur(4px);
-            overflow-x: auto;
-            overflow-y: hidden;
+            overflow-y: auto;
+            overflow-x: hidden;
             scrollbar-width: thin;
             scrollbar-color: rgba(255,255,255,0.15) transparent;
-            min-width: 0;
+            transition: width 0.16s ease;
             box-sizing: border-box;
+        `;
+
+        // ── Pin toggle ───────────────────────────────────────────────────────
+        // When pinned, the sidebar stays expanded regardless of mouse position.
+        // Persisted only for the session (not saved across reloads).
+        this._sidebarPinned = false;
+
+        const expand = () => {
+            sidebar.style.width = `${SIDEBAR_EXPANDED_W}px`;
+            content.style.opacity = '1';
+            content.style.pointerEvents = 'auto';
+        };
+        const collapse = () => {
+            if (this._sidebarPinned) return;
+            sidebar.style.width = `${SIDEBAR_COLLAPSED_W}px`;
+            content.style.opacity = '0';
+            content.style.pointerEvents = 'none';
+        };
+
+        sidebar.addEventListener('mouseenter', expand);
+        sidebar.addEventListener('mouseleave', collapse);
+
+        // ── Content wrapper (hidden when collapsed) ───────────────────────────
+        const content = document.createElement('div');
+        content.style.cssText = `
+            width: ${SIDEBAR_EXPANDED_W}px;
+            padding: 12px 10px 24px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.12s ease;
+            box-sizing: border-box;
+        `;
+
+        // ── Pin button (top of sidebar, always part of content) ──────────────
+        const pinRow = document.createElement('div');
+        pinRow.style.cssText = 'display:flex; justify-content:flex-end; margin-bottom:8px;';
+        const pinBtn = document.createElement('button');
+        pinBtn.textContent = '📌';
+        pinBtn.title = 'Pin sidebar open';
+        pinBtn.style.cssText = `
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 4px;
+            color: rgba(255,255,255,0.5);
+            font-size: 12px;
+            padding: 3px 8px;
+            cursor: pointer;
+        `;
+        pinBtn.addEventListener('click', () => {
+            this._sidebarPinned = !this._sidebarPinned;
+            pinBtn.style.background = this._sidebarPinned
+                ? 'rgba(100,180,255,0.25)' : 'rgba(255,255,255,0.06)';
+            pinBtn.style.borderColor = this._sidebarPinned
+                ? 'rgba(100,180,255,0.5)' : 'rgba(255,255,255,0.14)';
+            if (this._sidebarPinned) expand();
+        });
+        pinRow.appendChild(pinBtn);
+        content.appendChild(pinRow);
+
+        // ── Section builder helper ────────────────────────────────────────────
+        const _section = (title) => {
+            const sec = document.createElement('div');
+            sec.style.cssText = 'margin-bottom: 18px;';
+            const hdr = document.createElement('div');
+            hdr.textContent = title;
+            hdr.style.cssText = `
+                font-size: 11px;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                opacity: 0.5;
+                margin-bottom: 8px;
+                color: rgba(220,220,230,0.9);
+            `;
+            sec.appendChild(hdr);
+            content.appendChild(sec);
+            return sec;
+        };
+
+        // Row of buttons/controls within a section, wraps if needed
+        const _btnRow = (parent) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; flex-wrap:wrap; gap:5px; margin-bottom:6px;';
+            parent.appendChild(row);
+            return row;
+        };
+
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 1 — CAMERA
+        // ════════════════════════════════════════════════════════════════════
+        const camSection = _section('Camera');
+        const camRow1 = _btnRow(camSection);
+
+        const _sceneZoomIn = this._makeButton('↑ Zoom In', () => {
+          const cam  = this.sceneManager.camera;
+          const ctrl = this.sceneManager.controls;
+          if (!cam || !ctrl) return;
+          const dist = cam.position.distanceTo(ctrl.target);
+          const dir  = cam.position.clone().sub(ctrl.target).normalize();
+          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 0.8)));
+          ctrl.update();
+        });
+        _sceneZoomIn.title = 'Zoom in on 3D scene';
+        _sceneZoomIn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        camRow1.appendChild(_sceneZoomIn);
+
+        const _sceneZoomOut = this._makeButton('↓ Zoom Out', () => {
+          const cam  = this.sceneManager.camera;
+          const ctrl = this.sceneManager.controls;
+          if (!cam || !ctrl) return;
+          const dist = cam.position.distanceTo(ctrl.target);
+          const dir  = cam.position.clone().sub(ctrl.target).normalize();
+          cam.position.copy(ctrl.target.clone().add(dir.multiplyScalar(dist * 1.25)));
+          ctrl.update();
+        });
+        _sceneZoomOut.title = 'Zoom out on 3D scene';
+        _sceneZoomOut.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        camRow1.appendChild(_sceneZoomOut);
+
+        const camRow2 = _btnRow(camSection);
+        this._viewBtn = this._makeButton('View ▾', () =>
+            this._toggleViewMenu(this._viewBtn)
+        );
+        this._viewBtn.title = 'Snap camera to a preset viewing angle';
+        this._viewBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        camRow2.appendChild(this._viewBtn);
+
+        const _camResetBtn = this._makeButton('⌂ Home', () => {
+            this._setCameraView('home');
+        });
+        _camResetBtn.title = 'Reset camera to default view (Home)';
+        _camResetBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        camRow2.appendChild(_camResetBtn);
+
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 2 — LAYOUT
+        // ════════════════════════════════════════════════════════════════════
+        const layoutSection = _section('Card Layout');
+
+        this._layoutSelect = document.createElement('select');
+        this._layoutSelect.style.cssText = `
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 4px;
+            color: rgba(255,255,255,0.8);
+            font-size: 12px;
+            padding: 4px 6px;
+            cursor: pointer;
             width: 100%;
+            margin-bottom: 6px;
+            box-sizing: border-box;
         `;
+        this._layoutSelect.title = 'Choose auto-layout direction';
+        LAYOUT_DIRECTIONS.forEach(dir => {
+          const o = document.createElement('option');
+          o.value = dir; o.textContent = dir;
+          o.style.backgroundColor = '#1c1c22';
+          o.style.color = 'rgba(220,220,230,0.95)';
+          this._layoutSelect.appendChild(o);
+        });
+        this._layoutSelect.addEventListener('change', () => {
+          this._layoutDir = this._layoutSelect.value;
+          this._undo.snapshot();
+          this._runAutoLayout();
+        });
+        layoutSection.appendChild(this._layoutSelect);
 
-        // Section heading — makes clear these are global render settings,
-        // not per-node parameters
-        const heading = document.createElement('span');
-        heading.textContent = 'Render settings';
-        heading.style.cssText = `
+        const layoutRow1 = _btnRow(layoutSection);
+        const _autoLayoutBtn = this._makeButton('Auto', () => {
+          this._undo.snapshot();
+          this._runAutoLayout();
+        });
+        _autoLayoutBtn.title = 'Auto-arrange all node cards';
+        _autoLayoutBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        layoutRow1.appendChild(_autoLayoutBtn);
+
+        const _fitBtn = this._makeButton('Fit All', () => this._fitToScreen());
+        _fitBtn.title = 'Fit all node cards into the visible area';
+        _fitBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        layoutRow1.appendChild(_fitBtn);
+
+        const layoutRow2 = _btnRow(layoutSection);
+        const _cardsZoomIn = this._makeButton('+ Zoom', () => {
+          const newScale = Math.min(3.0, this._transform.scale * 1.25);
+          const cx = (this._bgCanvas.width  || 800) / 2;
+          const cy = (this._bgCanvas.height || 600) / 2;
+          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
+          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
+          this._transform.scale = newScale;
+          this._applyTransform();
+          this._drawEdges();
+        });
+        _cardsZoomIn.title = 'Zoom in on node cards';
+        _cardsZoomIn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        layoutRow2.appendChild(_cardsZoomIn);
+
+        const _cardsZoomOut = this._makeButton('− Zoom', () => {
+          const newScale = Math.max(0.2, this._transform.scale * 0.8);
+          const cx = (this._bgCanvas.width  || 800) / 2;
+          const cy = (this._bgCanvas.height || 600) / 2;
+          this._transform.tx    = cx - (cx - this._transform.tx) * (newScale / this._transform.scale);
+          this._transform.ty    = cy - (cy - this._transform.ty) * (newScale / this._transform.scale);
+          this._transform.scale = newScale;
+          this._applyTransform();
+          this._drawEdges();
+        });
+        _cardsZoomOut.title = 'Zoom out on node cards';
+        _cardsZoomOut.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        layoutRow2.appendChild(_cardsZoomOut);
+
+        // ── Stack Cards ────────────────────────────────────────────────────
+        // Moves every node card to a collapsed, overlapping pile in the
+        // top-left corner of the canvas, well outside the area where the
+        // 3D viewport / geometry is visible. Lets the user see the rendered
+        // shape with zero visual obstruction from the node graph.
+        // Positions are saved into node.uiPos as normal, so Fit All / Auto
+        // restore a readable layout afterward.
+        const stackRow = _btnRow(layoutSection);
+        const _stackBtn = this._makeButton('⊞ Stack Cards', () => this._stackAllCards());
+        _stackBtn.title = 'Pile all node cards in a corner so the geometry view is unobstructed';
+        _stackBtn.style.cssText += 'flex:1; min-width:0; font-size:12px; border-color: rgba(255,200,80,0.3); color: rgba(255,225,160,0.85);';
+        stackRow.appendChild(_stackBtn);
+
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 3 — OUTPUT
+        // ════════════════════════════════════════════════════════════════════
+        const outputSection = _section('Output');
+
+        const outputNote = document.createElement('div');
+        outputNote.textContent = 'CPU path only · GLSL/Ray March use canvas resolution';
+        outputNote.style.cssText = `
             font-size: 10px;
-            opacity: 0.4;
-            white-space: nowrap;
-            flex-shrink: 0;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-            color: rgba(220,220,230,0.9);
-        `;
-        drawer.appendChild(heading);
-
-        // Visual divider
-        const div0 = document.createElement('div');
-        div0.style.cssText = `
-            width: 1px;
-            height: 20px;
-            background: rgba(255,255,255,0.1);
-            flex-shrink: 0;
-        `;
-        drawer.appendChild(div0);
-
-        // Scope note — reminds the user these only affect the CPU path
-        const note = document.createElement('span');
-        note.textContent = 'CPU path only · GLSL and Ray March use canvas resolution';
-        note.style.cssText = `
-            font-size: 10px;
-            opacity: 0.28;
-            white-space: nowrap;
-            flex-shrink: 0;
+            opacity: 0.35;
             font-style: italic;
+            margin-bottom: 10px;
+            line-height: 1.4;
             color: rgba(220,220,230,0.8);
         `;
-        drawer.appendChild(note);
+        outputSection.appendChild(outputNote);
 
-        // Visual divider
-        const div1 = document.createElement('div');
-        div1.style.cssText = `
-            width: 1px;
-            height: 20px;
-            background: rgba(255,255,255,0.1);
-            flex-shrink: 0;
-        `;
-        drawer.appendChild(div1);
+        // Render method, resolution, bounds, placement — reuse the existing
+        // shared builder so behaviour and sync logic are identical to before.
+        const outputControlsWrap = document.createElement('div');
+        outputControlsWrap.style.cssText = 'display:flex; flex-direction:column; gap:10px;';
+        outputControlsWrap.appendChild(this._buildOutputControls('sidebar'));
+        outputSection.appendChild(outputControlsWrap);
 
-        // Controls row — flex row so all four controls sit inline
-        const controlsRow = document.createElement('div');
-        controlsRow.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            flex: 1;
-            min-width: 0;
-            overflow: hidden;
-        `;
-        controlsRow.appendChild(this._buildOutputControls('drawer'));
-        drawer.appendChild(controlsRow);
+        // "Lines" (GLSL contour density) slider — moved here from top bar
+        const linesRow = document.createElement('div');
+        linesRow.style.cssText = 'display:flex; align-items:center; gap:8px; margin-top:10px;';
+        const _isoLabel = document.createElement('span');
+        _isoLabel.textContent = 'Lines:';
+        _isoLabel.style.cssText = 'font-size:12px; color:rgba(255,255,255,0.5); min-width:38px;';
+        this._isoLabel = _isoLabel;
+        linesRow.appendChild(_isoLabel);
 
-        this._overlay.appendChild(drawer);
-        this._outputDrawer = drawer;
+        this._isoSlider = document.createElement('input');
+        this._isoSlider.type  = 'range';
+        this._isoSlider.min   = '0.1';
+        this._isoSlider.max   = '2.0';
+        this._isoSlider.step  = '0.05';
+        this._isoSlider.value = '0.5';
+        this._isoSlider.style.cssText = 'flex:1; min-width:0; cursor:pointer; opacity:0.4;';
+        this._isoSlider.disabled = true;
+        this._isoSlider.title = 'Contour line density (GLSL mode only)';
+        this._isoSlider.addEventListener('input', () => {
+          const v = parseFloat(this._isoSlider.value);
+          this.sceneManager.sdfRenderer.setIsoStep(v);
+          if (this.sceneManager.renderMode === 'glsl') {
+            this.sceneManager._renderGLSL();
+          }
+        });
+        linesRow.appendChild(this._isoSlider);
+        outputSection.appendChild(linesRow);
+
+        sidebar.appendChild(content);
+        document.body.appendChild(sidebar);
+        this._sidebar = sidebar;
+    }
+
+    /**
+     * Move every visible node card into a tight overlapping stack near the
+     * top-left of the canvas, well clear of the centre viewport. This gives
+     * the user an unobstructed view of the rendered geometry while keeping
+     * the graph structure intact and easy to restore.
+     *
+     * Cards are stacked with a small cascading offset (12px per card) so
+     * the topmost few are still individually clickable/draggable; deeper
+     * cards in the pile can be reached by dragging the ones above them
+     * aside, or by clicking Fit All / Auto to restore full layout.
+     */
+    _stackAllCards() {
+        this._undo.snapshot();
+        // Anchor the stack hard against the left edge, near the top, so it
+        // never overlaps the centred 3D/2D viewport regardless of window
+        // width. Negative-leaning X keeps the pile mostly off-canvas to the
+        // left; _fitToScreen()/_runAutoLayout() remain the way to bring
+        // cards back into a readable on-screen layout.
+        const STACK_X = -260;
+        const STACK_Y = 10;
+        const OFFSET  = 14;
+
+        let i = 0;
+        this.stateStore.nodeGraph.nodes.forEach((node) => {
+            if (!this._cards.has(node.id)) return;
+            const x = STACK_X + (i % 6) * OFFSET;
+            const y = STACK_Y + (i % 6) * OFFSET;
+            this.stateStore.nodeGraph.updateNodePosition(node.id, x, y);
+            i++;
+        });
+
+        this._rebuildCards();
+        this._drawEdges();
     }
 
     _makeButton(text, onClick) {
@@ -1035,7 +1182,41 @@ function _isConvexPolygon(vertices) {
               // next _rebuildCards() call restores it correctly.
               // NodeGraph.updateNodePosition does NOT fire onChange, so
               // this does not trigger a re-render loop.
-              this.stateStore.nodeGraph.updateNodePosition(nodeId, x, y);
+              //
+              // Group-drag: if the dragged card is part of a multi-selection
+              // (Shift+click to build a set, e.g. an entire visual chain of
+              // cards selected one-by-one), every other selected card moves
+              // by the same delta so the whole group can be repositioned
+              // together — covers the "drag this chain off to the side"
+              // need without requiring topology-aware auto-selection.
+              if (this._selectedIds.has(nodeId) && this._selectedIds.size > 1) {
+                  const draggedNode = this.stateStore.nodeGraph.nodes.get(nodeId);
+                  const prevX = draggedNode?.uiPos?.x ?? x;
+                  const prevY = draggedNode?.uiPos?.y ?? y;
+                  const dx = x - prevX;
+                  const dy = y - prevY;
+
+                  this._selectedIds.forEach(selId => {
+                      if (selId === nodeId) {
+                          this.stateStore.nodeGraph.updateNodePosition(nodeId, x, y);
+                          return;
+                      }
+                      const otherNode = this.stateStore.nodeGraph.nodes.get(selId);
+                      const otherCard = this._cards.get(selId);
+                      if (!otherNode || !otherCard) return;
+                      const newX = (otherNode.uiPos?.x ?? 0) + dx;
+                      const newY = (otherNode.uiPos?.y ?? 0) + dy;
+                      this.stateStore.nodeGraph.updateNodePosition(selId, newX, newY);
+                      // Keep the card's own DOM position in sync immediately
+                      // (NodeCard normally does this for the card being
+                      // actively dragged; for the other group members we
+                      // need to push it manually here).
+                      otherCard.el.style.left = `${newX}px`;
+                      otherCard.el.style.top  = `${newY}px`;
+                  });
+              } else {
+                  this.stateStore.nodeGraph.updateNodePosition(nodeId, x, y);
+              }
               this._drawEdges();
             },
             (nodeId, previewCanvas) => this._renderSDFPreview(nodeId, previewCanvas),
@@ -1125,6 +1306,82 @@ function _isConvexPolygon(vertices) {
                 this._selectedIds.delete(selectedId);
             }
         });
+    }
+
+    /**
+     * Delete every currently selected node (and all edges touching it) from
+     * the graph, scene, and evaluator caches. Triggered by the Delete /
+     * Backspace key. Unlike the right-click single-node delete, this does
+     * NOT show a confirm() dialog — keypress deletion is treated as a fast,
+     * deliberate multi-select action and is fully undoable via Ctrl+Z.
+     *
+     * This is the primary mechanism for "swap one primitive in a complex
+     * scene": select the node card to remove (e.g. a Cylinder feeding into
+     * several downstream transforms/blends), press Delete, then add the
+     * replacement (e.g. a Cone) and drag-connect it into the now-dangling
+     * input port left behind.
+     */
+    _deleteSelectedNodes() {
+        const idsToDelete = [...this._selectedIds];
+        if (idsToDelete.length === 0) return;
+
+        this._undo.snapshot();
+        const graph = this.stateStore.nodeGraph;
+
+        idsToDelete.forEach(nodeId => {
+            const node = graph.nodes.get(nodeId);
+            if (!node) return;
+
+            // Collect and remove every edge touching this node first —
+            // NodeGraph may validate edge integrity on node removal.
+            const edgeIdsToRemove = [];
+            graph.edges.forEach(edge => {
+                if (edge.fromNode === nodeId || edge.toNode === nodeId) {
+                    edgeIdsToRemove.push(edge.id);
+                }
+            });
+            edgeIdsToRemove.forEach(eid => {
+                try { graph.removeEdge(eid); } catch(_) {}
+            });
+
+            // Remove the node itself
+            try {
+                graph.removeNode(nodeId);
+            } catch(e) {
+                console.warn(`NodeCanvas: could not remove node ${nodeId}:`, e.message);
+                return;
+            }
+
+            // If this was a geometry primitive, remove its Three.js mesh too
+            const primIdx = this.sceneManager.activePrimitives.findIndex(
+                p => p.instance.id === nodeId
+            );
+            if (primIdx !== -1) {
+                const primEntry = this.sceneManager.activePrimitives[primIdx];
+                this.sceneManager._removeFromScene(primEntry);
+                this.sceneManager.activePrimitives.splice(primIdx, 1);
+            }
+
+            // If this was the current SchurComposition instance, clear it too
+            if (this.sceneManager.currentSchur?.instance?.id === nodeId) {
+                this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
+                this.sceneManager.currentSchur = null;
+            }
+        });
+
+        // Clear selection — the deleted nodes no longer exist
+        this._selectedIds.clear();
+
+        // Invalidate shader caches so the next render reflects the deletion
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
+
+        setTimeout(() => {
+            this._rebuildCards();
+            this._drawEdges();
+            this._updateGraphStatusLabel();
+        }, 50);
     }
 
     _setSelected(nodeId, addToSelection = false) {
@@ -1591,7 +1848,7 @@ function _isConvexPolygon(vertices) {
     const graph    = this.stateStore.nodeGraph;
     const defaults = {
       extrude:       { type: 'extrudeNode',      params: { height: 2 } },
-      revolve:       { type: 'revolveNode',       params: { offset: 0 } },
+      revolve:       { type: 'revolveNode',       params: { offset: 0, axis: 'Y' } },
       tiling:        { type: 'tilingNode',        params: { lattice:'hexagonal', periodX:3, periodY:3, offsetX:0, offsetY:0, isoOffset:0 } },
       symmetryfold:  { type: 'symmetryFoldNode',  params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', reflectY:'no' } },
       symmetryorbit: { type: 'symmetryOrbitNode', params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', combiner:'min', smoothness:8 } },
@@ -1600,6 +1857,11 @@ function _isConvexPolygon(vertices) {
       twist:         { type: 'twistNode',         params: { strength:1.0 } },
       bend:          { type: 'bendNode',          params: { strength:0.5 } },
       repeat:        { type: 'repeatNode',        params: { countX:3, countY:3, countZ:1, spacingX:3, spacingY:3, spacingZ:3 } },
+      // Position / Orient — compositional 3D transform.
+      // Lets the user move and rotate a sub-assembly before blending it
+      // with other shapes. Distinct from the output-level placement sliders
+      // which reposition the entire final scene as a single rigid body.
+      position3d:    { type: 'transform3DNode',   params: { posX:0, posY:0, posZ:0, rotateX:0, rotateY:0, rotateZ:0 } },
     };
 
     const def = defaults[type];
@@ -1615,9 +1877,10 @@ function _isConvexPolygon(vertices) {
       'sphere','box','cylinder','capsule','torus','cone','plane'
     ]);
 
+    // LINEAR_XFORM: nodes that participate in auto-chain walking.
     const LINEAR_XFORM = new Set([
-      'extrudeNode','revolveNode','noiseDisplaceNode','twistNode','bendNode',
-      'repeatNode','tilingNode','symmetryFoldNode','symmetryOrbitNode','mobiusNode'
+      'noiseDisplaceNode','twistNode','bendNode',
+      'repeatNode','tilingNode','symmetryFoldNode','symmetryOrbitNode','mobiusNode',
     ]);
 
     // Merge nodes always require explicit wiring — they are never auto-chained
@@ -1863,7 +2126,9 @@ function _isConvexPolygon(vertices) {
      */
     _buildOutputControls(context) {
         const frag = document.createDocumentFragment();
-        const isDrawer = context === 'drawer';
+        // Both 'popover' and 'sidebar' contexts use the same vertical
+        // labelled-row layout. (The former 'drawer' context and its compact
+        // horizontal strip were removed along with the bottom drawer.)
 
         // ── Row builder ───────────────────────────────────────────────────────
         // Creates one labelled control row and appends it to the fragment.
@@ -1873,17 +2138,16 @@ function _isConvexPolygon(vertices) {
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                margin-bottom: ${isDrawer ? '0' : '10px'};
-                ${isDrawer ? 'flex-shrink: 0;' : ''}
+                margin-bottom: 10px;
             `;
 
             const lbl = document.createElement('label');
             lbl.textContent = labelText;
             lbl.title = hint;
             lbl.style.cssText = `
-                font-size: 11px;
+                font-size: 12px;
                 opacity: 0.75;
-                min-width: ${isDrawer ? '76px' : '92px'};
+                min-width: 92px;
                 flex-shrink: 0;
                 cursor: help;
                 white-space: nowrap;
@@ -1984,6 +2248,7 @@ function _isConvexPolygon(vertices) {
             const v = parseInt(resSlider.value, 10);
             resDisplay.textContent = v;
             this._setOutputParam('resolution', v);
+            this._renderInPlace();
         });
         _row(
             'CPU resolution',
@@ -2026,6 +2291,7 @@ function _isConvexPolygon(vertices) {
             bMinSlider.value          = clamped;
             bMinDisplay.textContent   = clamped.toFixed(1);
             this._setOutputParam('boundsMin', clamped);
+            this._renderInPlace();
         });
         _row(
             'Scan min',
@@ -2065,6 +2331,7 @@ function _isConvexPolygon(vertices) {
             bMaxSlider.value          = clamped;
             bMaxDisplay.textContent   = clamped.toFixed(1);
             this._setOutputParam('boundsMax', clamped);
+            this._renderInPlace();
         });
         _row(
             'Scan max',
@@ -2076,6 +2343,118 @@ function _isConvexPolygon(vertices) {
             'primitives are outside the current bounds.\n' +
             'Range: 0 … 20. Default: 4.'
         );
+
+        // ── Object placement ────────────────────────────────────────────────────
+        // Repositions the entire final composed geometry as a single rigid body.
+        // Always available, no wiring required. posZ/rotateX/rotateY only affect
+        // 3D render modes (Surface, Ray March) and STL export; posX/posY/rotateZ
+        // affect all render modes including 2D contours and fill.
+        //
+        // These six sliders write through _setOutputParam → output node params,
+        // which NodeEvaluator.getRootSDF() reads to apply the inverse transform
+        // to the entire combined SDF before returning it to the renderer.
+        // SceneManager._getEffectiveBounds() also reads them to expand the scan
+        // window when the geometry has been rotated or translated.
+        const placementSection = document.createElement('div');
+        placementSection.style.cssText = `
+            width: 100%;
+            margin-top: 12px;
+        `;
+
+        const placementLabel = document.createElement('span');
+        placementLabel.textContent = 'Object placement:';
+        placementLabel.title = 'Move and rotate the final composed geometry. ' +
+            'posZ / rotateX / rotateY only affect 3D modes and STL export. ' +
+            'posX / posY / rotateZ affect all modes.';
+        placementLabel.style.cssText = `
+            font-size: 12px;
+            opacity: 0.6;
+            white-space: nowrap;
+            flex-shrink: 0;
+            color: rgba(220,220,230,0.9);
+            margin-bottom: 8px;
+            display: block;
+        `;
+        placementSection.appendChild(placementLabel);
+
+        // Placement param definitions — label, paramName, min, max, step, hint
+        const PLACEMENT_DEFS = [
+            { label: 'X',       param: 'posX',    min: -10, max: 10, step: 0.01,
+              hint: 'Move the final geometry along X (left/right). Affects all render modes.' },
+            { label: 'Y',       param: 'posY',    min: -10, max: 10, step: 0.01,
+              hint: 'Move the final geometry along Y (up/down). Affects all render modes.' },
+            { label: 'Z',       param: 'posZ',    min: -10, max: 10, step: 0.01,
+              hint: 'Move the final geometry along Z (toward/away from camera). Only affects 3D modes and STL export.' },
+            { label: 'Rx',      param: 'rotateX', min: 0, max: 6.28, step: 0.01,
+              hint: 'Rotate the final geometry around X (pitch). Only affects 3D modes and STL export.' },
+            { label: 'Ry',      param: 'rotateY', min: 0, max: 6.28, step: 0.01,
+              hint: 'Rotate the final geometry around Y (yaw). Only affects 3D modes and STL export.' },
+            { label: 'Rz',      param: 'rotateZ', min: 0, max: 6.28, step: 0.01,
+              hint: 'Rotate the final geometry around Z (roll). Affects all render modes.' },
+        ];
+
+        // ── Vertical labelled rows, one per param (popover and sidebar contexts) ──
+        const placementFrag = document.createDocumentFragment();
+        PLACEMENT_DEFS.forEach(({ label, param, min, max, step, hint }) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:10px;';
+
+            const lbl = document.createElement('label');
+            lbl.textContent = label;
+            lbl.title = hint;
+            lbl.style.cssText = `
+                font-size: 12px;
+                opacity: 0.75;
+                min-width: 92px;
+                flex-shrink: 0;
+                cursor: help;
+                white-space: nowrap;
+                color: rgba(220,220,230,0.9);
+            `;
+
+            const slider = document.createElement('input');
+            slider.type  = 'range';
+            slider.min   = min;
+            slider.max   = max;
+            slider.step  = step;
+            slider.value = this._getOutputParam(param);
+            slider.title = hint;
+            slider.dataset.outputParam        = param;
+            slider.dataset.outputParamDisplay = param;
+            slider.style.cssText = 'flex:1; min-width:0; height:14px; accent-color:#378ADD; cursor:pointer;';
+
+            const display = document.createElement('span');
+            display.dataset.outputParamDisplay = param;
+            display.textContent = parseFloat(this._getOutputParam(param)).toFixed(2);
+            display.style.cssText = `
+                font-size: 11px;
+                opacity: 0.8;
+                min-width: 38px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+                flex-shrink: 0;
+                color: rgba(220,220,230,0.85);
+            `;
+
+            slider.addEventListener('mousedown', () => {
+                if (this._undo) this._undo.snapshot();
+            });
+            slider.addEventListener('input', () => {
+                const val = parseFloat(slider.value);
+                display.textContent = val.toFixed(2);
+                this._setOutputParam(param, val);
+                this._syncOutputControls(param, val);
+                this._renderInPlace();
+            });
+
+            row.appendChild(lbl);
+            row.appendChild(slider);
+            row.appendChild(display);
+            placementFrag.appendChild(row);
+        });
+        placementSection.appendChild(placementFrag);
+
+        frag.appendChild(placementSection);
 
         return frag;
     }
@@ -2230,6 +2609,13 @@ function _isConvexPolygon(vertices) {
             resolution:   150,
             boundsMin:    -4,
             boundsMax:     4,
+            // Output-level placement defaults — identity transform (no movement)
+            posX:     0,
+            posY:     0,
+            posZ:     0,
+            rotateX:  0,
+            rotateY:  0,
+            rotateZ:  0,
         };
 
         // Pending local overrides take highest priority
@@ -2263,15 +2649,22 @@ function _isConvexPolygon(vertices) {
      * @param {*}      value
      */
     _syncOutputControls(paramName, value) {
+        const PLACEMENT_PARAMS = new Set([
+            'posX','posY','posZ','rotateX','rotateY','rotateZ'
+        ]);
+
         ['nc-output-drawer', 'nc-output-popover'].forEach(containerId => {
             const container = document.getElementById(containerId);
             if (!container) return;
 
+            // Sync the slider / select input element
             const inputEl = container.querySelector(
                 `[data-output-param="${paramName}"]`
             );
             if (inputEl) inputEl.value = value;
 
+            // Sync the readout display span (popover has these; drawer does not
+            // for placement params since the drawer is too narrow for readouts)
             const displayEl = container.querySelector(
                 `[data-output-param-display="${paramName}"]`
             );
@@ -2280,6 +2673,10 @@ function _isConvexPolygon(vertices) {
                     displayEl.textContent = Math.round(value);
                 } else if (paramName === 'boundsMin' || paramName === 'boundsMax') {
                     displayEl.textContent = parseFloat(value).toFixed(1);
+                } else if (PLACEMENT_PARAMS.has(paramName)) {
+                    // Placement params show two decimal places so the user can
+                    // see small increments without the display being cluttered
+                    displayEl.textContent = parseFloat(value).toFixed(2);
                 } else {
                     displayEl.textContent = value;
                 }
@@ -2377,7 +2774,7 @@ _sceneHasGeometry() {
         const TRANSFORM_TYPES = new Set([
             'extrudeNode', 'revolveNode', 'noiseDisplaceNode', 'twistNode', 'bendNode',
             'repeatNode', 'tilingNode', 'mobiusNode', 'symmetryFoldNode',
-            'symmetryOrbitNode', 'ifsBlend',
+            'symmetryOrbitNode', 'ifsBlend', 'transform3DNode',
         ]);
         const BLEND_TYPES = new Set([
             'schurBlend', 'rUnion', 'rIntersection', 'rDifference',
@@ -2420,7 +2817,13 @@ _sceneHasGeometry() {
 
     /**
      * Called by the Render button. Ensures output is wired then runs the
-     * CPU marching-squares compose pipeline.
+     * CPU marching-squares compose pipeline. Note this method ALWAYS forces
+     * the active mode to marchingSquares — that is correct for the explicit
+     * Render button (which is documented as "CPU marching squares") but
+     * wrong for any live-tweak control (sliders) that should respect
+     * whatever mode the user is currently in. Live controls call
+     * _renderInPlace() instead — see below.
+     *
      * The geometry guard is also checked here as belt-and-braces even though
      * the button is visually disabled when no geometry exists.
      */
@@ -2428,6 +2831,40 @@ _sceneHasGeometry() {
         if (!this._sceneHasGeometry()) return;
         this._ensureOutputWired();
         this._compose();
+    }
+
+    /**
+     * Re-render the scene in whatever render mode is CURRENTLY active,
+     * without switching modes. Used by all live-tweak sidebar controls
+     * (output method, resolution, bounds, object placement) so that
+     * adjusting a slider while in GLSL or Ray March mode stays in that
+     * mode rather than silently reverting to Marching Squares.
+     *
+     * Marching Squares still requires an explicit _compose() call since
+     * that path is documented as manually triggered; GLSL and Ray March
+     * re-render every frame already driven by their own render calls, so
+     * we just need to invalidate caches and trigger one render pass here
+     * for immediate visual feedback rather than waiting for the next
+     * scheduled frame.
+     */
+    _renderInPlace() {
+        if (!this._sceneHasGeometry()) return;
+        this._ensureOutputWired();
+
+        const mode = this.sceneManager.renderMode;
+        if (mode === 'glsl') {
+            this.sceneManager._renderGLSL();
+        } else if (mode === 'rayMarch') {
+            this.sceneManager._renderRayMarch();
+        } else {
+            // marchingSquares — same CPU compose path as the Render button,
+            // but we don't need _compose()'s mode-forcing logic since we're
+            // already confirmed to be in this mode.
+            const sdf = this.sceneManager.evaluator.getRootSDF();
+            if (sdf) {
+                this.sceneManager.renderSDF(sdf, this._getOutputParam('renderMethod'));
+            }
+        }
     }
 
     // ── Status label and button grey-out ──────────────────────────────────────
@@ -2484,21 +2921,18 @@ _sceneHasGeometry() {
         }
 
         // ── Status label ──────────────────────────────────────────────────────
+        // The sidebar's Output section remains visible at all times (it is
+        // not hidden when geometry is absent) since it occupies a separate
+        // screen region from the canvas and showing/hiding it would cause
+        // layout jumps in the sidebar itself. Render values are simply inert
+        // until geometry exists.
         if (!hasGeom) {
             this._graphStatusLabel.textContent = '⚠ Add a primitive to render';
             this._graphStatusLabel.style.display = '';
-            // Hide the drawer — no point showing render settings when there
-            // is nothing to render
-            if (this._outputDrawer) this._outputDrawer.style.display = 'none';
-            // Close the popover too if it is open
-            const popover = document.getElementById('nc-output-popover');
-            if (popover) popover.remove();
             return;
         }
 
-        // Geometry exists — scene is renderable
         this._graphStatusLabel.style.display = 'none';
-        if (this._outputDrawer) this._outputDrawer.style.display = 'flex';
     }
 
     // ── Pan and zoom ──────────────────────────────────────────────────────────
@@ -2631,6 +3065,17 @@ _sceneHasGeometry() {
         if (e.key === 'Escape' && this._open) {
             this._setSelected(null);
         }
+
+        // Delete / Backspace: remove all currently selected node cards
+        // (and their connected edges), without a confirmation dialog —
+        // deletion via keypress is treated as a fast, deliberate action
+        // (mirrors standard node-editor conventions in Houdini, Blender,
+        // etc.) and is undoable via Ctrl+Z like every other graph edit.
+        if ((e.key === 'Delete' || e.key === 'Backspace') &&
+            this._open && this._selectedIds.size > 0) {
+            e.preventDefault();
+            this._deleteSelectedNodes();
+        }
         });
 
         // Resize canvas when window resizes
@@ -2696,109 +3141,193 @@ _sceneHasGeometry() {
     // ── Export ────────────────────────────────────────────────────────────────
 
     /**
-     * Toggle the output settings popover (Option 1 — gear button companion).
-     * If the popover is already open, close it. Otherwise build and open it
-     * anchored below the gear button.
-     *
-     * The popover contains the same four output parameter controls as the
-     * bottom drawer, built by _buildOutputControls('popover'). Both UIs stay
-     * in sync through _syncOutputControls() which is called by _setOutputParam
-     * whenever any control changes a value.
-     *
-     * @param {HTMLElement} anchorEl  The gear button element used to position the panel
+     * Toggle the camera view menu — a small dropdown of preset camera angles.
+     * Clicking any angle snaps the camera to that view immediately.
+     * The menu closes on outside click or on selection.
      */
-    _toggleOutputPopover(anchorEl) {
-        const existing = document.getElementById('nc-output-popover');
+    _toggleViewMenu(anchorEl) {
+        const existing = document.getElementById('nc-view-menu');
         if (existing) { existing.remove(); return; }
 
         const anchorRect = anchorEl.getBoundingClientRect();
 
-        const panel = document.createElement('div');
-        panel.id = 'nc-output-popover';
-        panel.style.cssText = `
+        const menu = document.createElement('div');
+        menu.id = 'nc-view-menu';
+        menu.style.cssText = `
             position: fixed;
-            top: ${anchorRect.bottom + 6}px;
+            top: ${anchorRect.bottom + 4}px;
             left: ${anchorRect.left}px;
             background: rgba(16,16,22,0.98);
             border: 1px solid rgba(255,255,255,0.14);
-            border-radius: 8px;
-            padding: 16px 18px 14px;
+            border-radius: 6px;
+            padding: 6px 0;
             z-index: 2000;
             pointer-events: auto;
-            min-width: 330px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+            min-width: 160px;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.5);
             font-family: var(--font-sans, sans-serif);
         `;
 
-        // ── Header ────────────────────────────────────────────────────────────
-        const hdr = document.createElement('div');
-        hdr.style.cssText = `
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 14px;
-            gap: 10px;
-        `;
+        const views = [
+            { key: 'home',         label: '⌂  Home (3/4 view)',      hint: 'Default perspective — good for most scenes' },
+            { key: 'front',        label: '↑  Front',                 hint: 'Looking along -Z toward the scene' },
+            { key: 'back',         label: '↓  Back',                  hint: 'Looking along +Z toward the scene' },
+            { key: 'left',         label: '←  Left',                  hint: 'Looking along +X toward the scene' },
+            { key: 'right',        label: '→  Right',                 hint: 'Looking along -X toward the scene' },
+            { key: 'top',          label: '⊙  Top',                   hint: 'Looking straight down along -Y' },
+            { key: 'bottom',       label: '⊗  Bottom',                hint: 'Looking straight up along +Y' },
+            { key: 'perspective45',label: '◈  3/4 Perspective',       hint: 'Elevated 45° perspective — good for sculptural forms' },
+        ];
 
-        const titleCol = document.createElement('div');
-        titleCol.style.cssText = 'display:flex; flex-direction:column; gap:3px;';
+        views.forEach(({ key, label, hint }) => {
+            const item = document.createElement('div');
+            item.textContent = label;
+            item.title = hint;
+            item.style.cssText = `
+                padding: 7px 14px;
+                font-size: 12px;
+                color: rgba(220,220,230,0.85);
+                cursor: pointer;
+                white-space: nowrap;
+            `;
+            item.addEventListener('mouseenter', () =>
+                item.style.background = 'rgba(255,255,255,0.08)'
+            );
+            item.addEventListener('mouseleave', () =>
+                item.style.background = 'transparent'
+            );
+            item.addEventListener('click', () => {
+                menu.remove();
+                this._setCameraView(key);
+            });
+            menu.appendChild(item);
+        });
 
-        const ttl = document.createElement('span');
-        ttl.textContent = 'Render settings';
-        ttl.style.cssText = `
-            font-size: 13px;
-            font-weight: 600;
-            color: rgba(255,255,255,0.9);
-        `;
+        // Thin divider before top/bottom views
+        const div = menu.children[5];
+        if (div) div.style.borderTop = '1px solid rgba(255,255,255,0.08)';
 
-        const sub = document.createElement('span');
-        sub.textContent = 'CPU path only · GLSL and Ray March use canvas resolution';
-        sub.style.cssText = `
-            font-size: 10px;
-            opacity: 0.38;
-            font-style: italic;
-            color: rgba(220,220,230,0.8);
-        `;
+        // Track whether the listener has already been removed, so both the
+        // "click a view item" path and the "click outside" path can safely
+        // remove it without double-removal errors.
+        let _outsideListenerActive = true;
 
-        titleCol.appendChild(ttl);
-        titleCol.appendChild(sub);
+        const outside = (e) => {
+            if (!_outsideListenerActive) return;
+            if (!menu.contains(e.target) && e.target !== anchorEl) {
+                menu.remove();
+                document.removeEventListener('mousedown', outside);
+                _outsideListenerActive = false;
+            }
+        };
 
-        const cls = document.createElement('button');
-        cls.textContent = '✕';
-        cls.style.cssText = `
-            background: none;
-            border: none;
-            color: rgba(255,255,255,0.4);
-            font-size: 13px;
-            cursor: pointer;
-            padding: 0;
-            flex-shrink: 0;
-            line-height: 1;
-        `;
-        cls.addEventListener('click', () => panel.remove());
-
-        hdr.appendChild(titleCol);
-        hdr.appendChild(cls);
-        panel.appendChild(hdr);
-
-        // ── Controls ──────────────────────────────────────────────────────────
-        panel.appendChild(this._buildOutputControls('popover'));
-
-        // ── Close on outside click ────────────────────────────────────────────
-        // Deferred so this mousedown event does not immediately close the panel
         setTimeout(() => {
-            const outside = (e) => {
-                if (!panel.contains(e.target) && e.target !== anchorEl) {
-                    panel.remove();
-                    document.removeEventListener('mousedown', outside);
-                }
-            };
             document.addEventListener('mousedown', outside);
-        }, 120);
+        }, 100);
 
-        document.body.appendChild(panel);
+        // Ensure the listener is removed when a view item is clicked too —
+        // not just on outside clicks. Without this, clicking a view item
+        // leaves the listener attached, where it can interfere with the
+        // next mousedown event used by OrbitControls to start a drag.
+        menu.addEventListener('click', () => {
+            if (_outsideListenerActive) {
+                document.removeEventListener('mousedown', outside);
+                _outsideListenerActive = false;
+            }
+        });
+
+        document.body.appendChild(menu);
     }
 
+    /**
+     * Snap the camera to a named preset view.
+     *
+     * All views orbit around the current controls.target (default 0,0,0).
+     * The camera distance is preserved so zoom level is not reset.
+     * After repositioning, controls.update() is called so OrbitControls
+     * stays in sync and subsequent dragging works correctly from the new angle.
+     *
+     * The ray march renderer syncs its camera from Three.js each frame so
+     * no additional work is needed — the next frame will show the new view.
+     *
+     * @param {string} viewKey  One of the keys defined in _toggleViewMenu
+     */
+    _setCameraView(viewKey) {
+        const cam    = this.sceneManager.camera;
+        const ctrl   = this.sceneManager.controls;
+        if (!cam || !ctrl) return;
+
+        // Preserve current distance from the orbit target so zoom level
+        // is not reset when the user snaps to a new view angle.
+        const dist   = cam.position.distanceTo(ctrl.target);
+        const target = ctrl.target.clone();
+
+        // Direction vectors: each is a unit vector pointing FROM the orbit
+        // target TOWARD the camera position. The camera is placed at
+        // target + dir * dist so it looks toward the target from that direction.
+        //
+        // Top/bottom views have a special case: OrbitControls has a gimbal
+        // lock at the poles (when camera is exactly on the Y axis) because
+        // it cannot determine the "up" direction. We offset slightly from
+        // the exact pole to avoid this, giving the user a clear top/bottom
+        // view that still allows full mouse dragging afterward.
+        const dirs = {
+            home:          new THREE.Vector3( 0.6,  0.7,  1.0).normalize(),
+            front:         new THREE.Vector3( 0,    0.05, 1.0).normalize(),
+            back:          new THREE.Vector3( 0,    0.05,-1.0).normalize(),
+            left:          new THREE.Vector3(-1.0,  0.05, 0  ).normalize(),
+            right:         new THREE.Vector3( 1.0,  0.05, 0  ).normalize(),
+            // ── Pole offset increased from 0.001 to 0.15 ──────────────────────
+            // At 0.001, the camera sits so close to the Y axis (the up vector /
+            // polar axis) that horizontal dragging — which rotates azimuthally
+            // around this axis — produces almost zero visible movement. This is
+            // not a bug; it's the nature of spherical coordinates near a pole.
+            //
+            // 0.15 tilts the camera ~8.6° off the true top/bottom axis. The
+            // view still reads as "top-down" / "bottom-up" but now sits far
+            // enough from the pole that azimuthal dragging produces clearly
+            // visible rotation, letting the user tilt into angled perspectives
+            // from there.
+            top:           new THREE.Vector3( 0.15, 1.0,  0   ).normalize(),
+            bottom:        new THREE.Vector3( 0.15,-1.0,  0   ).normalize(),
+            perspective45: new THREE.Vector3( 0.7,  0.7,  0.7 ).normalize(),
+        };
+
+        const dir = dirs[viewKey] || dirs.home;
+
+        cam.position.copy(target.clone().add(dir.clone().multiplyScalar(dist)));
+
+        // Do NOT call cam.lookAt() here — let OrbitControls handle it via update()
+
+        // ── Ensure controls are not constrained or disabled ───────────────────
+        // If any prior interaction left these constrained or disabled, dragging
+        // after a view snap would silently do nothing. Explicitly reset to the
+        // permissive defaults every time a view is set.
+        ctrl.enabled         = true;
+        ctrl.minPolarAngle   = 0;
+        ctrl.maxPolarAngle   = Math.PI;
+        ctrl.minAzimuthAngle = -Infinity;
+        ctrl.maxAzimuthAngle =  Infinity;
+
+        ctrl.update();
+        ctrl.saveState();
+
+        // Force an immediate re-render so the view change is instantaneous
+        if (this.sceneManager.renderMode === 'glsl') {
+            this.sceneManager._renderGLSL();
+        } else if (this.sceneManager.renderMode === 'rayMarch') {
+            this.sceneManager.rayMarchRenderer.syncCamera(cam, ctrl);
+            this.sceneManager._renderRayMarch();
+        } else {
+            // marchingSquares — Three.js renders on the animation loop
+            // but force one frame immediately for responsiveness
+            this.sceneManager.renderer.render(
+                this.sceneManager.scene,
+                cam
+            );
+        }
+    }
+    
     /**
      * Toggle the preset panel. Shows the three V1 example scenes with
      * a description and audience label for each. Clicking a preset loads
@@ -2880,7 +3409,7 @@ _sceneHasGeometry() {
 
             const descEl = document.createElement('div');
             descEl.textContent = preset.meta.description;
-            descEl.style.cssText = 'font-size:11px; opacity:0.6; line-height:1.45; color:rgba(220,220,230,0.85);';
+            descEl.style.cssText = 'font-size:12px; opacity:0.6; line-height:1.45; color:rgba(220,220,230,0.85);';
 
             card.appendChild(titleRow);
             card.appendChild(descEl);
@@ -3004,9 +3533,15 @@ _sceneHasGeometry() {
             this.sceneManager._lastGLSLSource     = null;
             this.sceneManager._lastRayMarchSource = null;
 
-            // Sync output params from the preset's output node
+            // Sync output params from the preset's output node, including
+            // the placement params (which default to 0 for all presets,
+            // resetting any previous placement the user had configured)
             if (!this._pendingOutputParams) this._pendingOutputParams = {};
-            ['renderMethod', 'resolution', 'boundsMin', 'boundsMax'].forEach(k => {
+            const ALL_OUTPUT_PARAMS = [
+                'renderMethod', 'resolution', 'boundsMin', 'boundsMax',
+                'posX', 'posY', 'posZ', 'rotateX', 'rotateY', 'rotateZ',
+            ];
+            ALL_OUTPUT_PARAMS.forEach(k => {
                 this._pendingOutputParams[k] = this._getOutputParam(k);
                 this._syncOutputControls(k, this._getOutputParam(k));
             });
@@ -3103,7 +3638,7 @@ _sceneHasGeometry() {
         // Mode indicator
         const modeEl = document.createElement('div');
         modeEl.textContent = `Active mode: ${modeLabel}`;
-        modeEl.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.38); margin-bottom:14px;';
+        modeEl.style.cssText = 'font-size:12px; color:rgba(255,255,255,0.38); margin-bottom:14px;';
         panel.appendChild(modeEl);
 
         // Helper: styled export button row
@@ -3131,7 +3666,7 @@ _sceneHasGeometry() {
 
             const desc = document.createElement('div');
             desc.textContent = sub;
-            desc.style.cssText = 'font-size:11px; color:rgba(255,255,255,0.32); margin-top:3px; padding:0 2px;';
+            desc.style.cssText = 'font-size:12px; color:rgba(255,255,255,0.32); margin-top:3px; padding:0 2px;';
             wrap.appendChild(btn); wrap.appendChild(desc);
             return wrap;
         };
