@@ -18,3 +18,6 @@ dist/
 
 # Other system files
 Thumbs.db
+
+# Scratch / source notes files not needed at runtime
+complexprimitives.source.txt
