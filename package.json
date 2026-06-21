@@ -13,6 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@sentry/browser": "^10.59.0",
     "dat.gui": "^0.7.9",
     "delaunator": "^5.0.1",
     "dexie": "^4.0.11",

@@ -4,6 +4,22 @@
   <head>
     <meta charset="UTF-8" />
     <title>Isoline — Procedural Shape Studio</title>
+
+    <!-- Google Analytics (GA4) — basic usage analytics only.
+         Loaded directly in <head> per Google's standard snippet so it
+         tracks reliably regardless of how the JS bundle loads/errors. -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-780ZWFVZST"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-780ZWFVZST");
+    </script>
     <style>
       /* ── Global reset — prevents all page-level scrollbars ── */
       *,

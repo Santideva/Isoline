@@ -4,11 +4,32 @@
 // The dat.GUI and legacy HTML controls have been removed — the NodeCanvas
 // overlay is the primary UI.
 
+import * as Sentry from "@sentry/browser";
 import { SceneManager } from "./rendering/SceneManager.js";
 import { stateStore }   from "./state/stateStore.js";
 import { logger }       from "./utils/logger.js";
 import { saveScene }    from "./persistence.js";
 import { NodeCanvas }   from "./ui/NodeCanvas.js";
+
+// ── Error monitoring (production only) ────────────────────────────────────
+// Captures uncaught exceptions and unhandled promise rejections from real
+// users — shader compile failures, evaluator errors, etc. — with full stack
+// traces and browser/OS context, visible in the Sentry dashboard.
+// Free tier: 5,000 events/month, no card required.
+//
+// Guarded so it only activates on the deployed site, not during local dev
+// (avoids noisy/irrelevant events from your own testing at localhost:8080).
+if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+  Sentry.init({
+    dsn: "https://913c840805742725af848208666d6b7a@o4511603096813568.ingest.us.sentry.io/4511603179192320",
+    // Keep this conservative — captures errors, not full session replay or
+    // performance tracing, to stay comfortably within the free tier's
+    // monthly event quota.
+    tracesSampleRate: 0,
+    replaysSessionSampleRate: 0,
+    replaysOnErrorSampleRate: 0,
+  });
+}
 
 window.stateStore = stateStore;
 

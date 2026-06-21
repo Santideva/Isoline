@@ -558,6 +558,19 @@ function _isConvexPolygon(vertices) {
     _exportBtn.style.cssText += 'border-color: rgba(255,200,80,0.4); color: rgba(255,230,150,0.9);';
     toolbar.appendChild(_exportBtn);
 
+    // ── Feedback link ──────────────────────────────────────────────────────
+    // Opens an external short-form questionnaire in a new tab. Deliberately
+    // a plain labelled link, not an in-app modal/popup — does not interrupt
+    // the user's session, costs nothing to build/maintain, and stays
+    // findable (full text label, not just an icon) for anyone who wants to
+    // report something or share thoughts.
+    const _feedbackBtn = this._makeButton('💬 Feedback', () => {
+        window.open('https://docs.google.com/forms/d/e/1FAIpQLSe5hZqAi1epB7XjBgN0SKYhaPPGff7FroaGm5hzi5f4jV1ysA/viewform', '_blank', 'noopener');
+    });
+    _feedbackBtn.title = 'Share feedback or report an issue (opens in a new tab)';
+    _feedbackBtn.style.cssText += 'border-color: rgba(150,150,255,0.3); color: rgba(190,190,255,0.85);';
+    toolbar.appendChild(_feedbackBtn);
+
     
         this._overlay.appendChild(toolbar);
 
@@ -747,6 +760,41 @@ function _isConvexPolygon(vertices) {
             box-sizing: border-box;
         `;
 
+        // ── Discoverability glow ─────────────────────────────────────────────
+        // A slow, subtle pulsing glow on the collapsed sidebar's left edge —
+        // an ambient, non-interrupting hint that there's more content here,
+        // without forcing the sidebar open or stealing focus from the
+        // viewport. Stops permanently once the user has opened the sidebar
+        // at least once (see the 'mouseenter' handler below), since at that
+        // point they've discovered it and the hint is no longer needed.
+        if (!document.getElementById('nc-sidebar-glow-style')) {
+            const glowStyle = document.createElement('style');
+            glowStyle.id = 'nc-sidebar-glow-style';
+            // Stronger, wider glow than the original attempt — at a 14px
+            // collapsed width the sidebar is a very thin strip, so a subtle
+            // box-shadow can be easy to miss against a dark canvas
+            // background. Also adds a border-color pulse alongside the
+            // shadow so the effect reads clearly even on lower-contrast
+            // displays or in a quick screen recording.
+            glowStyle.textContent = `
+                @keyframes nc-sidebar-glow-pulse {
+                    0%, 100% {
+                        box-shadow: -3px 0 14px rgba(100,180,255,0.35);
+                        border-left-color: rgba(100,180,255,0.35);
+                    }
+                    50% {
+                        box-shadow: -3px 0 26px rgba(100,180,255,0.75);
+                        border-left-color: rgba(140,200,255,0.9);
+                    }
+                }
+                #nc-sidebar.nc-sidebar-glow {
+                    animation: nc-sidebar-glow-pulse 2.2s ease-in-out infinite;
+                }
+            `;
+            document.head.appendChild(glowStyle);
+        }
+        sidebar.classList.add('nc-sidebar-glow');
+
         // ── Pin toggle ───────────────────────────────────────────────────────
         // When pinned, the sidebar stays expanded regardless of mouse position.
         // Persisted only for the session (not saved across reloads).
@@ -756,6 +804,12 @@ function _isConvexPolygon(vertices) {
             sidebar.style.width = `${SIDEBAR_EXPANDED_W}px`;
             content.style.opacity = '1';
             content.style.pointerEvents = 'auto';
+            // Once the sidebar has been opened (by hover or programmatically)
+            // at least once, the discoverability glow has served its purpose
+            // — remove it permanently for the rest of the session so it
+            // doesn't keep pulsing distractingly once the user already knows
+            // it's there.
+            sidebar.classList.remove('nc-sidebar-glow');
         };
         const collapse = () => {
             if (this._sidebarPinned) return;
@@ -2940,6 +2994,37 @@ _sceneHasGeometry() {
 
         const hasGeom = this._sceneHasGeometry();
 
+        // ── One-time sidebar introduction ───────────────────────────────────
+        // The very first time the scene transitions from "no geometry" to
+        // "has geometry" in this session, briefly auto-open the sidebar so
+        // new users discover it exists at the most relevant possible moment
+        // — right when there's finally something worth tuning render/output
+        // settings for. Fires only once per session (guarded by
+        // _sidebarIntroShown); after that the persistent glow (see
+        // _buildSidebar) is the sole ongoing discoverability hint, since
+        // repeatedly auto-opening on every subsequent render would be an
+        // unwelcome interruption rather than a helpful introduction.
+        // ── One-time sidebar introduction — deferred ────────────────────────
+        // Wait briefly before auto-opening, rather than firing the instant
+        // geometry first appears. This gives the user a moment to actually
+        // SEE the collapsed sidebar's pulsing glow before it auto-expands
+        // and strips the glow class — otherwise, if geometry exists
+        // immediately on page load (e.g. an autosaved scene), the intro
+        // could fire and remove the glow before the user ever registers it,
+        // making the affordance invisible in practice.
+        if (hasGeom && !this._sidebarIntroShown && this._sidebar) {
+            this._sidebarIntroShown = true;
+            setTimeout(() => {
+                if (!this._sidebar) return;
+                this._sidebar.dispatchEvent(new Event('mouseenter'));
+                setTimeout(() => {
+                    if (!this._sidebar.matches(':hover') && !this._sidebarPinned) {
+                        this._sidebar.dispatchEvent(new Event('mouseleave'));
+                    }
+                }, 3200);
+            }, 1600);
+        }
+
         // ── Render button ─────────────────────────────────────────────────────
         if (this._composeBtn) {
             this._composeBtn.disabled          = !hasGeom;
@@ -3139,6 +3224,17 @@ _sceneHasGeometry() {
             e.preventDefault();
             this._togglePresentationMode();
         }
+
+        // 'R' key: toggle auto-orbit — the camera continuously revolves
+        // around the current orbit target at a fixed angular speed, useful
+        // for hands-free turntable-style demo shots when recording video
+        // or capturing a GIF. Press R again, or manually drag the camera,
+        // to stop. Does not require presentation mode to be active, but
+        // the two combine well together for clean capture.
+        if (e.key === 'r' || e.key === 'R') {
+            e.preventDefault();
+            this._toggleAutoOrbit();
+        }
         });
 
         // Resize canvas when window resizes
@@ -3315,6 +3411,48 @@ _sceneHasGeometry() {
      *
      * @param {string} viewKey  One of the keys defined in _toggleViewMenu
      */
+    /**
+     * Toggle hands-free camera auto-orbit. While active, the camera
+     * continuously revolves around the current OrbitControls target at a
+     * fixed angular speed (independent of render mode — works identically
+     * in marchingSquares, GLSL, and Ray March). Intended for turntable-style
+     * demo capture (video/GIF) without needing to manually drag the mouse
+     * for the entire shot duration.
+     *
+     * Implementation: OrbitControls has a built-in autoRotate feature
+     * (autoRotate + autoRotateSpeed) that handles the per-frame rotation
+     * internally as long as controls.update() is called every frame — which
+     * the existing animation loop in SceneManager already does. So this
+     * method just toggles those two properties; no separate animation loop
+     * or manual angle-stepping code is needed.
+     *
+     * Stops automatically the moment the user manually drags/zooms — this
+     * is OrbitControls' own default behaviour (any user interaction
+     * interrupts autoRotate), so no extra "stop on drag" wiring is required
+     * here either. The toolbar/toast just needs to reflect the off state
+     * if the user manually interrupts it, which _attachViewportDrag /
+     * the controls' own 'start' event could optionally sync later — for
+     * V1 a simple press-R-again toggle is sufficient.
+     */
+    _toggleAutoOrbit() {
+        const ctrl = this.sceneManager.controls;
+        if (!ctrl) return;
+
+        const next = !ctrl.autoRotate;
+        ctrl.autoRotate = next;
+        // Degrees per second at 60fps internally — 2.0 is a gentle, clearly
+        // visible turntable speed suited to demo footage (not so fast it
+        // looks frantic, not so slow it looks static across a short clip).
+        ctrl.autoRotateSpeed = 2.0;
+
+        this._showToast(
+            next
+                ? 'Auto-orbit ON — press R to stop, or drag to interrupt'
+                : 'Auto-orbit OFF',
+            2200
+        );
+    }
+
     _setCameraView(viewKey) {
         const cam    = this.sceneManager.camera;
         const ctrl   = this.sceneManager.controls;
