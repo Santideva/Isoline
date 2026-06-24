@@ -265,6 +265,20 @@ function _isConvexPolygon(vertices) {
         const _dispatchAdd = (v, selectEl) => {
           if (!v) return;
           selectEl.value = '';          // reset to placeholder immediately
+
+          // Belt-and-braces guard: if the user somehow triggers a disabled
+          // option (e.g. programmatically, or via keyboard navigation),
+          // treat it as a no-op and show a toast rather than proceeding.
+          // The visual greying in _updateDropdownAvailability() is the
+          // primary signal; this is the safety net behind it.
+          if (v === 'extrude' || v === 'revolve') {
+            const opt = Array.from(selectEl.options).find(o => o.value === v);
+            if (opt?.disabled) {
+              this._showToast(opt.title || 'Extrude / Revolve not available here.', 3500);
+              return;
+            }
+          }
+
           if (_GEOM.has(v)) {
             this._undo.snapshot();
             this.sceneManager.addPrimitive(v);
@@ -719,6 +733,12 @@ function _isConvexPolygon(vertices) {
         // camera, layout, and output controls that previously crowded the
         // top toolbar. See _buildSidebar() for full contents.
         this._buildSidebar();
+
+        // ── Initial dropdown availability ─────────────────────────────────────
+        // Evaluate bridge (Extrude/Revolve) availability once after the DOM
+        // is fully built, so the initial state is correct before any graph
+        // changes or selection events have fired.
+        requestAnimationFrame(() => this._updateDropdownAvailability());
     }
 
     /**
@@ -1495,7 +1515,12 @@ function _isConvexPolygon(vertices) {
         this._selectedIds.clear();
         }
 
-        if (nodeId === null) return;
+        if (nodeId === null) {
+            // Selection cleared — re-evaluate bridge availability now that
+            // no specific node is selected (Priority 2 logic takes over).
+            this._updateDropdownAvailability();
+            return;
+        }
 
         this._selectedIds.add(nodeId);
         const card = this._cards.get(nodeId);
@@ -1503,6 +1528,8 @@ function _isConvexPolygon(vertices) {
         card.el.style.outline = '2px solid rgba(100,180,255,0.8)';
         card.el.style.outlineOffset = '2px';
         }
+        // Re-evaluate bridge availability for the newly selected node.
+        this._updateDropdownAvailability();
     }  
 
     _attachViewportDrag() {
@@ -1670,27 +1697,65 @@ function _isConvexPolygon(vertices) {
         let outNodeId, outPort, inNodeId, inPort;
 
         if (fromDir === 'out' && toDir === 'in') {
-          // Dragged from an output port to an input port — canonical direction
           outNodeId = fromNodeId;
           outPort   = fromPortName;
           inNodeId  = toNodeId;
           inPort    = toPortName;
         } else if (fromDir === 'in' && toDir === 'out') {
-          // Dragged backwards (from input to output) — swap to canonical
           outNodeId = toNodeId;
           outPort   = toPortName;
           inNodeId  = fromNodeId;
           inPort    = fromPortName;
         } else {
-          // Both same direction — incompatible, ignore silently
-          // (e.g. OUT→OUT or IN→IN)
           return;
+        }
+
+        // ── V1 dimensional bridge wiring guard ────────────────────────────────
+        // Prevent invalid connections that the dropdown greying cannot catch
+        // (because the user drag-connected manually rather than using the
+        // dropdown). Specifically blocks:
+        //   1. A 3D primitive output wired into an Extrude or Revolve input
+        //   2. A bridge node (Extrude/Revolve) output wired into another
+        //      bridge node's input (bridge chaining is invalid in V1)
+        const graph = this.stateStore.nodeGraph;
+        const TYPES_3D = new Set([
+            'sphere','box','cylinder','capsule','torus','cone','plane'
+        ]);
+        const BRIDGE_TYPES = new Set(['extrudeNode','revolveNode']);
+
+        const fromNode = graph.nodes.get(outNodeId);
+        const toNode   = graph.nodes.get(inNodeId);
+
+        if (fromNode && toNode) {
+            const fromIs3D     = TYPES_3D.has(fromNode.type);
+            const fromIsBridge = BRIDGE_TYPES.has(fromNode.type);
+            const toIsBridge   = BRIDGE_TYPES.has(toNode.type);
+
+            if (toIsBridge && fromIs3D) {
+                this._showToast(
+                    `Cannot connect "${fromNode.type}" → "${toNode.type}": ` +
+                    `Extrude / Revolve require a 2D primitive as input. ` +
+                    `Connect a 2D shape (circle, arc, polygon…) instead.`,
+                    4000
+                );
+                return;
+            }
+
+            if (toIsBridge && fromIsBridge) {
+                this._showToast(
+                    `Cannot chain two dimensional bridges: ` +
+                    `"${fromNode.type}" → "${toNode.type}" is not supported in V1. ` +
+                    `A bridge node already produces a 3D solid — ` +
+                    `connect it to a blend or transform node instead.`,
+                    4000
+                );
+                return;
+            }
         }
 
         this._undo.snapshot();
         try {
           this.stateStore.nodeGraph.addEdge(outNodeId, outPort, inNodeId, inPort);
-          // _onGraphChange will rebuild cards and redraw
         } catch (e) {
           console.warn('NodeCanvas: Could not connect ports:', e.message);
         }
@@ -2794,6 +2859,10 @@ function _isConvexPolygon(vertices) {
         }
         this._drawEdges();
         this._updateGraphStatusLabel();
+        // Re-evaluate bridge (Extrude/Revolve) availability whenever the
+        // graph structure changes — a new bridge node being added, or an
+        // existing one being removed, changes what the dropdown should show.
+        this._updateDropdownAvailability();
     }
 
     // ── Scene geometry check ──────────────────────────────────────────────────
@@ -2811,7 +2880,136 @@ function _isConvexPolygon(vertices) {
      *
      * @returns {boolean}
      */
-_sceneHasGeometry() {
+/**
+     * Re-evaluate which Transform/Operation dropdown entries should be
+     * enabled or disabled based on the current graph state and selection.
+     *
+     * Rules enforced here (V1 scope):
+     *
+     * 1. Dimensional bridges (Extrude, Revolve) require a 2D primitive as
+     *    their direct or indirect input. They are disabled when:
+     *    a) A 3D primitive is selected (3D → bridge is geometrically invalid)
+     *    b) The selected node (or the sole unwired primitive) is already
+     *       downstream of a bridge (bridge → bridge is invalid)
+     *    c) The only primitives in the scene are 3D and no 2D primitives
+     *       exist (Priority 2 auto-chain would connect to a 3D primitive)
+     *
+     * 2. When bridges are disabled, a tooltip on the greyed option explains
+     *    why rather than silently ignoring the click.
+     *
+     * Called from: _setSelected(), _onGraphChange(), _updateGraphStatusLabel()
+     */
+    _updateDropdownAvailability() {
+        if (!this._xformSelect) return;
+
+        const graph = this.stateStore.nodeGraph;
+
+        const TYPES_3D = new Set([
+            'sphere','box','cylinder','capsule','torus','cone','plane'
+        ]);
+        const TYPES_2D = new Set([
+            'circle','regularPolygon','triangle','arc','polytope','lineSegment'
+        ]);
+        const BRIDGE_TYPES = new Set(['extrudeNode','revolveNode']);
+
+        // Walk backward from a node through its input chain — returns true
+        // if any node in the upstream chain is a dimensional bridge.
+        const chainHasBridge = (nodeId, visited = new Set()) => {
+            if (visited.has(nodeId)) return false;
+            visited.add(nodeId);
+            const node = graph.nodes.get(nodeId);
+            if (!node) return false;
+            if (BRIDGE_TYPES.has(node.type)) return true;
+            // Walk all incoming edges for this node
+            let found = false;
+            graph.edges.forEach(edge => {
+                if (edge.toNode === nodeId) {
+                    if (chainHasBridge(edge.fromNode, visited)) found = true;
+                }
+            });
+            return found;
+        };
+
+        let bridgesAllowed = true;
+        let reason = '';
+
+        // Check selected node first (Priority 1)
+        const selId = [...this._selectedIds].pop();
+        const selNode = selId ? graph.nodes.get(selId) : null;
+
+        if (selNode) {
+            if (TYPES_3D.has(selNode.type)) {
+                bridgesAllowed = false;
+                reason = 'Extrude / Revolve require a 2D shape as input — ' +
+                         `"${selNode.type}" is a 3D primitive. ` +
+                         'Select a 2D primitive (circle, arc, polygon…) first.';
+            } else if (chainHasBridge(selNode.id)) {
+                bridgesAllowed = false;
+                reason = 'This branch already contains a dimensional bridge ' +
+                         '(Extrude or Revolve). Adding a second bridge in the ' +
+                         'same chain is not supported in V1.';
+            }
+        } else {
+            // No selection — check Priority 2 (sole unwired primitive)
+            const prims = [];
+            graph.nodes.forEach((n, id) => {
+                if (TYPES_2D.has(n.type) || TYPES_3D.has(n.type)) prims.push(n);
+            });
+            if (prims.length === 1) {
+                const p = prims[0];
+                if (TYPES_3D.has(p.type)) {
+                    bridgesAllowed = false;
+                    reason = 'The only primitive in the scene is a 3D shape. ' +
+                             'Extrude / Revolve require a 2D input. ' +
+                             'Add a 2D primitive (circle, arc, polygon…) first.';
+                } else if (chainHasBridge(p.id)) {
+                    bridgesAllowed = false;
+                    reason = 'The existing chain already contains a dimensional ' +
+                             'bridge. Adding a second bridge is not supported in V1.';
+                }
+            } else if (prims.length > 1) {
+                // Multiple primitives, no selection — bridges remain available
+                // (the user must select a valid 2D source card first;
+                // _addTransformNode's existing guard handles the case where
+                // they click without a valid selection)
+                bridgesAllowed = true;
+            }
+        }
+
+        // Apply enabled/disabled state to Extrude and Revolve options
+        // in the Transform/Operation dropdown.
+        Array.from(this._xformSelect.options).forEach(opt => {
+            if (opt.value === 'extrude' || opt.value === 'revolve') {
+                opt.disabled = !bridgesAllowed;
+                // Grey-out styling — browsers don't always respect CSS on
+                // <option> elements consistently, but color + title (tooltip)
+                // together provide both visual and informational feedback.
+                opt.style.color = bridgesAllowed
+                    ? 'rgba(220,220,230,0.95)'
+                    : 'rgba(120,120,130,0.55)';
+                opt.style.backgroundColor = '#1c1c22';
+                opt.title = bridgesAllowed ? '' : reason;
+                // Also update the option's text label to append a ✕ marker
+                // when disabled, since <option> disabled visual state alone
+                // is very subtle in some OS/browser combos.
+                if (!bridgesAllowed && !opt.textContent.startsWith('✕')) {
+                    opt.dataset.originalText = opt.textContent;
+                    opt.textContent = `✕ ${opt.textContent}`;
+                } else if (bridgesAllowed && opt.dataset.originalText) {
+                    opt.textContent = opt.dataset.originalText;
+                    delete opt.dataset.originalText;
+                }
+            }
+        });
+
+        // Also update the dropdown's own title when bridges are disabled
+        // so hovering the whole dropdown shows context even before opening it.
+        this._xformSelect.title = bridgesAllowed
+            ? 'Click an operation to add it to the graph'
+            : `Extrude / Revolve disabled: ${reason}`;
+    }
+
+    _sceneHasGeometry() {
         const GEOM_TYPES = new Set([
             'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
             'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
@@ -3443,7 +3641,7 @@ _sceneHasGeometry() {
         // Degrees per second at 60fps internally — 2.0 is a gentle, clearly
         // visible turntable speed suited to demo footage (not so fast it
         // looks frantic, not so slow it looks static across a short clip).
-        ctrl.autoRotateSpeed = 2.0;
+        ctrl.autoRotateSpeed = 4.0;
 
         this._showToast(
             next

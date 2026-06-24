@@ -303,7 +303,42 @@ float rIntersection(float a, float b, float s) {
 float rDifference(float a, float b, float s) {
   // max(a, −b): positive outside A−B, negative inside crescent.
   return rIntersection(a, -b, s);
-}`;
+}
+
+// ── Shared noise helpers ────────────────────────────────────────────────────
+// Declared once in the preamble so that any number of noiseDisplaceNode
+// instances in the same graph can reference these functions without each
+// one redefining them — which would cause a GLSL "function already has a
+// body" compile error. Both 2D and 3D variants are declared here so either
+// can be called from any noise node regardless of its input dimensionality.
+float ndHash(float n) { return fract(sin(n) * 43758.5453); }
+
+float ndNoise3(vec3 p) {
+  float ix=floor(p.x); float iy=floor(p.y); float iz=floor(p.z);
+  float fx=fract(p.x); float fy=fract(p.y); float fz=fract(p.z);
+  float ux=fx*fx*(3.0-2.0*fx);
+  float uy=fy*fy*(3.0-2.0*fy);
+  float uz=fz*fz*(3.0-2.0*fz);
+  return mix(
+    mix(mix(ndHash(ix    +iy*57.0+iz*113.0), ndHash(ix+1.0+iy*57.0    +iz*113.0), ux),
+        mix(ndHash(ix    +(iy+1.0)*57.0+iz*113.0), ndHash(ix+1.0+(iy+1.0)*57.0+iz*113.0), ux), uy),
+    mix(mix(ndHash(ix    +iy*57.0+(iz+1.0)*113.0), ndHash(ix+1.0+iy*57.0+(iz+1.0)*113.0), ux),
+        mix(ndHash(ix    +(iy+1.0)*57.0+(iz+1.0)*113.0), ndHash(ix+1.0+(iy+1.0)*57.0+(iz+1.0)*113.0), ux), uy),
+    uz);
+}
+
+float ndNoise2(vec2 p) {
+  float ix=floor(p.x); float iy=floor(p.y);
+  float fx=fract(p.x); float fy=fract(p.y);
+  float ux=fx*fx*(3.0-2.0*fx);
+  float uy=fy*fy*(3.0-2.0*fy);
+  return mix(
+    mix(ndHash(ix    +iy*57.0), ndHash(ix+1.0+iy*57.0),     ux),
+    mix(ndHash(ix    +(iy+1.0)*57.0), ndHash(ix+1.0+(iy+1.0)*57.0), ux),
+    uy);
+}
+// ── End shared noise helpers ────────────────────────────────────────────────
+`;
   }
 
   // ── Per-node dispatch ─────────────────────────────────────────────────────
@@ -986,37 +1021,35 @@ float ${fn}(${dim} p) {
         const is3D     = baseNode && this._nodeOutputIs3D(baseNode);
         const dim      = is3D ? 'vec3' : 'vec2';
 
-        // When animated=yes, add uTime to the Z (or Y for 2D) noise coordinate
-        // so the pattern shifts over time. uTime is provided as a uniform by
-        // the renderer each frame. The 0.5 factor keeps the animation speed
-        // comfortable — fast enough to be visible, slow enough to read.
-        const timeOffset = animated ? '+ uTime * 0.5' : '';
+        // When animated=yes, add uTime to the noise sample coordinate so
+        // the pattern shifts over time. uTime is provided as a uniform by
+        // the renderer each frame. The 0.35 factor keeps animation speed
+        // comfortable — visible but not frantic.
+        const timeOffset = animated ? ' + uTime * 0.35' : '';
 
-        const sampleCoord = is3D
-          ? `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq} ${timeOffset})`
-          : `vec2(p.x * ${freq}, p.y * ${freq} ${timeOffset})`;
-
-        return `// noiseDisplaceNode ${node.id}  (animated=${animated})
-float ndHash(float n) { return fract(sin(n) * 43758.5453); }
-float ndNoise(${dim} p) {
-  ${is3D
-    ? `float ix=floor(p.x); float iy=floor(p.y); float iz=floor(p.z);
-  float fx=fract(p.x); float fy=fract(p.y); float fz=fract(p.z);
-  float ux=fx*fx*(3.0-2.0*fx); float uy=fy*fy*(3.0-2.0*fy); float uz=fz*fz*(3.0-2.0*fz);
-  return mix(mix(mix(ndHash(ix+iy*57.0+iz*113.0),ndHash(ix+1.0+iy*57.0+iz*113.0),ux),
-                 mix(ndHash(ix+(iy+1.0)*57.0+iz*113.0),ndHash(ix+1.0+(iy+1.0)*57.0+iz*113.0),ux),uy),
-             mix(mix(ndHash(ix+iy*57.0+(iz+1.0)*113.0),ndHash(ix+1.0+iy*57.0+(iz+1.0)*113.0),ux),
-                 mix(ndHash(ix+(iy+1.0)*57.0+(iz+1.0)*113.0),ndHash(ix+1.0+(iy+1.0)*57.0+(iz+1.0)*113.0),ux),uy),uz);`
-    : `float ix=floor(p.x); float iy=floor(p.y);
-  float fx=fract(p.x); float fy=fract(p.y);
-  float ux=fx*fx*(3.0-2.0*fx); float uy=fy*fy*(3.0-2.0*fy);
-  return mix(mix(ndHash(ix+iy*57.0),ndHash(ix+1.0+iy*57.0),ux),
-             mix(ndHash(ix+(iy+1.0)*57.0),ndHash(ix+1.0+(iy+1.0)*57.0),ux),uy);`}
-}
-float ${fn}(${dim} p) {
-  float n = ndNoise(${sampleCoord}) * 2.0 - 1.0;
+        // ndHash, ndNoise3, and ndNoise2 are declared once in _preamble()
+        // and must NOT be redeclared here — doing so would cause a GLSL
+        // "function already has a body" compile error whenever two or more
+        // noiseDisplaceNode instances exist in the same graph (as in the
+        // Gothic Portal preset, which uses three separate noise nodes).
+        // This node's generated function only calls the shared helpers.
+        if (is3D) {
+          const sampleCoord =
+            `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq}${timeOffset})`;
+          return `// noiseDisplaceNode ${node.id}  (3D, animated=${animated})
+float ${fn}(vec3 p) {
+  float n = ndNoise3(${sampleCoord}) * 2.0 - 1.0;
   return ${inputFn}(p) + n * ${amp};
 }`;
+        } else {
+          const sampleCoord =
+            `vec2(p.x * ${freq}, p.y * ${freq}${timeOffset})`;
+          return `// noiseDisplaceNode ${node.id}  (2D, animated=${animated})
+float ${fn}(vec2 p) {
+  float n = ndNoise2(${sampleCoord}) * 2.0 - 1.0;
+  return ${inputFn}(p) + n * ${amp};
+}`;
+        }
       }
 
       case 'twistNode': {
