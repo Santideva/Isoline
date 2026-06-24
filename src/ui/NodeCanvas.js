@@ -203,20 +203,19 @@ function _isConvexPolygon(vertices) {
         // ── Toolbar ───────────────────────────────────────────────────────────
         const toolbar = document.createElement('div');
         toolbar.style.cssText = `
-        height: 52px;
+        height: 46px;
         background: rgba(12,12,14,0.96);
         border-bottom: 1px solid rgba(255,255,255,0.10);
         display: flex;
         align-items: center;
-        padding: 0 12px;
-        gap: 6px;
+        padding: 0 8px;
+        gap: 4px;
         flex-shrink: 0;
         pointer-events: auto;
         backdrop-filter: blur(6px);
         overflow-x: auto;
         overflow-y: hidden;
-        scrollbar-width: thin;
-        scrollbar-color: rgba(255,255,255,0.15) transparent;
+        scrollbar-width: none;
         min-width: 0;
         box-sizing: border-box;
         width: 100%;
@@ -301,7 +300,7 @@ function _isConvexPolygon(vertices) {
         this._2dSelect = document.createElement('select');
         this._2dSelect.style.cssText = _selectStyle;
         this._2dSelect.title = 'Click a 2D primitive to add it to the graph';
-        this._2dSelect.appendChild(_ph('2D Primitive ▾'));
+        this._2dSelect.appendChild(_ph('2D ▾'));
         [
           ['line','Line'], ['triangle','Triangle'], ['arc','Arc'],
           ['circle','Circle'], ['polygon','Polygon'], ['polytope','Conv. Polygon'],
@@ -314,7 +313,7 @@ function _isConvexPolygon(vertices) {
         this._3dSelect = document.createElement('select');
         this._3dSelect.style.cssText = _selectStyle;
         this._3dSelect.title = 'Click a 3D primitive to add it to the graph';
-        this._3dSelect.appendChild(_ph('3D Primitive ▾'));
+        this._3dSelect.appendChild(_ph('3D ▾'));
         [
           ['sphere','Sphere'], ['box','Box'], ['cylinder','Cylinder'],
           ['capsule','Capsule'], ['torus','Torus'], ['cone','Cone'], ['plane','Plane'],
@@ -327,7 +326,7 @@ function _isConvexPolygon(vertices) {
         this._xformSelect = document.createElement('select');
         this._xformSelect.style.cssText = _selectStyle;
         this._xformSelect.title = 'Click an operation to add it to the graph';
-        this._xformSelect.appendChild(_ph('Transform / Operation ▾'));
+        this._xformSelect.appendChild(_ph('Transform ▾'));
         [
           ['extrude','Extrude'], ['revolve','Revolve'], ['tiling','Tiling'],
           ['symmetryfold','Sym. Fold'], ['symmetryorbit','Sym. Orbit'],
@@ -343,7 +342,7 @@ function _isConvexPolygon(vertices) {
         this._blendSelect = document.createElement('select');
         this._blendSelect.style.cssText = _selectStyle;
         this._blendSelect.title = 'Click a blend mode to add it to the graph';
-        this._blendSelect.appendChild(_ph('Blend Mode ▾'));
+        this._blendSelect.appendChild(_ph('Blend ▾'));
         [
           ['schurBlend','Schur'], ['rUnion','R-Union'],
           ['rIntersection','R-Intersect'], ['rDifference','R-Difference'],
@@ -770,7 +769,7 @@ function _isConvexPolygon(vertices) {
         sidebar.id = 'nc-sidebar';
         sidebar.style.cssText = `
             position: fixed;
-            top: 52px;
+            top: 46px;
             right: 0;
             bottom: 0;
             width: ${SIDEBAR_COLLAPSED_W}px;
@@ -1224,8 +1223,8 @@ function _isConvexPolygon(vertices) {
         border: 1px solid rgba(255,255,255,0.15);
         border-radius: 4px;
         color: rgba(255,255,255,0.75);
-        font-size: 13px;
-        padding: 4px 12px;
+        font-size: 12px;
+        padding: 3px 8px;
         cursor: pointer;
         `;
         btn.addEventListener('click', onClick);

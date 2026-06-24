@@ -360,9 +360,9 @@ export const PRESET_KNOTTED_BLOOM = {
         id:          'knotted-bloom',
         label:       'Knotted Bloom',
         description: 'A radial sculptural bloom: a cylinder and cone joined ' +
-                     'into a petal, twisted and folded into a 6-fold radial ' +
+                     'into a curved petal, folded and orbited into a 6-fold radial ' +
                      'arrangement with animated surface texture. ' +
-                     'Cylinder + Cone + Schur + Twist + Sym. Fold + Sym. Orbit + Noise.',
+                     'Cylinder + Cone + Schur + Bend + Sym. Fold + Sym. Orbit + Noise.',
         audience:    'General',
         renderMode:  'rayMarch',
     },
@@ -407,17 +407,17 @@ export const PRESET_KNOTTED_BLOOM = {
                 uiPos: { x: 340, y: 160 },
             },
 
-            // ── Twist — gives each petal the knotted, rotated quality ──────────
-            // This is the node that transforms a simple cylinder+cone
-            // into a blade-like twisted petal. The twist rotates geometry
-            // as a function of height, so the petal tip is rotated relative
-            // to its base, creating the characteristic swept-blade appearance.
-            // Inserted before the symmetry operations so all folded/orbited
-            // copies inherit the same twist.
+            // ── Bend — gives each petal its curved, bloom-petal shape ─────────
+            // Bend deforms geometry by curving it along an axis, which is
+            // the correct transform for petal-like forms — it produces the
+            // characteristic curvature of a real flower or bloom petal
+            // (curving away from center) rather than the torsional rotation
+            // of a twist. Applied before symmetry operations so all folded
+            // and orbited copies share the same curvature.
             {
                 id:    4,
-                type:  'twistNode',
-                params: { strength: 0.55 },
+                type:  'bendNode',
+                params: { strength: 0.38 },
                 uiPos: { x: 580, y: 160 },
             },
 
@@ -483,7 +483,7 @@ export const PRESET_KNOTTED_BLOOM = {
             { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 3, toPort: 'sdfA'   },
             // cone → schurBlend B
             { id: 'e2', fromNode: 2, fromPort: 'sdf',    toNode: 3, toPort: 'sdfB'   },
-            // joined petal → twist (creates swept-blade petal form)
+            // joined petal → bend (curves the petal away from center)
             { id: 'e3', fromNode: 3, fromPort: 'result', toNode: 4, toPort: 'sdf'    },
             // twisted petal → symmetry fold
             { id: 'e4', fromNode: 4, fromPort: 'result', toNode: 5, toPort: 'sdf'    },
