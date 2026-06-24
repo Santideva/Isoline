@@ -125,6 +125,13 @@ function _isConvexPolygon(vertices) {
         this._recomposeTimer       = null;
         this._viewportDragAttached = false;
 
+        // Auto-orbit speed — degrees per second (internal OrbitControls units).
+        // Range exposed to user: 0.5 (very slow, cinematic) to 10.0 (fast).
+        // Default 4.0 is a confident turntable pace suited to demo footage.
+        // Stored here so it persists across multiple R-key toggles within
+        // a session and so the sidebar slider always reflects the live value.
+        this._autoOrbitSpeed = 4.0;
+
         // ── Undo / Redo ───────────────────────────────────────────────────
         this._undo      = new UndoManager(stateStore.nodeGraph);
         this._undoBtnEl = null;   // assigned in _buildDOM
@@ -942,15 +949,91 @@ function _isConvexPolygon(vertices) {
             this._toggleViewMenu(this._viewBtn)
         );
         this._viewBtn.title = 'Snap camera to a preset viewing angle';
-        this._viewBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        this._viewBtn.style.cssText += 'flex:1; min-width:0; font-size:11px;';
         camRow2.appendChild(this._viewBtn);
 
         const _camResetBtn = this._makeButton('⌂ Home', () => {
             this._setCameraView('home');
         });
         _camResetBtn.title = 'Reset camera to default view (Home)';
-        _camResetBtn.style.cssText += 'flex:1; min-width:0; font-size:12px;';
+        _camResetBtn.style.cssText += 'flex:1; min-width:0; font-size:11px;';
         camRow2.appendChild(_camResetBtn);
+
+        // ── Auto-orbit speed slider ───────────────────────────────────────
+        // Controls how fast the camera revolves when auto-orbit (R key) is
+        // active. Graduated from very slow (0.5 — cinematic, good for long
+        // establishing shots) to fast (10.0 — quick demo spins). Updates
+        // live even while orbit is already running, so the user can dial
+        // in the right speed while watching the result.
+        const orbitSpeedRow = document.createElement('div');
+        orbitSpeedRow.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 6px;
+            margin-bottom: 2px;
+        `;
+
+        const orbitSpeedLabel = document.createElement('label');
+        orbitSpeedLabel.textContent = 'Orbit speed';
+        orbitSpeedLabel.title = 'Auto-orbit rotation speed (R key). ' +
+            'Slow (left) for cinematic shots and GIFs. ' +
+            'Fast (right) for quick demo spins. ' +
+            'Updates live while orbit is running.';
+        orbitSpeedLabel.style.cssText = `
+            font-size: 12px;
+            opacity: 0.75;
+            min-width: 72px;
+            flex-shrink: 0;
+            cursor: help;
+            white-space: nowrap;
+            color: rgba(220,220,230,0.9);
+        `;
+
+        const orbitSpeedSlider = document.createElement('input');
+        orbitSpeedSlider.type  = 'range';
+        orbitSpeedSlider.min   = '0.5';
+        orbitSpeedSlider.max   = '10.0';
+        orbitSpeedSlider.step  = '0.5';
+        orbitSpeedSlider.value = String(this._autoOrbitSpeed);
+        orbitSpeedSlider.title = orbitSpeedLabel.title;
+        orbitSpeedSlider.style.cssText = `
+            flex: 1;
+            min-width: 0;
+            height: 14px;
+            accent-color: #378ADD;
+            cursor: pointer;
+        `;
+
+        const orbitSpeedDisplay = document.createElement('span');
+        orbitSpeedDisplay.textContent = this._autoOrbitSpeed.toFixed(1);
+        orbitSpeedDisplay.style.cssText = `
+            font-size: 11px;
+            opacity: 0.8;
+            min-width: 28px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            flex-shrink: 0;
+            color: rgba(220,220,230,0.85);
+        `;
+
+        orbitSpeedSlider.addEventListener('input', () => {
+            const val = parseFloat(orbitSpeedSlider.value);
+            this._autoOrbitSpeed = val;
+            orbitSpeedDisplay.textContent = val.toFixed(1);
+
+            // Apply live if orbit is currently running — user sees the
+            // speed change immediately without needing to stop and restart.
+            const ctrl = this.sceneManager.controls;
+            if (ctrl && ctrl.autoRotate) {
+                ctrl.autoRotateSpeed = val;
+            }
+        });
+
+        orbitSpeedRow.appendChild(orbitSpeedLabel);
+        orbitSpeedRow.appendChild(orbitSpeedSlider);
+        orbitSpeedRow.appendChild(orbitSpeedDisplay);
+        camSection.appendChild(orbitSpeedRow);
 
         // ════════════════════════════════════════════════════════════════════
         // SECTION 2 — LAYOUT
@@ -3638,14 +3721,14 @@ function _isConvexPolygon(vertices) {
 
         const next = !ctrl.autoRotate;
         ctrl.autoRotate = next;
-        // Degrees per second at 60fps internally — 2.0 is a gentle, clearly
-        // visible turntable speed suited to demo footage (not so fast it
-        // looks frantic, not so slow it looks static across a short clip).
-        ctrl.autoRotateSpeed = 4.0;
+        // Read from the stored speed value so the sidebar slider and the
+        // R-key hotkey are always in sync — changing the slider then
+        // pressing R uses the slider's current value, not a hardcoded one.
+        ctrl.autoRotateSpeed = this._autoOrbitSpeed;
 
         this._showToast(
             next
-                ? 'Auto-orbit ON — press R to stop, or drag to interrupt'
+                ? `Auto-orbit ON  (speed ${this._autoOrbitSpeed.toFixed(1)}) — press R to stop`
                 : 'Auto-orbit OFF',
             2200
         );
