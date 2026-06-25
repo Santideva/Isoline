@@ -359,74 +359,74 @@ export const PRESET_KNOTTED_BLOOM = {
     meta: {
         id:          'knotted-bloom',
         label:       'Knotted Bloom',
-        description: 'A radial sculptural bloom: a cylinder and cone joined ' +
-                     'into a curved petal, folded and orbited into a 6-fold radial ' +
-                     'arrangement with animated surface texture. ' +
+        description: 'A radial sculptural bloom: cylinder and cone smooth-joined ' +
+                     'into a petal unit, bent into a curved blade, folded and ' +
+                     'orbited into a radial arrangement with animated surface texture. ' +
                      'Cylinder + Cone + Schur + Bend + Sym. Fold + Sym. Orbit + Noise.',
         audience:    'General',
         renderMode:  'rayMarch',
     },
     graph: {
         nodes: [
-            // ── Cylinder — petal body, offset from origin ─────────────────────
-            // Positioned at X=0.9 so that when symmetry fold and orbit
-            // replicate it, the copies are spaced apart and readable as
-            // individual petals rather than converging into a solid mass
-            // at the center. This offset is the key to the bloom reading
-            // correctly as distinct petal forms.
+            // ── Cylinder — petal body ─────────────────────────────────────────
+            // Centred at origin. Narrow radius, moderate height — the
+            // schurBlend with the cone will define the final petal shape.
             {
                 id:    1,
                 type:  'cylinder',
-                params: { radius: 0.22, height: 1.8, posX: 0.9, posY: 0.0, posZ: 0.0 },
+                params: { radius: 1.0, height: 0.7, posX: 0.0, posY: 0.0, posZ: 0.0 },
                 uiPos: { x: 60, y: 60 },
             },
 
-            // ── Cone — petal tip, aligned and offset to match cylinder ─────────
-            // Positioned so its base meets the cylinder top. Same X offset
-            // as the cylinder so they align spatially.
+            // ── Cone — petal tip ──────────────────────────────────────────────
+            // Positioned at posY = half cylinder height so its base meets
+            // the cylinder's top flush. Same radius as cylinder base so
+            // the schurBlend joins them without a visible seam.
             {
                 id:    2,
                 type:  'cone',
-                params: { radius: 0.22, height: 0.9, posX: 0.9, posY: 1.0, posZ: 0.0 },
+                params: { radius: 1.0, height: 1.0, posX: 0.0, posY: 0.8, posZ: 0.0 },
                 uiPos: { x: 60, y: 260 },
             },
 
             // ── Schur union — tight join ──────────────────────────────────────
+            // Low smoothness so cylinder and cone join cleanly at their
+            // shared boundary rather than melting into each other.
             {
                 id:    3,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
-                    smoothness: 3,
+                    smoothness: 4,
                     rotation:   0,
                     scale:      1,
                     posX:       0,
                     posY:       0,
-                    isoOffset:  0.0,
+                    isoOffset:  0.05,
                 },
                 uiPos: { x: 340, y: 160 },
             },
 
-            // ── Bend — gives each petal its curved, bloom-petal shape ─────────
-            // Bend deforms geometry by curving it along an axis, which is
-            // the correct transform for petal-like forms — it produces the
-            // characteristic curvature of a real flower or bloom petal
-            // (curving away from center) rather than the torsional rotation
-            // of a twist. Applied before symmetry operations so all folded
-            // and orbited copies share the same curvature.
+            // ── Bend — curves the joined petal ────────────────────────────────
+            // Applied to the schurBlend result so the entire petal unit
+            // (cylinder body + cone tip) curves together as one piece.
+            // This gives the characteristic curved-blade petal form that
+            // reads as a bloom petal rather than a straight geometric slab.
             {
                 id:    4,
                 type:  'bendNode',
-                params: { strength: 0.38 },
+                params: { strength: 0.5 },
                 uiPos: { x: 580, y: 160 },
             },
 
-            // ── Symmetry fold — X and Y reflection ───────────────────────────
+            // ── Symmetry fold ─────────────────────────────────────────────────
+            // Reflective symmetry creates multiple petal copies from one.
+            // folds=2 with reflectX and reflectY both yes = 4-way reflection.
             {
                 id:    5,
                 type:  'symmetryFoldNode',
                 params: {
-                    folds:    2,
+                    folds:    3,
                     centerX:  0,
                     centerY:  0,
                     rotation: 0,
@@ -436,16 +436,20 @@ export const PRESET_KNOTTED_BLOOM = {
                 uiPos: { x: 820, y: 160 },
             },
 
-            // ── Symmetry orbit — 6-fold radial replication ────────────────────
+            // ── Symmetry orbit — radial replication ───────────────────────────
+            // Replicates the folded result around the center with rotational
+            // symmetry to create the full bloom arrangement. folds=6 gives
+            // a 6-fold radial pattern. combiner='min' keeps individual
+            // petal boundaries sharp and distinct.
             {
                 id:    6,
                 type:  'symmetryOrbitNode',
                 params: {
-                    folds:      6,
+                    folds:      4,
                     centerX:    0,
                     centerY:    0,
                     rotation:   0,
-                    reflectX:   'no',
+                    reflectX:   'yes',
                     combiner:   'min',
                     smoothness: 2,
                 },
@@ -453,10 +457,13 @@ export const PRESET_KNOTTED_BLOOM = {
             },
 
             // ── Animated noise ────────────────────────────────────────────────
+            // Very low amplitude, fine frequency, animated — gives the
+            // bloom surface a subtle living quality without distorting
+            // the petal forms.
             {
                 id:    7,
                 type:  'noiseDisplaceNode',
-                params: { amplitude: 0.012, frequency: 14.0, animated: 'yes' },
+                params: { amplitude: 0.04, frequency: 0.10, animated: 'yes' },
                 uiPos: { x: 1300, y: 160 },
             },
 
@@ -483,11 +490,11 @@ export const PRESET_KNOTTED_BLOOM = {
             { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 3, toPort: 'sdfA'   },
             // cone → schurBlend B
             { id: 'e2', fromNode: 2, fromPort: 'sdf',    toNode: 3, toPort: 'sdfB'   },
-            // joined petal → bend (curves the petal away from center)
+            // joined petal → bend (curves into blade/petal form)
             { id: 'e3', fromNode: 3, fromPort: 'result', toNode: 4, toPort: 'sdf'    },
-            // twisted petal → symmetry fold
+            // bent petal → symmetry fold
             { id: 'e4', fromNode: 4, fromPort: 'result', toNode: 5, toPort: 'sdf'    },
-            // folded → symmetry orbit (6-fold radial bloom)
+            // folded → symmetry orbit (radial bloom)
             { id: 'e5', fromNode: 5, fromPort: 'result', toNode: 6, toPort: 'sdf'    },
             // orbited bloom → animated noise
             { id: 'e6', fromNode: 6, fromPort: 'result', toNode: 7, toPort: 'sdf'    },
