@@ -222,37 +222,151 @@ function _isConvexPolygon(vertices) {
         `;
 
         // ── Shared toolbar utilities ───────────────────────────────────────────
-        const _selectStyle = `
-          background: rgba(255,255,255,0.08);
-          border: 1px solid rgba(255,255,255,0.15);
-          border-radius: 4px;
-          color: rgba(255,255,255,0.8);
-          font-size: 12px;
-          padding: 3px 8px;
-          cursor: pointer;
-          min-width: fit-content;
-        `;
+        // _selectStyle, _opt, _ph removed — toolbar dropdowns are now
+        // custom div-based (see _makeCustomDropdown above) so native
+        // <select> helpers are no longer needed.
 
-        // Create an <option> with explicit background/color so the native
-        // OS dropdown popup renders readable text on any system theme.
-        const _opt = (val, lbl) => {
-          const o = document.createElement('option');
-          o.value = val; o.textContent = lbl;
-          o.style.backgroundColor = '#1c1c22';
-          o.style.color = 'rgba(220,220,230,0.95)';
-          return o;
+        // ── Custom dropdown builder ───────────────────────────────────────────
+        // Creates a fully browser-rendered dropdown (trigger + panel) that
+        // OBS Display Capture can record, unlike native <select> elements
+        // whose popup menus are rendered by the OS in a separate layer that
+        // OBS cannot capture.
+        //
+        // Returns { el, setValue } where:
+        //   el         — the root wrapper element to append to the toolbar
+        //   setValue   — programmatically reset the displayed label (e.g.
+        //                after a selection, to restore the placeholder text)
+        //
+        // @param {string}   placeholder   Label shown when nothing selected
+        // @param {Array}    items         [{ value, label }] option list
+        // @param {Function} onSelect      Called with (value) on selection
+        const _makeCustomDropdown = (placeholder, items, onSelect) => {
+            const wrapper = document.createElement('div');
+            wrapper.style.cssText = `
+                position: relative;
+                display: inline-block;
+                flex-shrink: 0;
+            `;
+
+            // ── Trigger button ────────────────────────────────────────────────
+            const trigger = document.createElement('button');
+            trigger.style.cssText = `
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 4px;
+                color: rgba(255,255,255,0.8);
+                font-size: 12px;
+                padding: 3px 8px;
+                cursor: pointer;
+                white-space: nowrap;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-family: var(--font-sans, sans-serif);
+            `;
+            trigger.textContent = placeholder;
+            wrapper.appendChild(trigger);
+
+            // ── Panel ─────────────────────────────────────────────────────────
+            const panel = document.createElement('div');
+            panel.style.cssText = `
+                display: none;
+                position: fixed;
+                background: rgba(16,16,22,0.98);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 6px;
+                padding: 4px 0;
+                z-index: 9999;
+                min-width: 160px;
+                box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+                font-family: var(--font-sans, sans-serif);
+                pointer-events: auto;
+            `;
+
+            // Build one row per item
+            items.forEach(({ value, label }) => {
+                const item = document.createElement('div');
+                item.textContent = label;
+                item.dataset.value = value;
+                item.style.cssText = `
+                    padding: 7px 14px;
+                    font-size: 12px;
+                    color: rgba(220,220,230,0.9);
+                    cursor: pointer;
+                    white-space: nowrap;
+                `;
+                item.addEventListener('mouseenter', () => {
+                    item.style.background = 'rgba(255,255,255,0.10)';
+                });
+                item.addEventListener('mouseleave', () => {
+                    item.style.background = 'transparent';
+                });
+                item.addEventListener('mousedown', (e) => {
+                    e.preventDefault(); // prevent outside-click handler firing first
+                    onSelect(value);
+                    trigger.textContent = placeholder; // reset to placeholder
+                    panel.style.display = 'none';
+                    document.removeEventListener('mousedown', outsideHandler);
+                    _dropdownOpen = null;
+                });
+                panel.appendChild(item);
+            });
+
+            document.body.appendChild(panel);
+
+            // ── Toggle open/close ─────────────────────────────────────────────
+            let outsideHandler = null;
+
+            trigger.addEventListener('click', (e) => {
+                e.stopPropagation();
+
+                // Close any other open dropdown first
+                if (_dropdownOpen && _dropdownOpen !== panel) {
+                    _dropdownOpen.style.display = 'none';
+                }
+
+                const isOpen = panel.style.display === 'block';
+                if (isOpen) {
+                    panel.style.display = 'none';
+                    _dropdownOpen = null;
+                    if (outsideHandler) {
+                        document.removeEventListener('mousedown', outsideHandler);
+                        outsideHandler = null;
+                    }
+                    return;
+                }
+
+                // Position the panel directly below the trigger button
+                const rect = trigger.getBoundingClientRect();
+                panel.style.top  = `${rect.bottom + 4}px`;
+                panel.style.left = `${rect.left}px`;
+                panel.style.display = 'block';
+                _dropdownOpen = panel;
+
+                // Outside click closes the panel
+                outsideHandler = (ev) => {
+                    if (!panel.contains(ev.target) && ev.target !== trigger) {
+                        panel.style.display = 'none';
+                        _dropdownOpen = null;
+                        document.removeEventListener('mousedown', outsideHandler);
+                        outsideHandler = null;
+                    }
+                };
+                // Small delay so the triggering click doesn't immediately close
+                setTimeout(() => {
+                    document.addEventListener('mousedown', outsideHandler);
+                }, 80);
+            });
+
+            // setValue — allows external code to reset the label
+            const setValue = (text) => { trigger.textContent = text; };
+
+            return { el: wrapper, setValue, panel, trigger };
         };
 
-        // Placeholder option: shown when nothing is selected; disabled so
-        // it cannot itself be dispatched as an add action.
-        const _ph = (label) => {
-          const o = document.createElement('option');
-          o.value = ''; o.textContent = label;
-          o.disabled = true; o.selected = true;
-          o.style.backgroundColor = '#14141a';
-          o.style.color = 'rgba(150,150,165,0.7)';
-          return o;
-        };
+        // Track which custom dropdown panel is currently open so we can
+        // close it when another opens (only one open at a time).
+        let _dropdownOpen = null;
 
         // Dispatch helper: called on every dropdown's change event.
         // Adds the selected node type and resets the dropdown to its placeholder.
@@ -270,18 +384,26 @@ function _isConvexPolygon(vertices) {
 
         const _dispatchAdd = (v, selectEl) => {
           if (!v) return;
-          selectEl.value = '';          // reset to placeholder immediately
+          // Reset native select if one was passed; no-op for custom dropdown
+          // plain objects since custom dropdowns reset their own label.
+          if (selectEl && typeof selectEl.value === 'string') {
+            selectEl.value = '';
+          }
 
-          // Belt-and-braces guard: if the user somehow triggers a disabled
-          // option (e.g. programmatically, or via keyboard navigation),
-          // treat it as a no-op and show a toast rather than proceeding.
-          // The visual greying in _updateDropdownAvailability() is the
-          // primary signal; this is the safety net behind it.
+          // Belt-and-braces guard for bridge nodes: check the custom
+          // dropdown panel's items for a disabled marker if it exists,
+          // otherwise fall through to _addTransformNode's own guard.
           if (v === 'extrude' || v === 'revolve') {
-            const opt = Array.from(selectEl.options).find(o => o.value === v);
-            if (opt?.disabled) {
-              this._showToast(opt.title || 'Extrude / Revolve not available here.', 3500);
-              return;
+            if (this._xformDropdownPanel) {
+              const item = Array.from(this._xformDropdownPanel.querySelectorAll('[data-value]'))
+                .find(el => el.dataset.value === v);
+              if (item?.dataset.disabled === 'true') {
+                this._showToast(
+                  item.dataset.disabledReason || 'Extrude / Revolve not available here.',
+                  3500
+                );
+                return;
+              }
             }
           }
 
@@ -297,59 +419,75 @@ function _isConvexPolygon(vertices) {
         };
 
         // ── 2D geometry dropdown ──────────────────────────────────────────────
-        this._2dSelect = document.createElement('select');
-        this._2dSelect.style.cssText = _selectStyle;
-        this._2dSelect.title = 'Click a 2D primitive to add it to the graph';
-        this._2dSelect.appendChild(_ph('2D ▾'));
-        [
-          ['line','Line'], ['triangle','Triangle'], ['arc','Arc'],
-          ['circle','Circle'], ['polygon','Polygon'], ['polytope','Conv. Polygon'],
-        ].forEach(([v, l]) => this._2dSelect.appendChild(_opt(v, l)));
-        this._2dSelect.addEventListener('change', () =>
-          _dispatchAdd(this._2dSelect.value, this._2dSelect));
-        toolbar.appendChild(this._2dSelect);
+        const _2dDropdown = _makeCustomDropdown(
+            '2D ▾',
+            [
+                { value: 'line',     label: 'Line'          },
+                { value: 'triangle', label: 'Triangle'       },
+                { value: 'arc',      label: 'Arc'            },
+                { value: 'circle',   label: 'Circle'         },
+                { value: 'polygon',  label: 'Polygon'        },
+                { value: 'polytope', label: 'Conv. Polygon'  },
+            ],
+            (v) => _dispatchAdd(v, { value: v })
+        );
+        _2dDropdown.el.title = 'Click a 2D primitive to add it to the graph';
+        toolbar.appendChild(_2dDropdown.el);
 
         // ── 3D geometry dropdown ──────────────────────────────────────────────
-        this._3dSelect = document.createElement('select');
-        this._3dSelect.style.cssText = _selectStyle;
-        this._3dSelect.title = 'Click a 3D primitive to add it to the graph';
-        this._3dSelect.appendChild(_ph('3D ▾'));
-        [
-          ['sphere','Sphere'], ['box','Box'], ['cylinder','Cylinder'],
-          ['capsule','Capsule'], ['torus','Torus'], ['cone','Cone'], ['plane','Plane'],
-        ].forEach(([v, l]) => this._3dSelect.appendChild(_opt(v, l)));
-        this._3dSelect.addEventListener('change', () =>
-          _dispatchAdd(this._3dSelect.value, this._3dSelect));
-        toolbar.appendChild(this._3dSelect);
+        const _3dDropdown = _makeCustomDropdown(
+            '3D ▾',
+            [
+                { value: 'sphere',   label: 'Sphere'    },
+                { value: 'box',      label: 'Box'       },
+                { value: 'cylinder', label: 'Cylinder'  },
+                { value: 'capsule',  label: 'Capsule'   },
+                { value: 'torus',    label: 'Torus'     },
+                { value: 'cone',     label: 'Cone'      },
+                { value: 'plane',    label: 'Plane'     },
+            ],
+            (v) => _dispatchAdd(v, { value: v })
+        );
+        _3dDropdown.el.title = 'Click a 3D primitive to add it to the graph';
+        toolbar.appendChild(_3dDropdown.el);
 
         // ── Transform / operation dropdown ────────────────────────────────────
-        this._xformSelect = document.createElement('select');
-        this._xformSelect.style.cssText = _selectStyle;
-        this._xformSelect.title = 'Click an operation to add it to the graph';
-        this._xformSelect.appendChild(_ph('Transform ▾'));
-        [
-          ['extrude','Extrude'], ['revolve','Revolve'], ['tiling','Tiling'],
-          ['symmetryfold','Sym. Fold'], ['symmetryorbit','Sym. Orbit'],
-          ['mobius','Möbius'], ['noisedisplace','Noise Disp.'],
-          ['twist','Twist'], ['bend','Bend'], ['repeat','Repeat'],
-          ['position3d','Position / Orient'],
-        ].forEach(([v, l]) => this._xformSelect.appendChild(_opt(v, l)));
-        this._xformSelect.addEventListener('change', () =>
-          _dispatchAdd(this._xformSelect.value, this._xformSelect));
-        toolbar.appendChild(this._xformSelect);
+        const _xformDropdown = _makeCustomDropdown(
+            'Transform ▾',
+            [
+                { value: 'extrude',       label: 'Extrude'          },
+                { value: 'revolve',       label: 'Revolve'          },
+                { value: 'tiling',        label: 'Tiling'           },
+                { value: 'symmetryfold',  label: 'Sym. Fold'        },
+                { value: 'symmetryorbit', label: 'Sym. Orbit'       },
+                { value: 'mobius',        label: 'Möbius'           },
+                { value: 'noisedisplace', label: 'Noise Disp.'      },
+                { value: 'twist',         label: 'Twist'            },
+                { value: 'bend',          label: 'Bend'             },
+                { value: 'repeat',        label: 'Repeat'           },
+                { value: 'position3d',    label: 'Position / Orient'},
+            ],
+            (v) => _dispatchAdd(v, { value: v })
+        );
+        _xformDropdown.el.title = 'Click an operation to add it to the graph';
+        // Store reference so _updateDropdownAvailability can grey out
+        // Extrude and Revolve items when bridges are invalid.
+        this._xformDropdownPanel = _xformDropdown.panel;
+        toolbar.appendChild(_xformDropdown.el);
 
         // ── Blend dropdown ────────────────────────────────────────────────────
-        this._blendSelect = document.createElement('select');
-        this._blendSelect.style.cssText = _selectStyle;
-        this._blendSelect.title = 'Click a blend mode to add it to the graph';
-        this._blendSelect.appendChild(_ph('Blend ▾'));
-        [
-          ['schurBlend','Schur'], ['rUnion','R-Union'],
-          ['rIntersection','R-Intersect'], ['rDifference','R-Difference'],
-        ].forEach(([v, l]) => this._blendSelect.appendChild(_opt(v, l)));
-        this._blendSelect.addEventListener('change', () =>
-          _dispatchAdd(this._blendSelect.value, this._blendSelect));
-        toolbar.appendChild(this._blendSelect);
+        const _blendDropdown = _makeCustomDropdown(
+            'Blend ▾',
+            [
+                { value: 'schurBlend',    label: 'Schur'       },
+                { value: 'rUnion',        label: 'R-Union'     },
+                { value: 'rIntersection', label: 'R-Intersect' },
+                { value: 'rDifference',   label: 'R-Difference'},
+            ],
+            (v) => _dispatchAdd(v, { value: v })
+        );
+        _blendDropdown.el.title = 'Click a blend mode to add it to the graph';
+        toolbar.appendChild(_blendDropdown.el);
 
         // ── Section 3: HISTORY ────────────────────────────────────────────────
         // Camera zoom, view presets, card layout, and card zoom have all moved
@@ -3058,37 +3196,38 @@ function _isConvexPolygon(vertices) {
             }
         }
 
-        // Apply enabled/disabled state to Extrude and Revolve options
-        // in the Transform/Operation dropdown.
-        Array.from(this._xformSelect.options).forEach(opt => {
-            if (opt.value === 'extrude' || opt.value === 'revolve') {
-                opt.disabled = !bridgesAllowed;
-                // Grey-out styling — browsers don't always respect CSS on
-                // <option> elements consistently, but color + title (tooltip)
-                // together provide both visual and informational feedback.
-                opt.style.color = bridgesAllowed
-                    ? 'rgba(220,220,230,0.95)'
-                    : 'rgba(120,120,130,0.55)';
-                opt.style.backgroundColor = '#1c1c22';
-                opt.title = bridgesAllowed ? '' : reason;
-                // Also update the option's text label to append a ✕ marker
-                // when disabled, since <option> disabled visual state alone
-                // is very subtle in some OS/browser combos.
-                if (!bridgesAllowed && !opt.textContent.startsWith('✕')) {
-                    opt.dataset.originalText = opt.textContent;
-                    opt.textContent = `✕ ${opt.textContent}`;
-                } else if (bridgesAllowed && opt.dataset.originalText) {
-                    opt.textContent = opt.dataset.originalText;
-                    delete opt.dataset.originalText;
-                }
-            }
-        });
+        // Apply enabled/disabled state to Extrude and Revolve items
+        // in the custom Transform/Operation dropdown panel.
+        if (this._xformDropdownPanel) {
+            Array.from(this._xformDropdownPanel.querySelectorAll('[data-value]'))
+                .forEach(item => {
+                    const v = item.dataset.value;
+                    if (v !== 'extrude' && v !== 'revolve') return;
 
-        // Also update the dropdown's own title when bridges are disabled
-        // so hovering the whole dropdown shows context even before opening it.
-        this._xformSelect.title = bridgesAllowed
-            ? 'Click an operation to add it to the graph'
-            : `Extrude / Revolve disabled: ${reason}`;
+                    if (!bridgesAllowed) {
+                        item.dataset.disabled       = 'true';
+                        item.dataset.disabledReason = reason;
+                        item.style.color            = 'rgba(120,120,130,0.45)';
+                        item.style.cursor           = 'not-allowed';
+                        item.title                  = reason;
+                        // Prepend ✕ marker if not already present
+                        if (!item.textContent.startsWith('✕')) {
+                            item.dataset.originalText = item.textContent;
+                            item.textContent = `✕ ${item.textContent}`;
+                        }
+                    } else {
+                        delete item.dataset.disabled;
+                        delete item.dataset.disabledReason;
+                        item.style.color  = 'rgba(220,220,230,0.9)';
+                        item.style.cursor = 'pointer';
+                        item.title        = '';
+                        if (item.dataset.originalText) {
+                            item.textContent = item.dataset.originalText;
+                            delete item.dataset.originalText;
+                        }
+                    }
+                });
+        }
     }
 
     _sceneHasGeometry() {
