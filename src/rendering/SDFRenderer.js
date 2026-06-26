@@ -49,6 +49,29 @@ export class SDFRenderer extends WebGLRenderer {
     if (this._ready) this.render(new Map(), 0);
   }
 
+  /**
+   * Set a render scale factor to improve performance on integrated graphics.
+   * The shader renders at (w * scale) × (h * scale) and CSS upscales the
+   * canvas to fill the full viewport — trading slight softness for
+   * dramatically better frame rates during orbit and animated noise scenes.
+   *
+   * @param {number} scale  0.5 = half resolution (4× faster), 1.0 = native.
+   *                        Recommended: 0.6 for integrated graphics during
+   *                        recording, 1.0 for final still captures.
+   */
+  setRenderScale(scale = 1.0) {
+    this._renderScale = Math.max(0.25, Math.min(1.0, scale));
+    const w = Math.round(window.innerWidth  * this._renderScale);
+    const h = Math.round(window.innerHeight * this._renderScale);
+    // Resize the underlying WebGL canvas to the reduced resolution
+    super.resize(w, h);
+    // CSS scales the canvas back up to fill the viewport — browser does
+    // this with bilinear filtering which looks smooth at 0.5-0.75× scale
+    this._canvas.style.width  = `${window.innerWidth}px`;
+    this._canvas.style.height = `${window.innerHeight}px`;
+    this._canvas.style.transformOrigin = '0 0';
+  }
+
   // ── Shader sources ────────────────────────────────────────────────────────
 
   _buildVertexShader() {

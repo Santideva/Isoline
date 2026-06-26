@@ -127,6 +127,27 @@ export class WebGLRenderer {
     }
   }
 
+  /**
+   * Set a render scale multiplier. The WebGL canvas renders at
+   * (viewport * scale) resolution, then CSS stretches it to fill
+   * the full viewport. Lower values = faster rendering, slightly softer.
+   * @param {number} scale  0.25–1.0
+   */
+  setRenderScale(scale) {
+    this._renderScale = Math.max(0.25, Math.min(1.0, scale));
+    const w = Math.round(window.innerWidth  * this._renderScale);
+    const h = Math.round(window.innerHeight * this._renderScale);
+    // Set actual WebGL canvas resolution to the reduced size
+    this._canvas.width  = w;
+    this._canvas.height = h;
+    if (this._gl) {
+      this._gl.viewport(0, 0, w, h);
+    }
+    // CSS stretches the canvas back to full viewport size
+    this._canvas.style.width  = `${window.innerWidth}px`;
+    this._canvas.style.height = `${window.innerHeight}px`;
+  }
+
   /** Release all WebGL resources and remove canvas from DOM */
   dispose() {
     const gl = this._gl;

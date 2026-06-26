@@ -2920,18 +2920,27 @@ function _isConvexPolygon(vertices) {
   }
 
     _renderSDFPreview(nodeId, previewCanvas) {
-        import('./previewRenderer.js').then(({ drawSDFPreview }) => {
-        try {
-            const evaluator = this.sceneManager.evaluator;
-            evaluator.invalidate();
-            const result = evaluator.evaluate(nodeId);
-            const sdfFn  = result?.sdf || result?.result;
-            if (typeof sdfFn !== 'function') return;
-            drawSDFPreview(previewCanvas, sdfFn, [-2.5, -2.5, 2.5, 2.5]);
-        } catch (e) {
-            // Silently ignore — preview errors never affect the main render
-        }
-        });
+        // Debounce preview renders — each card schedules a delayed render
+        // rather than firing immediately on every graph change event.
+        // This dramatically reduces CPU load when many cards are visible
+        // or when sliders are being dragged rapidly, since intermediate
+        // states are skipped and only the settled state is rendered.
+        if (!this._previewTimers) this._previewTimers = new Map();
+        clearTimeout(this._previewTimers.get(nodeId));
+        this._previewTimers.set(nodeId, setTimeout(() => {
+            import('./previewRenderer.js').then(({ drawSDFPreview }) => {
+            try {
+                const evaluator = this.sceneManager.evaluator;
+                evaluator.invalidate();
+                const result = evaluator.evaluate(nodeId);
+                const sdfFn  = result?.sdf || result?.result;
+                if (typeof sdfFn !== 'function') return;
+                drawSDFPreview(previewCanvas, sdfFn, [-2.5, -2.5, 2.5, 2.5]);
+            } catch (e) {
+                // Silently ignore
+            }
+            });
+        }, 120));
     }
 
     // ── Output parameter management ───────────────────────────────────────────

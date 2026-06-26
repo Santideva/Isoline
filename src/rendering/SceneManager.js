@@ -576,13 +576,86 @@ export class SceneManager {
     this.controls.update();
 
     if (this.renderMode === 'glsl') {
-      this._renderGLSL();
+      // ── GLSL mode: only re-render when something actually changed ───────
+      // Sources of change that require a new render:
+      //   1. Camera moved (user dragging / auto-orbit active)
+      //   2. Graph or params changed (flagged by _glslDirty, set externally
+      //      by _renderGLSL() callers in NodeCanvas and SceneManager)
+      //   3. Animated noise nodes (noiseDisplaceNode with animated='yes')
+      //      require continuous re-render since uTime changes every frame.
+      //
+      // _glslDirty is set to true by any code path that changes the graph
+      // (param change, node add/remove, edge add/remove). The animation loop
+      // here clears it after consuming it.
+      const pos = this.camera.position;
+      const tgt = this.controls.target;
+      const camKey = `${pos.x.toFixed(3)},${pos.y.toFixed(3)},${pos.z.toFixed(3)},${tgt.x.toFixed(3)},${tgt.y.toFixed(3)},${tgt.z.toFixed(3)}`;
+      const camMoved = camKey !== this._lastGLSLCamKey;
+      if (camMoved) this._lastGLSLCamKey = camKey;
+
+      if (camMoved || this._glslDirty || this._sceneHasAnimatedNoise()) {
+        this._glslDirty = false;
+        this._renderGLSL();
+      }
+
     } else if (this.renderMode === 'rayMarch') {
+      // ── Ray March mode: same logic as GLSL ──────────────────────────────
+      // Ray March is the most expensive mode — a full sphere-tracing pass
+      // per pixel, 60 times per second on integrated graphics is extremely
+      // wasteful when nothing changed. Skip the render entirely when the
+      // camera is stationary, no params changed, and no animated nodes exist.
       this.rayMarchRenderer.syncCamera(this.camera, this.controls);
-      this._renderRayMarch();
+
+      const pos = this.camera.position;
+      const tgt = this.controls.target;
+      const camKey = `${pos.x.toFixed(3)},${pos.y.toFixed(3)},${pos.z.toFixed(3)},${tgt.x.toFixed(3)},${tgt.y.toFixed(3)},${tgt.z.toFixed(3)}`;
+      const camMoved = camKey !== this._lastRMCamKey;
+      if (camMoved) this._lastRMCamKey = camKey;
+
+      if (camMoved || this._rayMarchDirty || this._sceneHasAnimatedNoise()) {
+        this._rayMarchDirty = false;
+        this._renderRayMarch();
+      }
+
     } else {
+      // marchingSquares — Three.js renders the wireframe scene continuously.
+      // This is cheap (no shader compilation, no sphere tracing) so
+      // unconditional rendering here is acceptable.
       this.renderer.render(this.scene, this.camera);
     }
+  }
+
+  /**
+   * Returns true if any noiseDisplaceNode in the current graph has
+   * animated='yes'. When true, the animation loop must re-render every
+   * frame even when the camera is stationary, because uTime changes
+   * continuously and the noise pattern evolves with it.
+   *
+   * Cached for one frame (checked once per loop iteration, not per render
+   * call) to avoid re-walking the graph on every animation frame.
+   */
+  _sceneHasAnimatedNoise() {
+    // Cache the result for 30 frames to avoid graph-walking overhead
+    // at 60fps. Graph structure only changes when nodes are added/removed,
+    // which also sets _rayMarchDirty/_glslDirty anyway — so 30-frame
+    // staleness is inconsequential.
+    if (this._animatedNoiseFrame !== undefined &&
+        this._animatedNoiseCounter < 30) {
+      this._animatedNoiseCounter++;
+      return this._animatedNoiseCached;
+    }
+    this._animatedNoiseCounter = 0;
+
+    const graph = this.glslEvaluator?.graph ?? stateStore.nodeGraph;
+    let found = false;
+    graph.nodes.forEach(n => {
+      if (n.type === 'noiseDisplaceNode' && n.params?.animated === 'yes') {
+        found = true;
+      }
+    });
+    this._animatedNoiseCached = found;
+    this._animatedNoiseFrame  = true;
+    return found;
   }
 
   // ---------------------------------------------------------------------------
@@ -1054,6 +1127,110 @@ export class SceneManager {
   }
 
   /**
+ * Automatic adaptive render scale for Ray March mode.
+ *
+ * Measures actual frame render time and adjusts the WebGL canvas
+ * resolution to maintain a target frame rate. Works transparently
+ * without user intervention — the system finds the right balance
+ * between quality and performance for each scene automatically.
+ *
+ * Called once per frame from _renderRayMarch() after the render completes.
+ */
+_adaptRenderScale() {
+    const now = performance.now();
+
+    // ── Warmup phase ───────────────────────────────────────────────────────
+    // For the first WARMUP_FRAMES frames after entering Ray March mode,
+    // do nothing — no measurement, no adaptation, no canvas resize.
+    //
+    // This covers:
+    //   - The first-frame shader compilation stall (200-600ms on integrated
+    //     Intel) which would otherwise register as an extreme slow frame and
+    //     immediately trigger a scale drop + canvas resize + black flash.
+    //   - Browser/driver warmup — WebGL contexts often run slower for the
+    //     first few frames as GPU caches warm up, giving misleadingly high
+    //     frame times that would cause premature scale reduction.
+    //
+    // During warmup the renderer runs at _currentScale (initialized to
+    // WARMUP_SCALE in setRenderMode) — slightly below native to soften
+    // the impact of the compilation frame without causing a visible flash.
+    const WARMUP_FRAMES = 45; // ~1.5 seconds at 30fps — covers most compile times
+    this._warmupCounter = (this._warmupCounter ?? 0) + 1;
+    if (this._warmupCounter <= WARMUP_FRAMES) {
+      this._lastFrameTime = now; // keep timestamp fresh so first real measurement is accurate
+      return;
+    }
+
+    // ── Rolling average frame time ─────────────────────────────────────────
+    // React to a rolling average of the last N frames rather than individual
+    // frame times. This prevents single anomalous frames (garbage collection,
+    // tab switching, OS interrupts) from triggering incorrect scale decisions.
+    if (this._lastFrameTime === undefined) {
+      this._lastFrameTime = now;
+      return;
+    }
+
+    const frameMs = now - this._lastFrameTime;
+    this._lastFrameTime = now;
+
+    // Maintain a circular buffer of recent frame times
+    if (!this._frameTimes) this._frameTimes = [];
+    this._frameTimes.push(frameMs);
+    const WINDOW = 8; // average over 8 frames (~quarter second at 30fps)
+    if (this._frameTimes.length > WINDOW) this._frameTimes.shift();
+    // Need a full window before making any decisions
+    if (this._frameTimes.length < WINDOW) return;
+    const avgMs = this._frameTimes.reduce((a, b) => a + b, 0) / this._frameTimes.length;
+
+    // ── Thresholds ─────────────────────────────────────────────────────────
+    const SLOW_MS    = 42;  // average slower than this → drop scale
+    const RECOVER_MS = 26;  // average faster than this → raise scale
+    const SCALE_STEP_DOWN = 0.03; // drop 3% per adjustment
+    const SCALE_STEP_UP   = 0.01; // recover 1% per adjustment (slower recovery)
+    const SCALE_MIN = 0.80;
+    const SCALE_MAX = 1.0;
+    // Number of consecutive WINDOW-averages that must be fast before recovering.
+    // 20 windows × 8 frames = 160 frames ≈ ~5 seconds at 30fps.
+    // Slow recovery prevents the oscillation cycle: drop → fast → recover →
+    // slow → drop → flash that would otherwise repeat indefinitely.
+    const STABLE_WINDOWS_TO_RECOVER = 20;
+
+    const currentScale = this._currentScale ?? 1.0;
+
+    if (avgMs > SLOW_MS && currentScale > SCALE_MIN) {
+      // Average frame time is too slow — drop scale immediately.
+      // No slow-frame counter needed here since we're already averaging
+      // over 8 frames, which filters single-frame spikes naturally.
+      const newScale = Math.max(SCALE_MIN, currentScale - SCALE_STEP_DOWN);
+      if (Math.abs(newScale - currentScale) > 0.001) {
+        this._currentScale = newScale;
+        this._stableWindowCount = 0;
+        if (this.rayMarchRenderer.setRenderScale) {
+          this.rayMarchRenderer.setRenderScale(newScale);
+        }
+      }
+
+    } else if (avgMs < RECOVER_MS && currentScale < SCALE_MAX) {
+      // Average frame time is comfortably fast — count stable windows
+      // before recovering scale upward.
+      this._stableWindowCount = (this._stableWindowCount ?? 0) + 1;
+      if (this._stableWindowCount >= STABLE_WINDOWS_TO_RECOVER) {
+        const newScale = Math.min(SCALE_MAX, currentScale + SCALE_STEP_UP);
+        if (Math.abs(newScale - currentScale) > 0.001) {
+          this._currentScale = newScale;
+          if (this.rayMarchRenderer.setRenderScale) {
+            this.rayMarchRenderer.setRenderScale(newScale);
+          }
+        }
+        this._stableWindowCount = 0;
+      }
+    } else {
+      // Frame time is acceptable — reset stable counter but keep scale
+      this._stableWindowCount = 0;
+    }
+  }
+
+  /**
    * Set ray march quality parameters.
    * @param {number} maxSteps  Maximum sphere-tracing iterations (default 128)
    * @param {number} epsilon   Hit threshold (default 0.001)
@@ -1065,6 +1242,61 @@ export class SceneManager {
     this.rayMarchRenderer._maxDist  = maxDist;
     // Recompile with new step count baked into shader
     this._lastRayMarchSource = null;
+  }
+
+  /**
+   * Analyse the given GLSL source string once and apply the correct
+   * sphere-tracing quality settings. Called only when the source changes
+   * (graph edit, node add/remove, param change that affects the shader),
+   * never on every animation frame.
+   *
+   * Previously this analysis ran inside _renderRayMarch() on every frame,
+   * which caused mid-orbit recompilation whenever targetMaxSteps changed —
+   * the single biggest source of "freeze then lurch" choppiness during
+   * auto-orbit on integrated graphics.
+   *
+   * @param {string} source  The GLSL source string from GLSLEvaluator
+   */
+  _applyRayMarchQualityForSource(source) {
+    const hasDifference = source.includes('rDifference(') ||
+      (source.includes('schurBlend') && source.includes('"difference"'));
+
+    const hasWarp = !hasDifference && (
+      source.includes('twistNode')        ||
+      source.includes('bendNode')         ||
+      source.includes('noiseDisplaceNode')||
+      source.includes('mobiusNode')       ||
+      source.includes('symmetryOrbit')
+    );
+
+    let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
+    if (hasDifference) {
+      targetMaxSteps  = 256;
+      targetStepScale = 0.25;
+      targetEpsilon   = 0.0001;
+      targetMaxDist   = 80.0;
+    } else if (hasWarp) {
+      targetMaxSteps  = 192;
+      targetStepScale = 0.55;
+      targetEpsilon   = 0.0005;
+      targetMaxDist   = 40.0;
+    } else {
+      targetMaxSteps  = 128;
+      targetStepScale = 0.85;
+      targetEpsilon   = 0.001;
+      targetMaxDist   = 30.0;
+    }
+
+    // Only force recompile if maxSteps actually changed — this is the
+    // only quality parameter baked into the GLSL loop bound. All other
+    // parameters are uniforms uploaded each frame with no recompile needed.
+    if (this.rayMarchRenderer._maxSteps !== targetMaxSteps) {
+      this.rayMarchRenderer._maxSteps = targetMaxSteps;
+      this._lastRayMarchSource = null;  // force recompile with new loop bound
+    }
+    this.rayMarchRenderer._stepScale = targetStepScale;
+    this.rayMarchRenderer._epsilon   = targetEpsilon;
+    this.rayMarchRenderer._maxDist   = targetMaxDist;
   }
   
   /**
@@ -1078,6 +1310,50 @@ export class SceneManager {
     // Force shader recompile on every mode switch
     this._lastGLSLSource     = null;
     this._lastRayMarchSource = null;
+
+    // Mark both render paths dirty so the loop renders at least one frame
+    // in the new mode immediately after switching.
+    this._glslDirty      = true;
+    this._rayMarchDirty  = true;
+
+    // Reset camera key caches so the first frame after a mode switch
+    // always renders regardless of camera position.
+    this._lastGLSLCamKey = null;
+    this._lastRMCamKey   = null;
+
+    // Reset adaptive render scale state when entering Ray March mode.
+    if (mode === 'rayMarch') {
+      // Start at WARMUP_SCALE rather than 1.0. This serves two purposes:
+      //   1. The first frame (shader compilation) won't look like a full
+      //      resolution frame that then abruptly drops — it starts slightly
+      //      reduced and only the user who's looking carefully would notice.
+      //   2. Integrated Intel graphics will immediately get some relief from
+      //      the very first rendered frame, rather than starting at full
+      //      resolution and thrashing down to a working scale over the first
+      //      few seconds.
+      // The warmup counter suppresses adaptation for the first ~1.5 seconds,
+      // so this initial scale persists quietly until the GPU has settled.
+      // If the GPU is fast enough, recovery begins after ~5 more seconds
+      // and the scale climbs gradually back toward 1.0.
+      const WARMUP_SCALE = 0.88;
+      this._currentScale      = WARMUP_SCALE;
+      this._lastFrameTime     = undefined;
+      this._stableWindowCount = 0;
+      this._warmupCounter     = 0;
+      this._frameTimes        = [];
+      if (this.rayMarchRenderer.setRenderScale) {
+        this.rayMarchRenderer.setRenderScale(WARMUP_SCALE);
+      }
+    } else {
+      // Restore native resolution when leaving Ray March mode so GLSL
+      // and Marching Squares modes are not affected by a reduced scale.
+      this._currentScale  = 1.0;
+      this._warmupCounter = 0;
+      this._frameTimes    = [];
+      if (this.rayMarchRenderer.setRenderScale) {
+        this.rayMarchRenderer.setRenderScale(1.0);
+      }
+    }
 
     const threeCanvas = this.renderer?.domElement;
 
@@ -1124,6 +1400,12 @@ export class SceneManager {
    * genuine unexpected condition worth reporting.
    */
   _renderGLSL() {
+    // Mark dirty so the animation loop knows to render on its next tick
+    // if this was called externally (param change, preset load, etc.).
+    // When called from within _loop() itself, the loop clears the flag
+    // immediately after — so setting it here is a no-op in that path.
+    this._glslDirty = true;
+
     const time = (performance.now() - this._startTime) / 1000;
 
     // Exit silently if the graph is in any state where generation cannot
@@ -1181,6 +1463,10 @@ export class SceneManager {
    * into the GLSL loop bound, so changes to it force a full shader recompile.
    */
     _renderRayMarch() {
+    // Mark dirty so the animation loop knows to render on its next tick
+    // if this was called externally (param change, preset load, etc.).
+    this._rayMarchDirty = true;
+
     const time = (performance.now() - this._startTime) / 1000;
 
     // Exit silently if the graph has no nodes, no output node, or the
@@ -1207,97 +1493,33 @@ export class SceneManager {
       return;
     }
 
-    // ── Step quality adaptation for non-Lipschitz SDFs ───────────────────
-    //
-    // rDifference and schurBlend(difference) use the Lp-norm formula:
-    //   a − b + (|a|^p + |b|^p)^(1/p)
-    // Near the inner boundary of the subtracted shape, b ≈ 0 and the Lp
-    // term ≈ |a|, so the result ≈ 0 over a wide band. Sphere tracing
-    // stalls in this near-zero region and exhausts its step budget before
-    // reaching the crescent surface.
-    //
-    // Two parameters must both change:
-    //   _stepScale  — reduces each step from d to d*scale, preventing
-    //                 overshoot at the gradient kink
-    //   _maxSteps   — increases the step budget so the marcher can still
-    //                 converge after taking many small steps
-    //
-    // _maxSteps is baked into the GLSL loop bound, so changing it requires
-    // recompilation. We detect the change and clear _lastRayMarchSource to
-    // force that recompile BEFORE the compile check below.
-    //
-    // ── Detect scene complexity for sphere-tracing quality ────────────────
-    //
-    // Non-Lipschitz operations — the SDF gradient can exceed 1, causing
-    // standard sphere-tracing steps to overshoot the surface.
-    //
-    // SEVERE:  rDifference / schurBlend(difference)
-    //   Lp-norm difference formula hovering near zero along the subtracted
-    //   shape inner boundary. Requires smallest step and most iterations.
-    //
-    // MODERATE: twist / bend / noise displace
-    //   Space-warping transforms. The SDF gradient magnitude scales with
-    //   the warp strength. Require reduced step but less than difference.
-    //
-    // DEFAULT: clean SDFs (union, intersection, primitive-only)
-    //   Lipschitz-1. Standard sphere tracing converges reliably.
-    const hasDifference = source.includes('rDifference(') ||
-      (source.includes('schurBlend') && source.includes('"difference"'));
-
-    const hasWarp = !hasDifference && (
-      source.includes('twist(')         ||
-      source.includes('twistSDF(')      ||
-      source.includes('applyTwist(')    ||
-      source.includes('bend(')          ||
-      source.includes('bendSDF(')       ||
-      source.includes('applyBend(')     ||
-      source.includes('noiseDisplace(') ||
-      source.includes('fbm(')           ||
-      source.includes('mobiusSDF(')     ||
-      source.includes('symmetryOrbit(')
-    );
-
-    let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
-    if (hasDifference) {
-      targetMaxSteps  = 256;
-      targetStepScale = 0.25;
-      targetEpsilon   = 0.0001;
-      targetMaxDist   = 80.0;
-    } else if (hasWarp) {
-      targetMaxSteps  = 256;
-      targetStepScale = 0.4;
-      targetEpsilon   = 0.0005;
-      targetMaxDist   = 50.0;
-    } else {
-      targetMaxSteps  = 128;
-      targetStepScale = 0.85;
-      targetEpsilon   = 0.001;
-      targetMaxDist   = 30.0;
-    }
-
-    if (this.rayMarchRenderer._maxSteps !== targetMaxSteps) {
-      // _maxSteps is a loop bound baked into the shader — changing it
-      // requires a full recompile. Clearing _lastRayMarchSource here
-      // ensures the compile check below treats the source as changed.
-      this.rayMarchRenderer._maxSteps = targetMaxSteps;
-      this._lastRayMarchSource = null;
-    }
-    this.rayMarchRenderer._stepScale = targetStepScale;
-    this.rayMarchRenderer._epsilon   = targetEpsilon;
-    this.rayMarchRenderer._maxDist   = targetMaxDist;
-
+    // ── Apply quality settings and compile if source changed ─────────────
+    // Quality analysis (_applyRayMarchQualityForSource) only runs when the
+    // source string actually changed — never on every frame. This prevents
+    // mid-orbit recompilation which was the primary cause of choppiness
+    // during auto-orbit with animated noise nodes.
     if (source !== this._lastRayMarchSource) {
-      const result = this.rayMarchRenderer.compile(source);
-      if (!result.ok) {
-        console.error('RayMarchRenderer compile error:\n', result.error);
-        return;
+      this._applyRayMarchQualityForSource(source);
+      // _applyRayMarchQualityForSource may have nulled _lastRayMarchSource
+      // if maxSteps changed — check again after calling it.
+      if (source !== this._lastRayMarchSource) {
+        const result = this.rayMarchRenderer.compile(source);
+        if (!result.ok) {
+          console.error('RayMarchRenderer compile error:\n', result.error);
+          return;
+        }
+        this._lastRayMarchSource = source;
+        logger.info('RayMarchRenderer: shader compiled.');
       }
-      this._lastRayMarchSource = source;
-      logger.info('RayMarchRenderer: shader compiled.');
     }
 
     this.rayMarchRenderer.syncCamera(this.camera, this.controls);
     this.rayMarchRenderer.render(uniforms, time);
+
+    // Automatically adapt render resolution to maintain ~30fps.
+    // Runs every frame in Ray March mode — drops scale when slow,
+    // gradually recovers when fast. Transparent to the user.
+    this._adaptRenderScale();
   }
 
   rerender(method, sdfOverride = null) {
