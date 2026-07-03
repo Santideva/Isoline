@@ -12,10 +12,7 @@
     meta: {
         id:          'structural-component',
         label:       'Structural Component',
-        description: 'Two boxes of contrasting proportions smooth-unioned and ' +
-                     'replicated with 3-fold rotational symmetry, producing a ' +
-                     'sculptural mechanical component — propeller, joint, or ' +
-                     'structural connector. Box + Box + Schur Union + Sym. Orbit.',
+        description: 'Box + Box + Schur Union + Sym. Orbit.',
         audience:    'Game designers',
         renderMode:  'rayMarch',
     },
@@ -154,7 +151,7 @@ export const PRESET_MANDALA_RELIEF = {
     meta: {
         id:          'mandala-relief',
         label:       'Mandala Relief',
-        description: 'A 12-fold symmetric petal form extruded into a relief disc. ' +
+        description: 'A 12-fold symmetric petal form extruded into a relief disc.' +
                      'Like a ceramic tile, decorative rosette, or mandala in 3D.',
         audience:    'Visual artists',
         renderMode:  'rayMarch',
@@ -276,9 +273,7 @@ export const PRESET_KNOTTED_BLOOM = {
     meta: {
         id:          'knotted-bloom',
         label:       'Knotted Bloom',
-        description: 'A radial sculptural bloom: cylinder and cone smooth-joined ' +
-                     'into a petal unit, bent into a curved blade, folded and ' +
-                     'orbited into a radial arrangement with animated surface texture. ' +
+        description: 'A radial sculptural bloom with animated surface texture. ' +
                      'Cylinder + Cone + Schur + Bend + Sym. Fold + Sym. Orbit + Noise.',
         audience:    'General',
         renderMode:  'rayMarch',
@@ -425,11 +420,7 @@ export const PRESET_TILED_SURFACE = {
     meta: {
         id:          'tiled-surface',
         label:       'Tiled Surface',
-        description: 'A cylinder and box smooth-unioned into a column unit, ' +
-                     'folded with bilateral symmetry, then tiled across a ' +
-                     'triangular lattice — producing a parametric surface ' +
-                     'pattern with architectural character. ' +
-                     'Cylinder + Box + Schur + Sym. Fold + Tiling.',
+        description: 'Cylinder + Box + Schur + Sym. Fold + Tiling.',
         audience:    'Architects',
         renderMode:  'rayMarch',
     },
@@ -673,7 +664,6 @@ export const PRESET_WINGED_FORM = {
         id:          'winged-form',
         label:       'Winged Form',
         description: 'A domed organic sculpture with four blade-like wings swept ' +
-                     'from a curved arc profile, and a cellular-pocked surface texture. ' +
                      'Arc + revolve + symmetry fold + smooth blend.',
         audience:    'Visual artists',
         renderMode:  'rayMarch',
