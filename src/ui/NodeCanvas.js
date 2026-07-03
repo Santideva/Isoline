@@ -409,8 +409,14 @@ function _isConvexPolygon(vertices) {
 
           if (_GEOM.has(v)) {
             this._undo.snapshot();
-            this.sceneManager.addPrimitive(v);
-            setTimeout(() => { this._runAutoLayout(); this._drawEdges(); }, 50);
+          this.sceneManager.addPrimitive(v, this._nextCardPosition());
+          setTimeout(() => {
+            // Never auto-layout after node addition — cards should stay
+            // wherever _nextCardPosition() placed them. Auto layout is
+            // only triggered by the explicit Auto button in the sidebar.
+            this._rebuildCards();
+            this._drawEdges();
+          }, 50);
           } else if (_XFORM.has(v)) {
             this._addTransformNode(v);  // snapshot taken inside _addTransformNode
           } else if (_BLEND.has(v)) {
@@ -661,6 +667,19 @@ function _isConvexPolygon(vertices) {
 
       const savedMode = loadedData?.renderMode || 'marchingSquares';
 
+
+      // Dismiss onboarding overlay when a saved scene is loaded
+        if (this._onboardingOverlay) {
+            this._onboardingOverlay.style.opacity = '0';
+            setTimeout(() => {
+                if (this._onboardingOverlay?.parentNode) {
+                    this._onboardingOverlay.parentNode
+                        .removeChild(this._onboardingOverlay);
+                    this._onboardingOverlay = null;
+                }
+            }, 700);
+        }
+        
       setTimeout(() => {
         this._rebuildCards();
         this._runAutoLayout();
@@ -877,11 +896,9 @@ function _isConvexPolygon(vertices) {
         // camera, layout, and output controls that previously crowded the
         // top toolbar. See _buildSidebar() for full contents.
         this._buildSidebar();
+        this._buildOnboardingOverlay();
 
         // ── Initial dropdown availability ─────────────────────────────────────
-        // Evaluate bridge (Extrude/Revolve) availability once after the DOM
-        // is fully built, so the initial state is correct before any graph
-        // changes or selection events have fired.
         requestAnimationFrame(() => this._updateDropdownAvailability());
     }
 
@@ -1318,12 +1335,136 @@ function _isConvexPolygon(vertices) {
         this._sidebar = sidebar;
     }
 
+
+    /**
+     * Compute a uiPos for a newly added node that places it in a
+     * left-aligned vertical column, keeping the center viewport clear.
+     * Cards stack downward from Y=60, X=20 — well clear of the rendered
+     * geometry which occupies the center-right of the screen.
+     */
+    _nextCardPosition() {
+        const graph      = this.stateStore.nodeGraph;
+        const COLUMN_X   = 20;
+        const START_Y    = 60;
+        const CARD_GAP   = 12;
+        const CARD_H_EST = 180;
+
+        let maxY = START_Y;
+
+        graph.nodes.forEach(node => {
+            if (!node.uiPos || node.type === 'outputNode') return;
+            const nodeY = node.uiPos.y || 0;
+            // Use actual rendered card height when available — cards vary
+            // in height depending on how many params they expose.
+            const card    = this._cards?.get(node.id);
+            const actualH = card?.el ? (card.el.offsetHeight || CARD_H_EST) : CARD_H_EST;
+            maxY = Math.max(maxY, nodeY + actualH + CARD_GAP);
+        });
+
+        return { x: COLUMN_X, y: maxY };
+    }
+
+    /**
+     * Build the empty-state onboarding overlay. A single horizontal row
+     * of icon+label steps connected by arrows. Very low opacity so it
+     * reads as ambient guidance rather than instruction. Disappears
+     * permanently the moment the first non-output node is added.
+     */
+    _buildOnboardingOverlay() {
+        const overlay = document.createElement('div');
+        overlay.id = 'nc-onboarding';
+        overlay.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            pointer-events: none;
+            z-index: 100;
+            opacity: 1;
+            transition: opacity 0.6s ease;
+            user-select: none;
+        `;
+
+        const steps = [
+            { icon: '⬡', label: 'Primitive' },
+            { icon: '↻', label: 'Transform'  },
+            { icon: '⊕', label: 'Blend'      },
+            { icon: '▶', label: 'Render'     },
+        ];
+
+        steps.forEach((step, i) => {
+            const node = document.createElement('div');
+            node.style.cssText = `
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 6px;
+                padding: 0 10px;
+            `;
+
+            const icon = document.createElement('div');
+            icon.textContent = step.icon;
+            icon.style.cssText = `
+                font-size: 28px;
+                color: rgba(180,210,255,0.28);
+                line-height: 1;
+            `;
+
+            const label = document.createElement('div');
+            label.textContent = step.label;
+            label.style.cssText = `
+                font-size: 11px;
+                color: rgba(180,210,255,0.20);
+                letter-spacing: 0.1em;
+                text-transform: uppercase;
+                font-family: sans-serif;
+                white-space: nowrap;
+            `;
+
+            node.appendChild(icon);
+            node.appendChild(label);
+            overlay.appendChild(node);
+
+            if (i < steps.length - 1) {
+                const arrow = document.createElement('div');
+                arrow.textContent = '→';
+                arrow.style.cssText = `
+                    font-size: 16px;
+                    color: rgba(180,210,255,0.14);
+                    padding-bottom: 18px;
+                    font-family: sans-serif;
+                `;
+                overlay.appendChild(arrow);
+            }
+        });
+
+        // Subtle hint below the flow pointing to Examples button
+        const hint = document.createElement('div');
+        hint.innerHTML = 'or load a scene via <strong style="color:rgba(180,210,255,0.22)">Examples ↗</strong>';
+        hint.style.cssText = `
+            position: absolute;
+            bottom: -30px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 11px;
+            color: rgba(180,210,255,0.16);
+            letter-spacing: 0.05em;
+            font-family: sans-serif;
+            white-space: nowrap;
+        `;
+        overlay.appendChild(hint);
+
+        document.body.appendChild(overlay);
+        this._onboardingOverlay = overlay;
+    }
+
+    
     /**
      * Move every visible node card into a tight overlapping stack near the
-     * top-left of the canvas, well clear of the centre viewport. This gives
-     * the user an unobstructed view of the rendered geometry while keeping
-     * the graph structure intact and easy to restore.
-     *
+     * top-left of the canvas, well clear of the centre viewport. 
      * Cards are stacked with a small cascading offset (12px per card) so
      * the topmost few are still individually clickable/draggable; deeper
      * cards in the pile can be reached by dragging the ones above them
@@ -2175,10 +2316,10 @@ function _isConvexPolygon(vertices) {
         rDifference:   { smoothness: 8 },
       }[type] || {};
 
-      const newNode = graph.addNode(type, params);
+      const newNode = graph.addNode(type, params, this._nextCardPosition());
 
       setTimeout(() => {
-        this._runAutoLayout();
+        this._rebuildCards();
         this._drawEdges();
         this._updateGraphStatusLabel();
       }, 50);
@@ -2253,7 +2394,7 @@ function _isConvexPolygon(vertices) {
     const def = defaults[type];
     if (!def) return;
 
-    const newNode = graph.addNode(def.type, def.params);
+    const newNode = graph.addNode(def.type, def.params, this._nextCardPosition());
 
     // ── Node type classification sets ──────────────────────────────────────
     // Used to decide what can be a chain source and what is a merge boundary.
@@ -2489,7 +2630,7 @@ function _isConvexPolygon(vertices) {
     }
 
     setTimeout(() => {
-      this._runAutoLayout();
+      this._rebuildCards();
       this._drawEdges();
       this._updateGraphStatusLabel();
     }, 50);
@@ -3080,17 +3221,31 @@ function _isConvexPolygon(vertices) {
     }
 
     _onGraphChange(event) {
-        // Rebuild cards and redraw edges whenever the graph structure changes.
-        // Parameter changes (paramChanged) don't need a full rebuild.
         if (event === 'nodeAdded' || event === 'nodeRemoved' ||
             event === 'edgeAdded' || event === 'edgeRemoved') {
         this._rebuildCards();
+
+        // Dismiss onboarding overlay permanently once any user node exists
+        if (this._onboardingOverlay) {
+            const graph = this.stateStore.nodeGraph;
+            let hasUserNode = false;
+            graph.nodes.forEach(n => {
+                if (n.type !== 'outputNode') hasUserNode = true;
+            });
+            if (hasUserNode) {
+                this._onboardingOverlay.style.opacity = '0';
+                setTimeout(() => {
+                    if (this._onboardingOverlay?.parentNode) {
+                        this._onboardingOverlay.parentNode
+                            .removeChild(this._onboardingOverlay);
+                        this._onboardingOverlay = null;
+                    }
+                }, 700);
+            }
+        }
         }
         this._drawEdges();
         this._updateGraphStatusLabel();
-        // Re-evaluate bridge (Extrude/Revolve) availability whenever the
-        // graph structure changes — a new bridge node being added, or an
-        // existing one being removed, changes what the dropdown should show.
         this._updateDropdownAvailability();
     }
 

@@ -134,16 +134,28 @@ export class WebGLRenderer {
    * @param {number} scale  0.25–1.0
    */
   setRenderScale(scale) {
-    this._renderScale = Math.max(0.25, Math.min(1.0, scale));
-    const w = Math.round(window.innerWidth  * this._renderScale);
-    const h = Math.round(window.innerHeight * this._renderScale);
-    // Set actual WebGL canvas resolution to the reduced size
-    this._canvas.width  = w;
-    this._canvas.height = h;
-    if (this._gl) {
-      this._gl.viewport(0, 0, w, h);
+    const clamped = Math.max(0.25, Math.min(1.0, scale));
+    const prev = this._renderScale ?? 1.0;
+    this._renderScale = clamped;
+
+    // Only perform a true WebGL canvas resize when the scale change is
+    // large enough to matter (>5%). Small incremental changes from the
+    // adaptive system are handled by CSS scaling alone, avoiding the
+    // one-blank-frame flash that canvas dimension changes cause.
+    const RESIZE_THRESHOLD = 0.05;
+    if (Math.abs(clamped - prev) >= RESIZE_THRESHOLD || !this._lastResizeScale) {
+      const w = Math.round(window.innerWidth  * clamped);
+      const h = Math.round(window.innerHeight * clamped);
+      this._canvas.width  = w;
+      this._canvas.height = h;
+      if (this._gl) {
+        this._gl.viewport(0, 0, w, h);
+      }
+      this._lastResizeScale = clamped;
     }
-    // CSS stretches the canvas back to full viewport size
+
+    // Always update CSS dimensions — handles small incremental changes
+    // smoothly without triggering a blank frame.
     this._canvas.style.width  = `${window.innerWidth}px`;
     this._canvas.style.height = `${window.innerHeight}px`;
   }

@@ -90,8 +90,12 @@ export class SceneManager {
    * @param {"line"|"triangle"|"arc"} type
    * @returns {Object} the new primitive entry { instance, type, object }
    */
-  addPrimitive(type) {
+    addPrimitive(type, uiPos = null) {
     let entry = null;
+    // Use provided uiPos for card placement, or fall back to origin.
+    // NodeCanvas._nextCardPosition() passes the correct left-column
+    // position so cards do not appear in the center of the viewport.
+    const _uiPos = uiPos || { x: 0, y: 0 };
 
     switch (type.toLowerCase()) {
       case "line": {
@@ -132,7 +136,7 @@ export class SceneManager {
           posX:           triangle.position?.x      ?? 0,
           posY:           triangle.position?.y      ?? 0,
           cornerRounding: triangle.cornerRounding   ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: triangle, type: "triangle" };
         entry.object = triangle.createObject();
         logger.info("Triangle primitive instantiated.");
@@ -162,7 +166,7 @@ export class SceneManager {
           segments:   arc.segments   ?? 8,
           posX:       arc.position?.x ?? 0,
           posY:       arc.position?.y ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: arc, type: "arc" };
         entry.object = arc.createObject();
         logger.info("Arc primitive instantiated.");
@@ -183,7 +187,7 @@ export class SceneManager {
           posX:     polytope.posX     ?? 0,
           posY:     polytope.posY     ?? 0,
           rotation: polytope.rotation ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: polytope, type: 'polytope' };
         entry.object = polytope.createObject();
         logger.info("Polytope primitive instantiated.");
@@ -208,7 +212,7 @@ export class SceneManager {
           rotation: poly.rotation ?? 0,
           posX:     poly.posX     ?? 0,
           posY:     poly.posY     ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: poly, type: 'regularPolygon' };
         entry.object = poly.createObject();
         logger.info(`RegularPolygon primitive instantiated (${poly.sides} sides).`);
@@ -228,7 +232,7 @@ export class SceneManager {
           radius: circle.radius,
           posX:   circle.posX   ?? 0,
           posY:   circle.posY   ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: circle, type: 'circle' };
         entry.object = circle.createObject();
         logger.info("Circle primitive instantiated.");
@@ -248,7 +252,7 @@ export class SceneManager {
           posX:   prim.posX ?? 0,
           posY:   prim.posY ?? 0,
           posZ:   prim.posZ ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'sphere', object: prim.createObject() };
         logger.info('Sphere primitive instantiated.');
         break;
@@ -269,7 +273,7 @@ export class SceneManager {
           posX:   prim.posX ?? 0,
           posY:   prim.posY ?? 0,
           posZ:   prim.posZ ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'box', object: prim.createObject() };
         logger.info('Box primitive instantiated.');
         break;
@@ -292,7 +296,7 @@ export class SceneManager {
           posX:   prim.posX ?? 0,
           posY:   prim.posY ?? 0,
           posZ:   prim.posZ ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'cylinder', object: prim.createObject() };
         logger.info('Cylinder primitive instantiated.');
         break;
@@ -315,7 +319,7 @@ export class SceneManager {
     });
 
     stateStore.addShape(prim);
-    this._registerPrimInGraph(prim, 'capsule', { radius, height, posX, posY, posZ });
+    this._registerPrimInGraph(prim, 'capsule', { radius, height, posX, posY, posZ }, _uiPos);
     entry = { instance: prim, type: 'capsule', object: prim.createObject() };
     logger.info('Capsule primitive instantiated.');
     break;
@@ -335,7 +339,7 @@ export class SceneManager {
           posX: prim.posX ?? 0,
           posY: prim.posY ?? 0,
           posZ: prim.posZ ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'torus', object: prim.createObject() };
         logger.info('Torus primitive instantiated.');
         break;
@@ -360,7 +364,7 @@ export class SceneManager {
           posX:   prim.posX ?? 0,
           posY:   prim.posY ?? 0,
           posZ:   prim.posZ ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'cone', object: prim.createObject() };
         logger.info('Cone primitive instantiated.');
         break;
@@ -381,7 +385,7 @@ export class SceneManager {
           ny:     prim.ny     ?? 1,
           nz:     prim.nz     ?? 0,
           offset: prim.offset ?? 0,
-        });
+        }, _uiPos);
         entry = { instance: prim, type: 'plane', object: prim.createObject() };
         logger.info('InfinitePlane primitive instantiated.');
         break;
@@ -1183,10 +1187,10 @@ _adaptRenderScale() {
     const avgMs = this._frameTimes.reduce((a, b) => a + b, 0) / this._frameTimes.length;
 
     // ── Thresholds ─────────────────────────────────────────────────────────
-    const SLOW_MS    = 42;  // average slower than this → drop scale
-    const RECOVER_MS = 26;  // average faster than this → raise scale
-    const SCALE_STEP_DOWN = 0.03; // drop 3% per adjustment
-    const SCALE_STEP_UP   = 0.01; // recover 1% per adjustment (slower recovery)
+    const SLOW_MS    = 48;  // wider dead-band — animated noise varies ±8ms naturally
+    const RECOVER_MS = 22;  // only recover when clearly and consistently fast
+    const SCALE_STEP_DOWN = 0.015; // smaller steps → less frequent canvas resize
+    const SCALE_STEP_UP   = 0.008; // proportionally slower recovery
     const SCALE_MIN = 0.80;
     const SCALE_MAX = 1.0;
     // Number of consecutive WINDOW-averages that must be fast before recovering.
@@ -1228,6 +1232,51 @@ _adaptRenderScale() {
       // Frame time is acceptable — reset stable counter but keep scale
       this._stableWindowCount = 0;
     }
+  }
+
+  /**
+   * Estimate scene rendering complexity from the graph node structure.
+   * Returns an appropriate starting render scale in [0.80, 0.92].
+   * Heavy scenes start lower so the adaptive system finds equilibrium
+   * faster with less visible jerkiness during the transition period.
+   * Called once when entering Ray March mode.
+   */
+  _estimateSceneComplexity() {
+    const graph = this.glslEvaluator?.graph ?? stateStore.nodeGraph;
+    let weight = 0;
+
+    graph.nodes.forEach(n => {
+      switch (n.type) {
+        case 'symmetryOrbitNode':
+          weight += (n.params?.folds ?? 6) * 2;
+          break;
+        case 'symmetryFoldNode':
+          weight += (n.params?.folds ?? 6);
+          break;
+        case 'noiseDisplaceNode':
+          weight += n.params?.animated === 'yes' ? 4 : 2;
+          break;
+        case 'schurBlend':
+          weight += 2;
+          break;
+        case 'rDifference':
+          weight += 3;
+          break;
+        case 'repeatNode':
+          weight += (n.params?.countX ?? 3) * (n.params?.countY ?? 3);
+          break;
+        case 'torus': case 'capsule':
+          weight += 1;
+          break;
+        default:
+          break;
+      }
+    });
+
+    if (weight > 40) return 0.80;
+    if (weight > 25) return 0.84;
+    if (weight > 12) return 0.88;
+    return 0.92;
   }
 
   /**
@@ -1335,7 +1384,7 @@ _adaptRenderScale() {
       // so this initial scale persists quietly until the GPU has settled.
       // If the GPU is fast enough, recovery begins after ~5 more seconds
       // and the scale climbs gradually back toward 1.0.
-      const WARMUP_SCALE = 0.88;
+      const WARMUP_SCALE = this._estimateSceneComplexity();
       this._currentScale      = WARMUP_SCALE;
       this._lastFrameTime     = undefined;
       this._stableWindowCount = 0;
@@ -1668,11 +1717,11 @@ _adaptRenderScale() {
    * @param {string} nodeType  The NODE_TYPES key e.g. 'circle', 'sphere'
    * @param {object} params    The node params (mirrors prim properties)
    */
-  _registerPrimInGraph(prim, nodeType, params) {
+  _registerPrimInGraph(prim, nodeType, params, uiPos = { x: 0, y: 0 }) {
     const graph = stateStore.nodeGraph;
     // Only register if not already present (idempotent)
     if (!graph.nodes.has(prim.id)) {
-      graph.addNode(nodeType, params, { x: 0, y: 0 }, prim.id);
+      graph.addNode(nodeType, params, uiPos, prim.id);
     }
   }
 
@@ -1909,7 +1958,7 @@ _adaptRenderScale() {
         resolution:   150,
         boundsMin:    -4,
         boundsMax:     4
-      });
+      }, { x: 1400, y: 200 });
     }
     return outputNode;
   }

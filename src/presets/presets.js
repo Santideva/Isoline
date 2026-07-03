@@ -8,162 +8,101 @@
 // Node IDs are small integers unique within each preset only.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const PRESET_GOTHIC_PORTAL = {
+    export const PRESET_STRUCTURAL_COMPONENT = {
     meta: {
-        id:          'gothic-portal',
-        label:       'Gothic Portal',
-        description: 'A massive standing portal ring' + 'on an ancient stone ground plane. Portal cavity faces the ' +
-                     'viewer — an opening you could walk through. Animated portal noise.',
+        id:          'structural-component',
+        label:       'Structural Component',
+        description: 'Two boxes of contrasting proportions smooth-unioned and ' +
+                     'replicated with 3-fold rotational symmetry, producing a ' +
+                     'sculptural mechanical component — propeller, joint, or ' +
+                     'structural connector. Box + Box + Schur Union + Sym. Orbit.',
         audience:    'Game designers',
         renderMode:  'rayMarch',
     },
     graph: {
         nodes: [
-            // ── Portal torus ring ─────────────────────────────────────────────
+            // ── Long shaft box ────────────────────────────────────────────────
+            // Narrow cross-section, deep along Z — the elongated bar that
+            // reads as a shaft or beam when the orbit replicates it.
             {
                 id:    1,
-                type:  'torus',
-                params: { majorRadius: 2.0, minorRadius: 0.32, posX: 0, posY: 1.8, posZ: 0 },
+                type:  'box',
+                params: {
+                    width:          0.68,
+                    height:         0.56,
+                    depth:          7.00,
+                    posX:           0,
+                    posY:           0,
+                    posZ:           0,
+                    cornerRounding: 0,
+                },
                 uiPos: { x: 60, y: 60 },
             },
 
-            // ── Rotate torus 90° so hole faces viewer ─────────────────────────
-            // Default torus hole is along Y (lies flat). rotateX = π/2
-            // stands it upright so the cavity faces along Z toward the camera.
+            // ── Wide head box ─────────────────────────────────────────────────
+            // Wider and flatter — reads as the blade or head of each arm
+            // when combined with the shaft. Corner rounding softens what
+            // would otherwise be a hard geometric intersection.
             {
                 id:    2,
-                type:  'transform3DNode',
+                type:  'box',
                 params: {
-                    posX: 0, posY: 0, posZ: 0,
-                    rotateX: 1.5708, rotateY: 0, rotateZ: 0,
+                    width:          3.90,
+                    height:         1.00,
+                    depth:          2.42,
+                    posX:           0,
+                    posY:           0,
+                    posZ:           0,
+                    cornerRounding: 0.07,
                 },
-                uiPos: { x: 300, y: 60 },
-            },
-
-            // ── Animated noise on torus only ──────────────────────────────────
-            {
-                id:    3,
-                type:  'noiseDisplaceNode',
-                params: { amplitude: 0.022, frequency: 8.0, animated: 'yes' },
-                uiPos: { x: 540, y: 60 },
-            },
-
-            // ── Ground plane ──────────────────────────────────────────────────
-            {
-                id:    4,
-                type:  'plane',
-                params: { normalX: 0, normalY: 1, normalZ: 0, offset: -1.0 },
                 uiPos: { x: 60, y: 280 },
             },
 
-            // ── Ground noise — coarse, static ─────────────────────────────────
+            // ── Schur union — joins shaft and head into one arm unit ───────────
+            // Very low smoothness so the two boxes join at a near-sharp
+            // boundary rather than melting into each other — the mechanical
+            // component aesthetic reads best with hard edges rather than
+            // fully organic blending. Rotation = 6.28 (≈ 2π) is a full
+            // rotation, effectively zero rotation in practice.
+            {
+                id:    3,
+                type:  'schurBlend',
+                params: {
+                    operation:  'union',
+                    smoothness: 0.40,
+                    rotation:   6.28,
+                    scale:      1.00,
+                    posX:       0,
+                    posY:       0,
+                    isoOffset:  0.00,
+                },
+                uiPos: { x: 340, y: 170 },
+            },
+
+            // ── 3-fold symmetry orbit ─────────────────────────────────────────
+            // Replicates the single arm unit three times around the center
+            // at 120° intervals. reflectX=yes adds mirror copies of each
+            // arm, creating the characteristic propeller/screw silhouette
+            // visible in the reference render. smoothMin combiner gives
+            // the three arms a gentle connection at the center rather than
+            // a hard mathematical minimum.
+            {
+                id:    4,
+                type:  'symmetryOrbitNode',
+                params: {
+                    folds:      3,
+                    centerX:    0,
+                    centerY:    0,
+                    rotation:   0,
+                    reflectX:   'yes',
+                    combiner:   'smoothMin',
+                    smoothness: 0.40,
+                },
+                uiPos: { x: 600, y: 170 },
+            },
+
             {
                 id:    5,
-                type:  'noiseDisplaceNode',
-                params: { amplitude: 0.08, frequency: 2.5, animated: 'no' },
-                uiPos: { x: 300, y: 280 },
-            },
-
-            // ── Pillar cylinder — structural roundness ────────────────────────
-            {
-                id:    6,
-                type:  'cylinder',
-                params: { radius: 0.22, height: 2.0, posX: 0, posY: 0, posZ: 0 },
-                uiPos: { x: 60, y: 500 },
-            },
-
-            // ── Pillar profile line — vertical, for fluted detail ─────────────
-            {
-                id:    7,
-                type:  'lineSegment',
-                params: { x1: 0, y1: -1.0, x2: 0, y2: 1.0 },
-                uiPos: { x: 60, y: 660 },
-            },
-
-            // ── Extrude the line into a slab ──────────────────────────────────
-            {
-                id:    8,
-                type:  'extrudeNode',
-                params: { height: 0.24 },
-                uiPos: { x: 300, y: 660 },
-            },
-
-            // ── Blend cylinder + extruded slab → column cross-section ─────────
-            {
-                id:    9,
-                type:  'rUnion',
-                params: { smoothness: 1 },
-                uiPos: { x: 540, y: 580 },
-            },
-
-            // ── Twist the blended column ──────────────────────────────────────
-            {
-                id:    10,
-                type:  'twistNode',
-                params: { strength: 0.45 },
-                uiPos: { x: 780, y: 580 },
-            },
-
-            // ── Offset pillar assembly to the LEFT side of the portal ─────────
-            // Moves the single twisted column to X = -3.2 (to the left of
-            // the portal ring whose majorRadius is 2.0, so it clears the ring)
-            // and slightly behind the ring (posZ = 0.8) so it reads as
-            // a background architectural element rather than blocking the portal.
-            // Y = -0.1 lowers it slightly so it sits on the ground plane.
-            {
-                id:    11,
-                type:  'transform3DNode',
-                params: {
-                    posX: -3.2, posY: -0.1, posZ: 0.8,
-                    rotateX: 0, rotateY: 0, rotateZ: 0,
-                },
-                uiPos: { x: 1020, y: 580 },
-            },
-
-            // ── Mirror to create a RIGHT side pillar using symmetry fold ───────
-            // A 2-fold symmetry fold with reflectX mirrors the left pillar
-            // to the right side of the portal, giving bilateral symmetry
-            // without requiring a second separate pillar branch in the graph.
-            {
-                id:    12,
-                type:  'symmetryFoldNode',
-                params: {
-                    folds:    2,
-                    centerX:  0,
-                    centerY:  0,
-                    rotation: 0,
-                    reflectX: 'yes',
-                    reflectY: 'no',
-                },
-                uiPos: { x: 1260, y: 580 },
-            },
-
-            // ── Pillar noise — medium amplitude, static ───────────────────────
-            {
-                id:    13,
-                type:  'noiseDisplaceNode',
-                params: { amplitude: 0.042, frequency: 4.5, animated: 'no' },
-                uiPos: { x: 1500, y: 580 },
-            },
-
-            // ── Merge portal ring (animated) + ground (static) ────────────────
-            {
-                id:    14,
-                type:  'rUnion',
-                params: { smoothness: 2 },
-                uiPos: { x: 800, y: 170 },
-            },
-
-            // ── Merge scene + pillars ─────────────────────────────────────────
-            {
-                id:    15,
-                type:  'rUnion',
-                params: { smoothness: 2 },
-                uiPos: { x: 1100, y: 375 },
-            },
-
-            {
-                id:    16,
                 type:  'outputNode',
                 params: {
                     renderMethod: 'surface (3D)',
@@ -171,44 +110,24 @@ export const PRESET_GOTHIC_PORTAL = {
                     boundsMin:    -6,
                     boundsMax:     6,
                     posX:         0,
-                    posY:         0.4,
+                    posY:         0,
                     posZ:         0,
-                    rotateX:      0.1,
-                    rotateY:      0,
+                    rotateX:      0.4,
+                    rotateY:      0.6,
                     rotateZ:      0,
                 },
-                uiPos: { x: 1340, y: 375 },
+                uiPos: { x: 860, y: 170 },
             },
         ],
         edges: [
-            // torus → rotate (stand upright, hole facing viewer)
-            { id: 'e1',  fromNode: 1,  fromPort: 'sdf',    toNode: 2,  toPort: 'sdf'    },
-            // rotated torus → animated noise
-            { id: 'e2',  fromNode: 2,  fromPort: 'result', toNode: 3,  toPort: 'sdf'    },
-            // ground plane → ground noise
-            { id: 'e3',  fromNode: 4,  fromPort: 'sdf',    toNode: 5,  toPort: 'sdf'    },
-            // cylinder → rUnion A
-            { id: 'e4',  fromNode: 6,  fromPort: 'sdf',    toNode: 9,  toPort: 'sdfA'   },
-            // line segment → extrude
-            { id: 'e5',  fromNode: 7,  fromPort: 'sdf',    toNode: 8,  toPort: 'sdf'    },
-            // extruded slab → rUnion B
-            { id: 'e6',  fromNode: 8,  fromPort: 'result', toNode: 9,  toPort: 'sdfB'   },
-            // blended column → twist
-            { id: 'e7',  fromNode: 9,  fromPort: 'result', toNode: 10, toPort: 'sdf'    },
-            // twisted column → position offset (move left, slightly behind portal)
-            { id: 'e8',  fromNode: 10, fromPort: 'result', toNode: 11, toPort: 'sdf'    },
-            // positioned column → symmetry fold (mirror to right side)
-            { id: 'e9',  fromNode: 11, fromPort: 'result', toNode: 12, toPort: 'sdf'    },
-            // mirrored pillars → pillar noise
-            { id: 'e10', fromNode: 12, fromPort: 'result', toNode: 13, toPort: 'sdf'    },
-            // animated portal + noisy ground → rUnion
-            { id: 'e11', fromNode: 3,  fromPort: 'result', toNode: 14, toPort: 'sdfA'   },
-            { id: 'e12', fromNode: 5,  fromPort: 'result', toNode: 14, toPort: 'sdfB'   },
-            // portal+ground + noisy pillars → rUnion
-            { id: 'e13', fromNode: 14, fromPort: 'result', toNode: 15, toPort: 'sdfA'   },
-            { id: 'e14', fromNode: 13, fromPort: 'result', toNode: 15, toPort: 'sdfB'   },
-            // full scene → output
-            { id: 'e15', fromNode: 15, fromPort: 'result', toNode: 16, toPort: 'sdf'    },
+            // shaft box → schurBlend A
+            { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 3, toPort: 'sdfA'   },
+            // head box → schurBlend B
+            { id: 'e2', fromNode: 2, fromPort: 'sdf',    toNode: 3, toPort: 'sdfB'   },
+            // joined arm unit → 3-fold symmetry orbit
+            { id: 'e3', fromNode: 3, fromPort: 'result', toNode: 4, toPort: 'sdf'    },
+            // orbited component → output
+            { id: 'e4', fromNode: 4, fromPort: 'result', toNode: 5, toPort: 'sdf'    },
         ],
     },
 };
@@ -502,111 +421,113 @@ export const PRESET_KNOTTED_BLOOM = {
     },
 };
 
-/**
- * Knotted Ribbon
- * Target audience: General
- *
- * A flowing, knotted ribbon form built from an arc revolved around an
- * offset axis, then twisted and repeated into a three-dimensional loop.
- * The arc profile gives the ribbon its open, curved cross-section rather
- * than a closed tube. The twist node introduces the characteristic knotted,
- * writhing quality. Noise displacement adds fine surface texture making
- * the ribbon read as a physical material — silk, metal foil, or paper —
- * rather than a geometric abstraction.
- *
- * Demonstrates: arc → revolveNode → twistNode → repeatNode →
- * noiseDisplaceNode. Shows how a 2D curve profile swept into 3D and then
- * deformed produces complex, organic-feeling sculptural forms that do not
- * have an obvious geometric origin.
- */
-export const PRESET_KNOTTED_RIBBON = {
+export const PRESET_TILED_SURFACE = {
     meta: {
-        id:          'knotted-ribbon',
-        label:       'Knotted Ribbon',
-        description: 'A flowing knotted ribbon: arc profile revolved into a curved ' +
-                     'tube, twisted, repeated into a looping form, and surface-textured ' +
-                     'with noise. Arc + Revolve + Twist + Repeat + Noise.',
-        audience:    'General',
+        id:          'tiled-surface',
+        label:       'Tiled Surface',
+        description: 'A cylinder and box smooth-unioned into a column unit, ' +
+                     'folded with bilateral symmetry, then tiled across a ' +
+                     'triangular lattice — producing a parametric surface ' +
+                     'pattern with architectural character. ' +
+                     'Cylinder + Box + Schur + Sym. Fold + Tiling.',
+        audience:    'Architects',
         renderMode:  'rayMarch',
     },
     graph: {
         nodes: [
-            // ── Arc profile ───────────────────────────────────────────────────
-            // An open arc (not a full circle) so that when revolved it
-            // produces an open curved ribbon rather than a closed tube.
-            // The sweep angle (~200°) is wide enough to read as a ribbon
-            // cross-section but open enough to give the revolved result
-            // a distinct edge — essential for the knotted ribbon silhouette.
+            // ── Box — the flat panel or blade component ────────────────────────
             {
                 id:    1,
-                type:  'arc',
+                type:  'box',
                 params: {
-                    radius:     0.55,
-                    startAngle: 0.55,
-                    endAngle:   3.90,
-                    segments:   24,
-                    posX:       0,
-                    posY:       0,
+                    width:          1.77,
+                    height:         0.60,
+                    depth:          2.00,
+                    posX:           0,
+                    posY:           0,
+                    posZ:           0,
+                    cornerRounding: 0,
                 },
                 uiPos: { x: 60, y: 60 },
             },
 
-            // ── Revolve the arc into a 3D curved ribbon tube ──────────────────
-            // offset controls how far the ribbon sits from the revolution axis.
-            // A moderate offset combined with the open arc profile gives a
-            // ribbon-like swept form rather than a torus — the open arc means
-            // the revolved cross-section has visible edges (inner and outer)
-            // rather than being fully closed.
+            // ── Cylinder — the structural column ─────────────────────────────
+            // Tall and slender, axis Y — stands upright as the main vertical
+            // element. Combined with the flat box it produces a column-with-
+            // fin cross-section that tiles well and reads as an architectural
+            // structural member.
             {
                 id:    2,
-                type:  'revolveNode',
-                params: { offset: 0.85, axis: 'Y' },
-                uiPos: { x: 300, y: 60 },
+                type:  'cylinder',
+                params: {
+                    radius: 0.48,
+                    height: 10.24,
+                    capped: 'yes',
+                    axis:   'Y',
+                    posX:   0,
+                    posY:   0,
+                    posZ:   0,
+                },
+                uiPos: { x: 60, y: 280 },
             },
 
-            // ── Twist — the key deformation that creates the knotted quality ──
-            // The twist node rotates the geometry around the Y axis as a
-            // function of height, introducing the characteristic writhing,
-            // knotted appearance. Moderate strength keeps the form readable
-            // without collapsing the SDF into rendering artefacts.
+            // ── Schur union — tight join ───────────────────────────────────────
+            // Zero smoothness: hard boolean union so the column and fin
+            // panel meet at a sharp architectural edge rather than blending
+            // organically. This is intentional — tiled architectural forms
+            // read more convincingly with crisp intersections.
             {
                 id:    3,
-                type:  'twistNode',
-                params: { strength: 0.85 },
-                uiPos: { x: 540, y: 60 },
+                type:  'schurBlend',
+                params: {
+                    operation:  'union',
+                    smoothness: 0.00,
+                    rotation:   0.00,
+                    scale:      1.00,
+                    posX:       0,
+                    posY:       0,
+                    isoOffset:  0.00,
+                },
+                uiPos: { x: 340, y: 170 },
             },
 
-            // ── Repeat — creates the looping, multi-strand structure ───────────
-            // A small countX repeat with moderate spacing creates the
-            // impression of multiple interleaved ribbon strands without
-            // requiring multiple separate branches in the graph.
-            // countZ=2 adds depth repetition so the form reads as
-            // volumetric rather than flat from the default camera angle.
+            // ── Symmetry fold — bilateral symmetry ─────────────────────────────
+            // 2-fold fold with reflectX=yes creates a mirrored pair of the
+            // column+fin unit. This doubles the visual complexity within
+            // each tile cell, and the bilateral symmetry reads as
+            // intentional architectural design rather than arbitrary repetition.
             {
                 id:    4,
-                type:  'repeatNode',
+                type:  'symmetryFoldNode',
                 params: {
-                    countX:   2,
-                    countY:   1,
-                    countZ:   2,
-                    spacingX: 2.6,
-                    spacingY: 4.0,
-                    spacingZ: 2.6,
+                    folds:    2,
+                    centerX:  0,
+                    centerY:  0,
+                    rotation: 0,
+                    reflectX: 'yes',
+                    reflectY: 'no',
                 },
-                uiPos: { x: 780, y: 60 },
+                uiPos: { x: 600, y: 170 },
             },
 
-            // ── Noise displacement — surface texture ──────────────────────────
-            // Low amplitude, medium-high frequency noise gives the ribbon
-            // surface the fine texture of a physical material — the slight
-            // irregularity makes it read as silk, metal foil, or paper
-            // rather than a perfectly smooth mathematical surface.
-            // Static (not animated) so the form reads as a frozen sculpture.
+            // ── Triangular tiling ─────────────────────────────────────────────
+            // Tiles the symmetry-folded unit across a triangular lattice.
+            // The triangular lattice (rather than square) creates the
+            // characteristic offset-row arrangement visible in the reference
+            // images — adjacent columns are staggered rather than aligned,
+            // which is both visually richer and more structurally efficient.
             {
                 id:    5,
-                type:  'noiseDisplaceNode',
-                params: { amplitude: 0.018, frequency: 10.0, animated: 'no' },
-                uiPos: { x: 1020, y: 60 },
+                type:  'tilingNode',
+                params: {
+                    lattice:  'triangular',
+                    periodX:  3.00,
+                    periodY:  3.00,
+                    offsetX:  0,
+                    offsetY:  0,
+                    isoOffset: 0,
+                },
+                uiPos: { x: 860, y: 170 },
             },
 
             {
@@ -615,28 +536,28 @@ export const PRESET_KNOTTED_RIBBON = {
                 params: {
                     renderMethod: 'surface (3D)',
                     resolution:   150,
-                    boundsMin:    -4,
-                    boundsMax:     4,
+                    boundsMin:    -6,
+                    boundsMax:     6,
                     posX:         0,
                     posY:         0,
                     posZ:         0,
-                    rotateX:      0.25,
-                    rotateY:      0.4,
+                    rotateX:      0.35,
+                    rotateY:      0.5,
                     rotateZ:      0,
                 },
-                uiPos: { x: 1260, y: 60 },
+                uiPos: { x: 1100, y: 170 },
             },
         ],
         edges: [
-            // arc profile → revolve (open arc swept into 3D ribbon tube)
-            { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 2, toPort: 'sdf'    },
-            // revolved ribbon → twist (introduces knotted, writhing quality)
-            { id: 'e2', fromNode: 2, fromPort: 'result', toNode: 3, toPort: 'sdf'    },
-            // twisted ribbon → repeat (multi-strand looping structure)
+            // box → schurBlend A
+            { id: 'e1', fromNode: 1, fromPort: 'sdf',    toNode: 3, toPort: 'sdfA'   },
+            // cylinder → schurBlend B
+            { id: 'e2', fromNode: 2, fromPort: 'sdf',    toNode: 3, toPort: 'sdfB'   },
+            // joined unit → symmetry fold (bilateral mirror)
             { id: 'e3', fromNode: 3, fromPort: 'result', toNode: 4, toPort: 'sdf'    },
-            // repeated strands → noise displacement (physical material texture)
+            // folded unit → triangular tiling
             { id: 'e4', fromNode: 4, fromPort: 'result', toNode: 5, toPort: 'sdf'    },
-            // textured ribbon → output
+            // tiled surface → output
             { id: 'e5', fromNode: 5, fromPort: 'result', toNode: 6, toPort: 'sdf'    },
         ],
     },
@@ -891,10 +812,10 @@ export const PRESET_WINGED_FORM = {
  * The preset panel shows them in this order.
  */
 export const PRESETS = [
-    PRESET_GOTHIC_PORTAL,
+    PRESET_STRUCTURAL_COMPONENT,
     PRESET_WINGED_FORM,
     PRESET_KNOTTED_BLOOM,
     PRESET_PERFORATED_FACADE,
-    PRESET_KNOTTED_RIBBON,
+    PRESET_TILED_SURFACE,
     PRESET_CORAL_FORMATION,
 ];
