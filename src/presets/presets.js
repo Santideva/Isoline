@@ -12,9 +12,7 @@ export const PRESET_GOTHIC_PORTAL = {
     meta: {
         id:          'gothic-portal',
         label:       'Gothic Portal',
-        description: 'A massive standing portal ring flanked by broken, twisted ' +
-                     'column-pillars (cylinder blended with extruded line profile) ' +
-                     'on an ancient stone ground plane. Portal cavity faces the ' +
+        description: 'A massive standing portal ring' + 'on an ancient stone ground plane. Portal cavity faces the ' +
                      'viewer — an opening you could walk through. Animated portal noise.',
         audience:    'Game designers',
         renderMode:  'rayMarch',
