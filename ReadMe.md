@@ -1,18 +1,13 @@
 # Isoline
 
-**A browser-based procedural shape studio for building 2D and 3D
-forms from connected geometry, transforms, and blends.**
+**Composed Geometry**
 
-Isoline is a node-based tool for designing procedural shapes and
-sculptural forms directly in the browser — no installation required.
-Connect primitives, transforms, and blend operations on a visual
-graph, and watch your geometry evolve in real time.
+A browser-based procedural shape studio for building 2D and 3D
+forms from connected geometry, transforms, and blends.
 
-![Knotted Bloom preset rendered in Ray March mode](docs/images/knotted-bloom.png)
+[![Watch the demo](src/assets/image/HeroImage.png)](https://youtu.be/YOUR_VIDEO_ID)
 
-**Live demo:** [isoline-studio.netlify.app](https://isoline-studio.netlify.app)
-
-▶ [Watch the demo video](https://youtube.com/PASTE_YOUR_LINK_HERE)
+**Live demo:** https://isoline-studio.netlify.app
 
 ---
 
@@ -47,6 +42,28 @@ graph, and watch your geometry evolve in real time.
 - Full **undo/redo** history and multi-select node operations
 - **Presentation mode** (press `F`) hides all UI chrome for
   clean screenshots or video capture
+
+  [![Isoline user interface](src/assets/image/cleanUIshot.jpeg)](src/assets/image/cleanUIshot.jpeg)
+
+  Export:
+  • PNG
+  • GLSL
+  • Scene JSON
+  • Binary STL
+
+### Example exports
+
+**ShaderToy**
+
+[![Shader exported from Isoline and running in ShaderToy](src/assets/image/IsolineShadertoyshot.jpeg)](src/assets/image/IsolineShadertoyshot.jpeg)
+
+The exported fragment shader runs directly inside ShaderToy with only minor adaptation.
+
+**STL**
+
+[![STL exported from Isoline and viewed in MeshLab](src/assets/image/IsolineMeshlabshot.png)](src/assets/image/IsolineMeshlabshot.png)
+
+The same procedural scene exported as a binary STL for downstream mesh workflows.
 
 ---
 
@@ -100,7 +117,7 @@ export at.
    layout, and output settings
 6. Export via the **↗** button in the toolbar
 
----
+[![Node graph driving the rendered geometry](src/assets/image/Nodegraphexample.jpeg)](src/assets/image/Nodegraphexample.jpeg)
 
 ## Quick start
 

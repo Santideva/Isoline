@@ -420,6 +420,9 @@ export class NodeEvaluator {
           const tp = {
             x: T.a * pt.x + T.b * pt.y + T.tx,
             y: T.c * pt.x + T.d * pt.y + T.ty,
+            z: pt.z || 0,   // forward z — the 2D affine transform only acts on XY;
+                            // 3D children (sphere/box/cylinder/etc.) need z preserved
+                            // or they silently sample at z=0 for every query point.
           };
           const dA = sdfA(tp, cs, t) - (aIsRegion ? 0 : iso);
           const dB = sdfB(tp, cs, t) - (bIsRegion ? 0 : iso);
@@ -456,9 +459,11 @@ export class NodeEvaluator {
             const d = baseSDF(tp, cs, t) / Math.pow(scaleFactor, i);
             result = i === 0 ? d : weightedRUnion(result, d, 8);
             // Apply transform for next iteration
+            const prevZ = tp.z || 0;
             tp = {
               x: T.a * tp.x + T.b * tp.y + T.tx,
               y: T.c * tp.x + T.d * tp.y + T.ty,
+              z: prevZ,   // forward z — 2D affine transform doesn't touch it
             };
           }
           return result;
