@@ -55,7 +55,7 @@ forms from connected geometry, transforms, and blends.
 
 **ShaderToy**
 
-[![Shader exported from Isoline and running in ShaderToy](src/assets/image/IsolineShadertoyshot.jpeg)](src/assets/image/IsolineShadertoyshot.jpeg)
+[![Shader exported from Isoline and running in ShaderToy](src/assets/image/IsolineShadertoyShot.jpeg)](src/assets/image/IsolineShadertoyShot.jpeg)
 
 The exported fragment shader runs directly inside ShaderToy with only minor adaptation.
 
