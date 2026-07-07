@@ -90,7 +90,7 @@ export class SceneManager {
    * @param {"line"|"triangle"|"arc"} type
    * @returns {Object} the new primitive entry { instance, type, object }
    */
-    addPrimitive(type, uiPos = null) {
+    addPrimitive(type, uiPos = null, extraParams = {}) {
     let entry = null;
     // Use provided uiPos for card placement, or fall back to origin.
     // NodeCanvas._nextCardPosition() passes the correct left-column
@@ -1721,7 +1721,7 @@ _adaptRenderScale() {
     const graph = stateStore.nodeGraph;
     // Only register if not already present (idempotent)
     if (!graph.nodes.has(prim.id)) {
-      graph.addNode(nodeType, params, uiPos, prim.id);
+      graph.addNode(nodeType, { ...params, ...extraParams }, uiPos, prim.id);
     }
   }
 

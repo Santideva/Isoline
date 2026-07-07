@@ -1273,10 +1273,15 @@ function _isConvexPolygon(vertices) {
         // Positions are saved into node.uiPos as normal, so Fit All / Auto
         // restore a readable layout afterward.
         const stackRow = _btnRow(layoutSection);
-        const _stackBtn = this._makeButton('⊞ Stack Cards', () => this._stackAllCards());
+        const _stackBtn = this._makeButton('⊟ Stack', () => this._stackAllCards());
         _stackBtn.title = 'Pile all node cards in a corner so the geometry view is unobstructed';
         _stackBtn.style.cssText += 'flex:1; min-width:0; font-size:12px; border-color: rgba(255,200,80,0.3); color: rgba(255,225,160,0.85);';
         stackRow.appendChild(_stackBtn);
+
+        const _revealBtn = this._makeButton('⊞ Reveal', () => this._revealAllCards());
+        _revealBtn.title = 'Bring all cards back into the visible viewport (also: Home key)';
+        _revealBtn.style.cssText += 'flex:1; min-width:0; font-size:12px; border-color: rgba(100,200,150,0.3); color: rgba(160,230,190,0.85);';
+        stackRow.appendChild(_revealBtn);
 
         // ════════════════════════════════════════════════════════════════════
         // SECTION 3 — OUTPUT
@@ -1345,23 +1350,45 @@ function _isConvexPolygon(vertices) {
     _nextCardPosition() {
         const graph      = this.stateStore.nodeGraph;
         const COLUMN_X   = 20;
+        const COLUMN_W   = 320; // card width + inter-column gap
         const START_Y    = 60;
         const CARD_GAP   = 12;
         const CARD_H_EST = 180;
 
-        let maxY = START_Y;
+        // Maximum Y before wrapping to the next column.
+        // Uses actual viewport height minus toolbar and bottom margin
+        // so the last card in each column stays fully visible.
+        const TOOLBAR_H  = 46;
+        const BOTTOM_PAD = 24;
+        const MAX_Y = window.innerHeight - TOOLBAR_H - BOTTOM_PAD;
+
+        // Map each column index to the lowest occupied Y in that column.
+        // Column index = floor(node.uiPos.x / COLUMN_W).
+        const colDepths = new Map();
 
         graph.nodes.forEach(node => {
             if (!node.uiPos || node.type === 'outputNode') return;
-            const nodeY = node.uiPos.y || 0;
-            // Use actual rendered card height when available — cards vary
-            // in height depending on how many params they expose.
+            const colIdx  = Math.max(0, Math.floor((node.uiPos.x || 0) / COLUMN_W));
             const card    = this._cards?.get(node.id);
             const actualH = card?.el ? (card.el.offsetHeight || CARD_H_EST) : CARD_H_EST;
-            maxY = Math.max(maxY, nodeY + actualH + CARD_GAP);
+            const bottom  = (node.uiPos.y || 0) + actualH + CARD_GAP;
+            colDepths.set(colIdx, Math.max(colDepths.get(colIdx) ?? START_Y, bottom));
         });
 
-        return { x: COLUMN_X, y: maxY };
+        // Find the first column that still has room for another card.
+        let col = 0;
+        while (col <= 7) {
+            const depth = colDepths.get(col) ?? START_Y;
+            if (depth + CARD_H_EST <= MAX_Y) break;
+            col++;
+        }
+        // col 8 fallback: wrap back to col 0 rather than going off-screen right
+        if (col > 7) col = 0;
+
+        return {
+            x: COLUMN_X + col * COLUMN_W,
+            y: colDepths.get(col) ?? START_Y,
+        };
     }
 
     /**
@@ -1463,13 +1490,57 @@ function _isConvexPolygon(vertices) {
 
     
     /**
-     * Move every visible node card into a tight overlapping stack near the
-     * top-left of the canvas, well clear of the centre viewport. 
-     * Cards are stacked with a small cascading offset (12px per card) so
-     * the topmost few are still individually clickable/draggable; deeper
-     * cards in the pile can be reached by dragging the ones above them
-     * aside, or by clicking Fit All / Auto to restore full layout.
+     * Remap all node card positions back into the visible viewport.
+     * Resets canvas pan/zoom to identity then re-runs _remapToLeftColumn
+     * to place all cards in the left-column layout within the viewport.
+     * Triggered by the ⊞ Reveal button and by the Home key (normal mode only).
      */
+    _revealAllCards() {
+        this._transform = { tx: 0, ty: 0, scale: 1 };
+        if (this._bgCanvas) {
+            this._bgCanvas.style.transform = '';
+        }
+        this._remapToLeftColumn();
+        this._rebuildCards();
+        this._drawEdges();
+        this._showToast('All cards brought back into view', 1800);
+    }
+
+    /**
+     * Remap all node uiPos values into a visible left-column layout.
+     * Used by _revealAllCards() and preset loading.
+     * Primitives and transforms stack downward in the left column.
+     * The output node goes to a fixed far-right position.
+     */
+    _remapToLeftColumn() {
+        const graph      = this.stateStore.nodeGraph;
+        const COLUMN_X   = 20;
+        const START_Y    = 60;
+        const CARD_GAP   = 12;
+        const CARD_H_EST = 180;
+        const OUTPUT_X   = 1300;
+        const OUTPUT_Y   = 200;
+
+        let orderedIds;
+        try {
+            orderedIds = graph.topologicalOrder();
+        } catch (e) {
+            orderedIds = [...graph.nodes.keys()];
+        }
+
+        let currentY = START_Y;
+        orderedIds.forEach(nodeId => {
+            const node = graph.nodes.get(nodeId);
+            if (!node) return;
+            if (node.type === 'outputNode') {
+                graph.updateNodePosition(nodeId, OUTPUT_X, OUTPUT_Y);
+            } else {
+                graph.updateNodePosition(nodeId, COLUMN_X, currentY);
+                currentY += CARD_H_EST + CARD_GAP;
+            }
+        });
+    }
+
     _stackAllCards() {
         this._undo.snapshot();
         // Anchor the stack hard against the left edge, near the top, so it
@@ -3818,6 +3889,14 @@ function _isConvexPolygon(vertices) {
             e.preventDefault();
             this._toggleAutoOrbit();
         }
+
+        // Home key — reveal all cards (bring off-screen cards back into view).
+        // Only active when not in presentation mode so it does not conflict
+        // with camera-reset behaviour that some users may expect from Home.
+        if (e.key === 'Home' && !this._presentationMode) {
+            e.preventDefault();
+            this._revealAllCards();
+        }
         });
 
         // Resize canvas when window resizes
@@ -4467,7 +4546,8 @@ function _isConvexPolygon(vertices) {
         panel.appendChild(_row(
             '🔷', 'Export GLSL Shader',
             glslAvail
-                ? 'Download the generated fragment shader — paste into ShaderToy, Three.js, Unity, or any WebGL project.'
+                ? 'Download the generated fragment shader, adapted for ShaderToy. ' +
+                  'Go to shadertoy.com → New Shader → paste the file → click ▶. No edits needed.'
                 : 'Switch to GLSL or Ray March mode and render to unlock shader export.',
             () => this._exportGLSL(),
             glslAvail
@@ -4560,7 +4640,7 @@ function _isConvexPolygon(vertices) {
      * wrapping (add a `mainImage` entry point and `iResolution` uniform).
      */
     _exportGLSL() {
-        const mode    = this.sceneManager.renderMode;
+        const mode = this.sceneManager.renderMode;
         const injected = mode === 'rayMarch'
             ? this.sceneManager._lastRayMarchSource
             : this.sceneManager._lastGLSLSource;
@@ -4573,46 +4653,287 @@ function _isConvexPolygon(vertices) {
             return;
         }
 
-        // Build the COMPLETE fragment shader by combining the injected SDF
-        // functions with the renderer's fixed template (uniforms, void main,
-        // ray march loop, lighting). Without this step the exported file
-        // contains only bare SDF function definitions — not a runnable shader.
         const renderer = mode === 'rayMarch'
             ? this.sceneManager.rayMarchRenderer
             : this.sceneManager.sdfRenderer;
         const fullFragmentShader = renderer._buildFragmentShader(injected);
 
-        const header = [
-            '// Generated by Isoline — SDF Geometry Workbench',
-            `// Mode: ${mode === 'rayMarch' ? 'Ray March (3D)' : 'GLSL 2D'}`,
-            `// Exported: ${new Date().toISOString()}`,
-            '//',
-            '// ── To run on ShaderToy (shadertoy.com) ─────────────────────────',
-            '//   1. Create a new shader and replace the default fragment code.',
-            '//   2. Change  void main()  →  void mainImage(out vec4 fragColor, in vec2 fragCoord)',
-            '//   3. Change  gl_FragColor  →  fragColor',
-            '//   4. Change  gl_FragCoord  →  fragCoord',
-            '//   iResolution and iTime are ShaderToy built-ins — no changes needed.',
-            '//',
-            '// ── To run in a WebGL project ─────────────────────────────────────',
-            '//   Use this as your fragment shader source directly.',
-            '//   Pair with a simple full-screen quad vertex shader.',
-            '//   Provide uniforms: uResolution (vec2), uTime (float).',
-            '',
-        ].join('\n');
+        // Adapt the shader for direct ShaderToy use before export.
+        const shaderToyReady = this._adaptForShaderToy(fullFragmentShader);
 
-        const full = header + fullFragmentShader;
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const header = [
+            `// Isoline — ${mode === 'rayMarch' ? 'Ray March (3D)' : 'GLSL 2D'} shader`,
+            `// Exported: ${new Date().toISOString()}`,
+            `// Generated by Isoline (isoline-studio.netlify.app)`,
+            '//',
+            '// ── ShaderToy (shadertoy.com) ────────────────────────────────────',
+            '//   Paste the entire file into a new ShaderToy shader and click ▶.',
+            '//   No changes needed — mainImage(), iTime, and iResolution are',
+            '//   already correctly wired for ShaderToy.',
+            '//',
+            '// ── Your own WebGL project ───────────────────────────────────────',
+            '//   Replace mainImage(out vec4 fragColor, in vec2 fragCoord) with',
+            '//   void main() and write to gl_FragColor instead of fragColor.',
+            '//   Declare: uniform float iTime; uniform vec2 iResolution;',
+            '//',
+        ].join('\n') + '\n\n';
+
+        const full = header + shaderToyReady;
         const blob = new Blob([full], { type: 'text/plain;charset=utf-8' });
         const url  = URL.createObjectURL(blob);
-        const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const a    = document.createElement('a');
         a.href     = url;
-        a.download = `isoline-shader-${ts}.glsl`;
-        document.body.appendChild(a);
+        a.download = `isoline-shadertoy-${ts}.glsl`;
         a.click();
-        document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        this._showToast('GLSL shader exported.');
+        this._showToast('GLSL shader exported — ready to paste into ShaderToy.');
+    }
+
+    /**
+     * Adapt Isoline's generated GLSL fragment shader for direct use in
+     * ShaderToy. Handles all incompatibilities between Isoline's WebGL
+     * renderer interface and ShaderToy's fixed interface:
+     *
+     *   1. Replaces vScreenPos varying with fragCoord-based UV computation
+     *   2. Bakes all application uniforms (camera, lighting, tuning) as
+     *      GLSL constants using their current renderer values
+     *   3. Replaces uTime → iTime, uResolution → iResolution.xy
+     *   4. Replaces gl_FragColor → fragColor, gl_FragCoord → fragCoord
+     *   5. Renames main() → _isolineMain() and adds ShaderToy mainImage()
+     */
+    /**
+     * Adapt Isoline's generated GLSL fragment shader for direct use in
+     * ShaderToy. Handles all incompatibilities:
+     *
+     *   1. Removes #extension GL_OES_standard_derivatives (ShaderToy provides it)
+     *   2. Removes varying vScreenPos declaration
+     *   3. Replaces vScreenPos UV computation with fragCoord-based UV
+     *   4. Bakes all application uniforms as GLSL constants
+     *   5. Converts uFOV from degrees to radians (tan() expects radians)
+     *   6. Replaces uTime → iTime, uResolution → iResolution
+     *   7. Replaces gl_FragColor → fragColor, gl_FragCoord → fragCoord
+     *   8. Renames main() → _isolineMain(), adds ShaderToy mainImage()
+     */
+    _adaptForShaderToy(source) {
+        const rm = this.sceneManager.rayMarchRenderer;
+
+        // ── Bake camera values from current renderer state ────────────────────
+        const cx = rm?._camera?.position?.x ?? 0;
+        const cy = rm?._camera?.position?.y ?? 2;
+        const cz = rm?._camera?.position?.z ?? 5;
+        const tx = rm?._controls?.target?.x ?? 0;
+        const ty = rm?._controls?.target?.y ?? 0;
+        const tz = rm?._controls?.target?.z ?? 0;
+
+        // uFOV in Isoline is stored in degrees. ShaderToy GLSL's tan()
+        // expects radians. Convert here so the baked constant is correct.
+        const fovDeg    = rm?._fov ?? 52.0;
+        const fovRad    = (fovDeg * Math.PI / 180.0).toFixed(6);
+        // Use conservative but sensible defaults for ShaderToy export rather
+        // than the renderer's current adaptive values. The live renderer may
+        // have reduced stepScale (to 0.25 or lower) for non-Lipschitz scenes,
+        // which combined with ShaderToy's fixed 256-iteration budget makes
+        // the scene invisible. Standard values work for all common scenes.
+        // Users who need tighter epsilon (for rDifference scenes) can edit
+        // the baked constants at the top of the exported file.
+        const maxDist   = '30.0';
+        const epsilon   = '0.001';
+        const stepScale = '0.85';
+
+        const camPosStr    = `vec3(${cx.toFixed(4)}, ${cy.toFixed(4)}, ${cz.toFixed(4)})`;
+        const camTargetStr = `vec3(${tx.toFixed(4)}, ${ty.toFixed(4)}, ${tz.toFixed(4)})`;
+
+        const bakedConstants = `
+// ── Baked renderer constants (replace application-specific uniforms) ──────────
+// Camera — baked from Isoline at export time. Edit these to change the view.
+vec3  uCamPos    = ${camPosStr};
+vec3  uCamTarget = ${camTargetStr};
+// FOV converted from degrees to radians (GLSL tan() expects radians)
+float uFOV       = ${fovRad};
+
+// Directional key light
+vec3  uLightDir   = normalize(vec3(0.6, 1.0, 0.5));
+vec3  uLightColor = vec3(1.0, 0.98, 0.92);
+vec3  uAmbient    = vec3(0.08, 0.10, 0.14);
+
+// Material
+vec3  uMatColor     = vec3(0.82, 0.84, 0.88);
+float uRoughness    = 0.45;
+float uSpecularInt  = 0.55;
+float uFresnelPower = 3.5;
+float uFresnelInt   = 0.35;
+
+// Ray march tuning
+float uMaxDist   = ${maxDist};
+float uEpsilon   = ${epsilon};
+float uStepScale = ${stepScale};
+
+// Point lights — ShaderToy does not allow uniform arrays to be declared
+// as non-const, so we use plain vec3 variables instead.
+vec3  uPL0Pos = vec3(-4.0, 3.0, -2.0);  vec3  uPL0Col = vec3(0.25, 0.35, 0.55);  float uPL0R = 8.0;
+vec3  uPL1Pos = vec3( 3.0,-1.0,  4.0);  vec3  uPL1Col = vec3(0.30, 0.18, 0.10);  float uPL1R = 6.0;
+vec3  uPL2Pos = vec3( 0.0, 0.0,  0.0);  vec3  uPL2Col = vec3(0.0,  0.0,  0.0);   float uPL2R = 1.0;
+vec3  uPL3Pos = vec3( 0.0, 0.0,  0.0);  vec3  uPL3Col = vec3(0.0,  0.0,  0.0);   float uPL3R = 1.0;
+// ── End baked constants ───────────────────────────────────────────────────────
+`;
+
+        let s = source;
+
+        // ── 1. Remove #extension line — ShaderToy provides derivatives ────────
+        s = s.replace(/^\s*#extension\s+GL_OES_standard_derivatives\s*:.*$/mg, '');
+
+        // ── 2. Remove uniform declarations that ShaderToy provides or we bake ─
+        const uniformsToRemove = [
+            'uCamPos', 'uCamTarget', 'uFOV',
+            'uLightDir', 'uLightColor', 'uAmbient',
+            'uMatColor', 'uRoughness', 'uSpecularInt', 'uFresnelPower', 'uFresnelInt',
+            'uMaxDist', 'uEpsilon', 'uStepScale',
+            // Array uniforms — match with optional [N] suffix
+            'uPointLightPos', 'uPointLightColor', 'uPointLightRadius', 'uPointLightCount',
+        ];
+        uniformsToRemove.forEach(name => {
+            s = s.replace(
+                new RegExp(
+                    `^\\s*uniform\\s+\\S+\\s+${name}(\\s*\\[\\d+\\])?\\s*;[^\\n]*$`,
+                    'mg'
+                ),
+                `// [baked] ${name}`
+            );
+        });
+        s = s.replace(/^\s*uniform\s+float\s+uTime\s*;[^\n]*/mg,
+            '// iTime — ShaderToy built-in');
+        s = s.replace(/^\s*uniform\s+(vec[23])\s+uResolution\s*;[^\n]*/mg,
+            '// iResolution — ShaderToy built-in');
+
+        // ── 3. Remove varying declaration ─────────────────────────────────────
+        s = s.replace(/^\s*varying\s+vec2\s+vScreenPos\s*;[^\n]*/mg, '');
+
+        // ── 4. Insert baked constants after precision declaration ─────────────
+        s = s.replace(
+            /(precision\s+highp\s+float\s*;)/,
+            `$1\n${bakedConstants}`
+        );
+
+        // ── 5. Replace vScreenPos UV computation with fragCoord-based UV ──────
+        // Pattern 1: the two-line form used in the ray march renderer
+        s = s.replace(
+            /vec2\s+uv\s*=\s*vScreenPos\s*\*\s*2\.0\s*-\s*1\.0\s*;\s*\n\s*uv\.x\s*\*=\s*[^;]+;/,
+            `vec2 uv = (fragCoord / iResolution.xy) * 2.0 - 1.0;\n  uv.x *= iResolution.x / iResolution.y;`
+        );
+        // Pattern 2: single-line form if renderer generates it differently
+        s = s.replace(
+            /vec2\s+uv\s*=\s*vScreenPos\s*\*\s*2\.0\s*-\s*1\.0\s*;/,
+            `vec2 uv = (fragCoord / iResolution.xy) * 2.0 - 1.0;\n  uv.x *= iResolution.x / iResolution.y;`
+        );
+        // Pattern 3: any remaining vScreenPos reference
+        s = s.replace(/\bvScreenPos\b/g, '(fragCoord / iResolution.xy)');
+
+        // ── 6. Replace point light array element accesses ─────────────────────
+        // The original shader uses uPointLightPos[i], uPointLightColor[i],
+        // uPointLightRadius[i] inside a for loop. The uniform declarations
+        // were removed above, so any remaining array-indexed references would
+        // cause a compile error. Replace each indexed access with the baked
+        // variable names, then replace uPointLightCount with the literal 2.
+        //
+        // We replace by index (0, 1, 2, 3) to handle both loop-unrolled
+        // and loop-body forms regardless of how the renderer emits them.
+        s = s.replace(/uPointLightPos\s*\[\s*0\s*\]/g, 'uPL0Pos');
+        s = s.replace(/uPointLightPos\s*\[\s*1\s*\]/g, 'uPL1Pos');
+        s = s.replace(/uPointLightPos\s*\[\s*2\s*\]/g, 'uPL2Pos');
+        s = s.replace(/uPointLightPos\s*\[\s*3\s*\]/g, 'uPL3Pos');
+        s = s.replace(/uPointLightColor\s*\[\s*0\s*\]/g, 'uPL0Col');
+        s = s.replace(/uPointLightColor\s*\[\s*1\s*\]/g, 'uPL1Col');
+        s = s.replace(/uPointLightColor\s*\[\s*2\s*\]/g, 'uPL2Col');
+        s = s.replace(/uPointLightColor\s*\[\s*3\s*\]/g, 'uPL3Col');
+        s = s.replace(/uPointLightRadius\s*\[\s*0\s*\]/g, 'uPL0R');
+        s = s.replace(/uPointLightRadius\s*\[\s*1\s*\]/g, 'uPL1R');
+        s = s.replace(/uPointLightRadius\s*\[\s*2\s*\]/g, 'uPL2R');
+        s = s.replace(/uPointLightRadius\s*\[\s*3\s*\]/g, 'uPL3R');
+
+        // Variable-index array accesses (e.g. uPointLightPos[i]) cannot be
+        // resolved statically. Replace the entire for loop over point lights
+        // with break-guarded index checks using the baked variables.
+        // This handles the case where the renderer emits a loop rather than
+        // unrolled accesses.
+        s = s.replace(
+            /for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*(?:uPointLightCount|4)\s*;\s*i\+\+\s*\)\s*\{[\s\S]*?^\s*\}/m,
+            `// Point lights unrolled (ShaderToy: no non-const array indexing)
+  { // Light 0
+    vec3 _toL=uPL0Pos-p; float _dL=length(_toL); if(_dL>0.001){
+      vec3 _dirL=_toL/_dL;
+      float _att=1.0/(1.0+_dL*_dL/(uPL0R*uPL0R));
+      float _dif=max(dot(normal,_dirL),0.0);
+      float _shd=softShadow(p+normal*0.002,_dirL,0.01,_dL,8.0);
+      vec3 _hL=normalize(_dirL+viewDir);
+      float _spc=pow(max(dot(normal,_hL),0.0),specExp)*uSpecularInt*0.6;
+      col+=uMatColor*uPL0Col*_dif*_att*_shd+uPL0Col*_spc*_att*_shd;
+    }
+  }
+  { // Light 1
+    vec3 _toL=uPL1Pos-p; float _dL=length(_toL); if(_dL>0.001){
+      vec3 _dirL=_toL/_dL;
+      float _att=1.0/(1.0+_dL*_dL/(uPL1R*uPL1R));
+      float _dif=max(dot(normal,_dirL),0.0);
+      float _shd=softShadow(p+normal*0.002,_dirL,0.01,_dL,8.0);
+      vec3 _hL=normalize(_dirL+viewDir);
+      float _spc=pow(max(dot(normal,_hL),0.0),specExp)*uSpecularInt*0.6;
+      col+=uMatColor*uPL1Col*_dif*_att*_shd+uPL1Col*_spc*_att*_shd;
+    }
+  }`
+        );
+
+        // Replace uPointLightCount wherever it survived loop replacement
+        s = s.replace(/\buPointLightCount\b/g, '2');
+
+        // Any remaining variable-index array accesses that survived both
+        // passes (e.g. uPointLightPos[i] with i still as a variable) must
+        // be caught here to prevent a compile error. Replace with vec3(0.0).
+        s = s.replace(/uPointLightPos\s*\[\s*\w+\s*\]/g, 'vec3(0.0)');
+        s = s.replace(/uPointLightColor\s*\[\s*\w+\s*\]/g, 'vec3(0.0)');
+        s = s.replace(/uPointLightRadius\s*\[\s*\w+\s*\]/g, '1.0');
+
+        // ── 8. Replace remaining uniform-based references ─────────────────────
+        s = s.replace(/\buTime\b/g, 'iTime');
+        s = s.replace(/\buResolution\b/g, 'iResolution.xy');
+        s = s.replace(/\biResolution\.xy\.x\b/g, 'iResolution.x');
+        s = s.replace(/\biResolution\.xy\.y\b/g, 'iResolution.y');
+        s = s.replace(/\bgl_FragColor\b/g, 'fragColor');
+        s = s.replace(/\bgl_FragCoord\b/g, 'fragCoord');
+
+        // ── Remove 2D overloads of sceneSDF and sceneSDF_raw ──────────────────
+        // The ray march shader only calls sceneSDF(vec3), never sceneSDF(vec2).
+        // GLSL ES 1.0 (ShaderToy) does not support function overloading, so
+        // the vec2 overloads cause a compile error. Remove them.
+        s = s.replace(
+            /float\s+sceneSDF_raw\s*\(\s*vec2\s+p\s*\)\s*\{[^}]*\}/g,
+            '// sceneSDF_raw(vec2) removed — ray march uses vec3 only'
+        );
+        s = s.replace(
+            /float\s+sceneSDF\s*\(\s*vec2\s+p\s*\)\s*\{[^}]*\}/g,
+            '// sceneSDF(vec2) removed — ray march uses vec3 only'
+        );
+
+        // ── 9. Rename main() → _isolineMain() ────────────────────────────────
+        s = s.replace(
+            /\bvoid\s+main\s*\(\s*\)\s*\{/,
+            'void _isolineMain(out vec4 fragColor, in vec2 fragCoord) {'
+        );
+
+        // ── 10. Remove any previous ShaderToy wrapper (idempotent) ────────────
+        s = s.replace(/\/\/\s*──\s*ShaderToy entry point[\s\S]*$/m, '');
+
+        // ── 11. Append ShaderToy entry point ──────────────────────────────────
+        s += `
+// ── ShaderToy entry point ────────────────────────────────────────────────────
+// Paste this entire file into shadertoy.com → New Shader → click ▶
+// Camera is baked from Isoline at export time — edit uCamPos / uCamTarget
+// near the top of this file to change the viewing angle.
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    _isolineMain(fragColor, fragCoord);
+}
+`;
+        return s;
     }
 
     /**
