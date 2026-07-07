@@ -5,7 +5,7 @@
 A browser-based procedural shape studio for building 2D and 3D
 forms from connected geometry, transforms, and blends.
 
-[![Watch the demo](src/assets/image/HeroImage.png)](https://youtu.be/YOUR_VIDEO_ID)
+[![Watch the demo](src/assets/image/HeroImage.png)](https://www.youtube.com/watch?v=dGRmIoLHyaw)
 
 **Live demo:** https://isoline-studio.netlify.app
 
