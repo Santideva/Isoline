@@ -504,9 +504,6 @@ export class StateStore {
     if (shape.type === 'triangle') {
       return {
         size:           shape.size           || 1,
-        rotation:       shape.rotation       || 0,
-        posX:           shape.position?.x    || 0,
-        posY:           shape.position?.y    || 0,
         cornerRounding: shape.cornerRounding || 0
       };
     }
@@ -517,8 +514,6 @@ export class StateStore {
         startAngle: shape.startAngle          || 0,
         endAngle:   shape.endAngle !== undefined ? shape.endAngle : Math.PI,
         segments:   shape.segments            || 8,
-        posX:       shape.position?.x         || 0,
-        posY:       shape.position?.y         || 0,
         thickness:  shape.thickness           || 0
       };
     }
@@ -526,46 +521,30 @@ export class StateStore {
     if (shape.type === 'circle') {
       return {
         radius: shape.radius !== undefined ? shape.radius : 1,
-        posX:   shape.posX   !== undefined ? shape.posX   : 0,
-        posY:   shape.posY   !== undefined ? shape.posY   : 0,
       };
     }
 
     if (shape.type === 'regularPolygon') {
       return {
-        sides:    shape.sides    !== undefined ? shape.sides    : 6,
-        size:     shape.size     !== undefined ? shape.size     : 1,
-        rotation: shape.rotation !== undefined ? shape.rotation : 0,
-        posX:     shape.posX     !== undefined ? shape.posX     : 0,
-        posY:     shape.posY     !== undefined ? shape.posY     : 0,
+        sides: shape.sides !== undefined ? shape.sides : 6,
+        size:  shape.size  !== undefined ? shape.size  : 1,
       };
     }
 
     if (shape.type === 'polytope') {
       return {
         vertices: JSON.stringify(shape.vertices || [[-1,-1],[1,-1],[1,1],[-1,1]]),
-        posX:     shape.posX     !== undefined ? shape.posX     : 0,
-        posY:     shape.posY     !== undefined ? shape.posY     : 0,
-        rotation: shape.rotation !== undefined ? shape.rotation : 0,
       };
     }
 
     if (shape.type === 'sphere') {
-      return {
-        radius: shape.radius ?? 1,
-        posX:   shape.posX   ?? 0,
-        posY:   shape.posY   ?? 0,
-        posZ:   shape.posZ   ?? 0,
-      };
+      return { radius: shape.radius ?? 1 };
     }
     if (shape.type === 'box') {
       return {
         width:  shape.width  ?? 2,
         height: shape.height ?? 2,
         depth:  shape.depth  ?? 2,
-        posX:   shape.posX   ?? 0,
-        posY:   shape.posY   ?? 0,
-        posZ:   shape.posZ   ?? 0,
       };
     }
     if (shape.type === 'cylinder') {
@@ -573,12 +552,14 @@ export class StateStore {
         radius: shape.radius ?? 1,
         height: shape.height ?? 2,
         capped: shape.capped ? 'yes' : 'no',
-        posX:   shape.posX   ?? 0,
-        posY:   shape.posY   ?? 0,
-        posZ:   shape.posZ   ?? 0,
       };
     }
     if (shape.type === 'capsule') {
+      // NOTE: pre-existing oddity, left as-is — this branch's ax/ay/az/bx/by/bz
+      // fields don't match CapsulePrimitive's actual radius/height schema and
+      // appear to already have been stale/unreachable before this change.
+      // Not touched as part of the transform overhaul; flagged for separate
+      // cleanup.
       return {
         ax: shape.ax ?? 0, ay: shape.ay ?? -1, az: shape.az ?? 0,
         bx: shape.bx ?? 0, by: shape.by ??  1, bz: shape.bz ?? 0,
@@ -589,9 +570,6 @@ export class StateStore {
       return {
         majorRadius: shape.majorRadius ?? 2,
         minorRadius: shape.minorRadius ?? 0.5,
-        posX: shape.posX ?? 0,
-        posY: shape.posY ?? 0,
-        posZ: shape.posZ ?? 0,
       };
     }
 
@@ -599,9 +577,6 @@ export class StateStore {
       return {
         radius: shape.radius ?? 1,
         height: shape.height ?? 2,
-        posX:   shape.posX ?? 0,
-        posY:   shape.posY ?? 0,
-        posZ:   shape.posZ ?? 0,
       };
     }
 

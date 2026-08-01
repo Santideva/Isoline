@@ -1,6 +1,7 @@
 // src/graph/NodeGraph.js
 import { NODE_TYPES } from './NodeSpec.js';
 import { nextId, advanceIdCounter } from '../utils/idGenerator.js';
+import { createIdentityTransform } from '../utils/transform3D.js';
 
 /**
  * NodeGraph is the ground-truth data model for the entire scene.
@@ -46,7 +47,16 @@ export class NodeGraph {
 
   // ── Node operations ───────────────────────────────────────────────────────
 
-  addNode(type, params = {}, uiPos = { x: 0, y: 0 }, forceId = null) {
+  /**
+   * @param {string} type
+   * @param {object} [params]
+   * @param {object} [uiPos]
+   * @param {number|null} [forceId]
+   * @param {object|null} [transform]  Optional initial transform (posX/Y/Z,
+   *   pivotX/Y/Z, rotateX/Y/Z, scale). Defaults to identity. Every node gets
+   *   a transform regardless of type — it is not part of NodeSpec params.
+   */
+  addNode(type, params = {}, uiPos = { x: 0, y: 0 }, forceId = null, transform = null) {
     const spec = NODE_TYPES[type];
     if (!spec) throw new Error(`Unknown node type: ${type}`);
 
@@ -54,10 +64,11 @@ export class NodeGraph {
     spec.params.forEach(p => { defaultParams[p.name] = p.default; });
 
     const node = {
-      id:     forceId !== null ? forceId : nextId(),
+      id:        forceId !== null ? forceId : nextId(),
       type,
-      params: { ...defaultParams, ...params },
-      uiPos:  { ...uiPos },
+      params:    { ...defaultParams, ...params },
+      uiPos:     { ...uiPos },
+      transform: { ...createIdentityTransform(), ...(transform || {}) },
     };
 
     this.nodes.set(node.id, node);
@@ -87,6 +98,22 @@ export class NodeGraph {
     if (!node) return false;
     node.params[paramName] = value;
     this._notify('paramChanged', { nodeId, paramName, value });
+    return true;
+  }
+
+  /**
+   * Update a single field of a node's transform block.
+   * @param {number} nodeId
+   * @param {string} field  One of: posX,posY,posZ, pivotX,pivotY,pivotZ,
+   *                        rotateX,rotateY,rotateZ, scale
+   * @param {number} value
+   */
+  updateNodeTransform(nodeId, field, value) {
+    const node = this.nodes.get(nodeId);
+    if (!node) return false;
+    if (!node.transform) node.transform = createIdentityTransform();
+    node.transform[field] = value;
+    this._notify('transformChanged', { nodeId, field, value });
     return true;
   }
 
@@ -231,7 +258,11 @@ export class NodeGraph {
 
   static deserialise(data) {
     const graph = new NodeGraph();
-    data.nodes.forEach(n => graph.nodes.set(n.id, n));
+    data.nodes.forEach(n => {
+      // Migration: old serialised nodes may not have a transform block.
+      if (!n.transform) n.transform = createIdentityTransform();
+      graph.nodes.set(n.id, n);
+    });
     data.edges.forEach(e => graph.edges.set(e.id, e));
     graph._rebuildLookups();
     return graph;
@@ -253,9 +284,10 @@ export class NodeGraph {
     this.nodes.forEach((node, id) => {
       nodes.push({
         id,
-        type:   node.type,
-        params: { ...node.params },
-        uiPos:  { ...node.uiPos }
+        type:      node.type,
+        params:    { ...node.params },
+        uiPos:     { ...node.uiPos },
+        transform: { ...(node.transform || createIdentityTransform()) },
       });
     });
 
@@ -292,10 +324,16 @@ export class NodeGraph {
     // Restore nodes — preserve original IDs
     for (const n of data.nodes) {
       this.nodes.set(n.id, {
-        id:     n.id,
-        type:   n.type,
-        params: { ...n.params },
-        uiPos:  { ...n.uiPos }
+        id:        n.id,
+        type:      n.type,
+        params:    { ...n.params },
+        uiPos:     { ...n.uiPos },
+        // Migration: scenes saved before the transform overhaul have no
+        // transform block. Default to identity so old saves load correctly
+        // (their position/rotation was stored in params under the old
+        // scheme and is intentionally NOT auto-migrated into transform —
+        // see the persistence.js migration shim in Phase 4 for that).
+        transform: n.transform ? { ...n.transform } : createIdentityTransform(),
       });
     }
 

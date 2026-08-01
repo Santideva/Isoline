@@ -28,9 +28,6 @@
                     width:          0.68,
                     height:         0.56,
                     depth:          7.00,
-                    posX:           0,
-                    posY:           0,
-                    posZ:           0,
                     cornerRounding: 0,
                 },
                 uiPos: { x: 60, y: 60 },
@@ -47,9 +44,6 @@
                     width:          3.90,
                     height:         1.00,
                     depth:          2.42,
-                    posX:           0,
-                    posY:           0,
-                    posZ:           0,
                     cornerRounding: 0.07,
                 },
                 uiPos: { x: 60, y: 280 },
@@ -59,18 +53,17 @@
             // Very low smoothness so the two boxes join at a near-sharp
             // boundary rather than melting into each other — the mechanical
             // component aesthetic reads best with hard edges rather than
-            // fully organic blending. Rotation = 6.28 (≈ 2π) is a full
-            // rotation, effectively zero rotation in practice.
+            // fully organic blending. schurBlend no longer carries its own
+            // rotation/scale/position — those params were removed in the
+            // transform overhaul (mathematically redundant with the node's
+            // own transform block, which for this preset stays identity
+            // since no placement of the joined arm unit itself is needed).
             {
                 id:    3,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
                     smoothness: 0.40,
-                    rotation:   6.28,
-                    scale:      1.00,
-                    posX:       0,
-                    posY:       0,
                     isoOffset:  0.00,
                 },
                 uiPos: { x: 340, y: 170 },
@@ -82,18 +75,19 @@
             // arm, creating the characteristic propeller/screw silhouette
             // visible in the reference render. smoothMin combiner gives
             // the three arms a gentle connection at the center rather than
-            // a hard mathematical minimum.
+            // a hard mathematical minimum. orbitCenterX/Y (renamed from
+            // centerX/Y) are the fold/orbit pivot, distinct from transform.
             {
                 id:    4,
                 type:  'symmetryOrbitNode',
                 params: {
-                    folds:      3,
-                    centerX:    0,
-                    centerY:    0,
-                    rotation:   0,
-                    reflectX:   'yes',
-                    combiner:   'smoothMin',
-                    smoothness: 0.40,
+                    folds:         3,
+                    orbitCenterX:  0,
+                    orbitCenterY:  0,
+                    rotation:      0,
+                    reflectX:      'yes',
+                    combiner:      'smoothMin',
+                    smoothness:    0.40,
                 },
                 uiPos: { x: 600, y: 170 },
             },
@@ -158,27 +152,38 @@ export const PRESET_MANDALA_RELIEF = {
     },
     graph: {
         nodes: [
-            // Small pentagon offset from origin — one petal unit
+            // Small pentagon offset from origin — one petal unit.
+            // NOTE: this pentagon is centered at the origin now (posX/posY
+            // removed with the primitive param cleanup); regularPolygon
+            // also no longer has its own 'rotation' param — both were
+            // identity-equivalent here (posX/Y:0 after regularPolygon's
+            // own offset was folded into the symmetry fold's radius via
+            // node 2 in the original design, rotation was already 0),
+            // so no transform block is needed for this node.
             { id: 1, type: 'regularPolygon',
-              params: { sides: 5, size: 0.28, rotation: 0, posX: 0.85, posY: 0 },
+              params: { sides: 5, size: 0.28 },
               uiPos:  { x: 60, y: 60 } },
-            // 12-fold dihedral symmetry fold — creates the full mandala pattern
+            // 12-fold dihedral symmetry fold — creates the full mandala pattern.
+            // centerX/centerY renamed to foldCenterX/foldCenterY (transform
+            // overhaul — distinct from the node's own placement transform).
             { id: 2, type: 'symmetryFoldNode',
-              params: { folds: 12, centerX: 0, centerY: 0, rotation: 0,
+              params: { folds: 12, foldCenterX: 0, foldCenterY: 0, rotation: 0,
                         reflectX: 'yes', reflectY: 'no' },
               uiPos:  { x: 320, y: 60 } },
             // Central disc — gives the mandala a solid core
             { id: 3, type: 'circle',
-              params: { radius: 0.3, posX: 0, posY: 0 },
+              params: { radius: 0.3 },
               uiPos:  { x: 60, y: 280 } },
-            // Smooth union of folded petals and core disc
+            // Smooth union of folded petals and core disc. schurBlend no
+            // longer carries rotation/scale/posX/posY — those were
+            // structurally redundant with the node's own transform (which
+            // stays identity here; nothing was actually being placed).
             { id: 4, type: 'schurBlend',
-              params: { operation: 'union', smoothness: 8,
-                        rotation: 0, scale: 1, posX: 0, posY: 0, isoOffset: 0.15 },
+              params: { operation: 'union', smoothness: 8, isoOffset: 0.15 },
               uiPos:  { x: 580, y: 170 } },
             // Outer bounding circle — creates the disc boundary
             { id: 5, type: 'circle',
-              params: { radius: 1.3, posX: 0, posY: 0 },
+              params: { radius: 1.3 },
               uiPos:  { x: 60, y: 480 } },
             // Intersect with outer circle to clip the mandala to a clean disc
             { id: 6, type: 'rIntersection',
@@ -235,7 +240,7 @@ export const PRESET_PERFORATED_FACADE = {
         nodes: [
             // Panel circle profile — one circular perforation
             { id: 1, type: 'circle',
-              params: { radius: 0.32, posX: 0, posY: 0 },
+              params: { radius: 0.32 },
               uiPos:  { x: 60, y: 60 } },
             // Extrude the circle into a cylindrical hole
             { id: 2, type: 'extrudeNode',
@@ -243,8 +248,7 @@ export const PRESET_PERFORATED_FACADE = {
               uiPos:  { x: 300, y: 60 } },
             // Panel box — the solid slab the holes are punched through
             { id: 3, type: 'box',
-              params: { width: 0.9, height: 0.9, depth: 0.4,
-                        posX: 0, posY: 0, posZ: 0, cornerRounding: 0.02 },
+              params: { width: 0.9, height: 0.9, depth: 0.4, cornerRounding: 0.02 },
               uiPos:  { x: 60, y: 280 } },
             // Punch the cylindrical hole through the panel slab
             { id: 4, type: 'rDifference',
@@ -286,34 +290,35 @@ export const PRESET_KNOTTED_BLOOM = {
             {
                 id:    1,
                 type:  'cylinder',
-                params: { radius: 1.0, height: 0.7, posX: 0.0, posY: 0.0, posZ: 0.0 },
+                params: { radius: 1.0, height: 0.7 },
                 uiPos: { x: 60, y: 60 },
             },
 
             // ── Cone — petal tip ──────────────────────────────────────────────
-            // Positioned at posY = half cylinder height so its base meets
-            // the cylinder's top flush. Same radius as cylinder base so
-            // the schurBlend joins them without a visible seam.
+            // Base offset +0.8 on Y so its base meets the cylinder's top
+            // flush. Same radius as cylinder base so the schurBlend joins
+            // them without a visible seam. This offset is genuine placement
+            // (not zero) so it now lives in the node's transform block
+            // rather than params.
             {
                 id:    2,
                 type:  'cone',
-                params: { radius: 1.0, height: 1.0, posX: 0.0, posY: 0.8, posZ: 0.0 },
+                params: { radius: 1.0, height: 1.0 },
+                transform: { posY: 0.8 },
                 uiPos: { x: 60, y: 260 },
             },
 
             // ── Schur union — tight join ──────────────────────────────────────
             // Low smoothness so cylinder and cone join cleanly at their
             // shared boundary rather than melting into each other.
+            // rotation/scale/posX/posY removed — redundant with the node's
+            // own transform, which stays identity here.
             {
                 id:    3,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
                     smoothness: 4,
-                    rotation:   0,
-                    scale:      1,
-                    posX:       0,
-                    posY:       0,
                     isoOffset:  0.05,
                 },
                 uiPos: { x: 340, y: 160 },
@@ -334,13 +339,14 @@ export const PRESET_KNOTTED_BLOOM = {
             // ── Symmetry fold ─────────────────────────────────────────────────
             // Reflective symmetry creates multiple petal copies from one.
             // folds=2 with reflectX and reflectY both yes = 4-way reflection.
+            // centerX/centerY renamed to foldCenterX/foldCenterY.
             {
                 id:    5,
                 type:  'symmetryFoldNode',
                 params: {
                     folds:    3,
-                    centerX:  0,
-                    centerY:  0,
+                    foldCenterX:  0,
+                    foldCenterY:  0,
                     rotation: 0,
                     reflectX: 'yes',
                     reflectY: 'yes',
@@ -352,14 +358,15 @@ export const PRESET_KNOTTED_BLOOM = {
             // Replicates the folded result around the center with rotational
             // symmetry to create the full bloom arrangement. folds=6 gives
             // a 6-fold radial pattern. combiner='min' keeps individual
-            // petal boundaries sharp and distinct.
+            // petal boundaries sharp and distinct. centerX/centerY renamed
+            // to orbitCenterX/orbitCenterY.
             {
                 id:    6,
                 type:  'symmetryOrbitNode',
                 params: {
                     folds:      4,
-                    centerX:    0,
-                    centerY:    0,
+                    orbitCenterX:    0,
+                    orbitCenterY:    0,
                     rotation:   0,
                     reflectX:   'yes',
                     combiner:   'min',
@@ -434,19 +441,18 @@ export const PRESET_TILED_SURFACE = {
                     width:          1.77,
                     height:         0.60,
                     depth:          2.00,
-                    posX:           0,
-                    posY:           0,
-                    posZ:           0,
                     cornerRounding: 0,
                 },
                 uiPos: { x: 60, y: 60 },
             },
 
             // ── Cylinder — the structural column ─────────────────────────────
-            // Tall and slender, axis Y — stands upright as the main vertical
-            // element. Combined with the flat box it produces a column-with-
-            // fin cross-section that tiles well and reads as an architectural
-            // structural member.
+            // Tall and slender — stands upright as the main vertical element.
+            // Combined with the flat box it produces a column-with-fin
+            // cross-section that tiles well and reads as an architectural
+            // structural member. The old 'axis: Y' dropdown value is gone —
+            // Y is now always the cylinder's local axis, and since Y was
+            // already the default here, no transform rotation is needed.
             {
                 id:    2,
                 type:  'cylinder',
@@ -454,10 +460,6 @@ export const PRESET_TILED_SURFACE = {
                     radius: 0.48,
                     height: 10.24,
                     capped: 'yes',
-                    axis:   'Y',
-                    posX:   0,
-                    posY:   0,
-                    posZ:   0,
                 },
                 uiPos: { x: 60, y: 280 },
             },
@@ -465,18 +467,14 @@ export const PRESET_TILED_SURFACE = {
             // ── Schur union — tight join ───────────────────────────────────────
             // Zero smoothness: hard boolean union so the column and fin
             // panel meet at a sharp architectural edge rather than blending
-            // organically. This is intentional — tiled architectural forms
-            // read more convincingly with crisp intersections.
+            // organically. rotation/scale/posX/posY removed — redundant
+            // with the node's own transform, which stays identity here.
             {
                 id:    3,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
                     smoothness: 0.00,
-                    rotation:   0.00,
-                    scale:      1.00,
-                    posX:       0,
-                    posY:       0,
                     isoOffset:  0.00,
                 },
                 uiPos: { x: 340, y: 170 },
@@ -484,16 +482,15 @@ export const PRESET_TILED_SURFACE = {
 
             // ── Symmetry fold — bilateral symmetry ─────────────────────────────
             // 2-fold fold with reflectX=yes creates a mirrored pair of the
-            // column+fin unit. This doubles the visual complexity within
-            // each tile cell, and the bilateral symmetry reads as
-            // intentional architectural design rather than arbitrary repetition.
+            // column+fin unit. centerX/centerY renamed to
+            // foldCenterX/foldCenterY.
             {
                 id:    4,
                 type:  'symmetryFoldNode',
                 params: {
                     folds:    2,
-                    centerX:  0,
-                    centerY:  0,
+                    foldCenterX:  0,
+                    foldCenterY:  0,
                     rotation: 0,
                     reflectX: 'yes',
                     reflectY: 'no',
@@ -503,10 +500,6 @@ export const PRESET_TILED_SURFACE = {
 
             // ── Triangular tiling ─────────────────────────────────────────────
             // Tiles the symmetry-folded unit across a triangular lattice.
-            // The triangular lattice (rather than square) creates the
-            // characteristic offset-row arrangement visible in the reference
-            // images — adjacent columns are staggered rather than aligned,
-            // which is both visually richer and more structurally efficient.
             {
                 id:    5,
                 type:  'tilingNode',
@@ -583,27 +576,34 @@ export const PRESET_CORAL_FORMATION = {
     },
     graph: {
         nodes: [
-            // Small circle offset from origin — profile for revolution
+            // Small circle offset from origin — profile for revolution.
+            // posX:1.2 is genuine placement (not zero), so it now lives in
+            // this node's transform block. This offset is what makes the
+            // subsequent revolveNode produce a torus ring rather than a
+            // solid ball of revolution — preserving it exactly is important.
             { id: 1, type: 'circle',
-              params: { radius: 0.2, posX: 1.2, posY: 0 },
+              params: { radius: 0.2 },
+              transform: { posX: 1.2 },
               uiPos:  { x: 60, y: 60 } },
             // Revolve around Y axis to create a torus ring
             { id: 2, type: 'revolveNode',
               params: { offset: 1.2 },
               uiPos:  { x: 300, y: 60 } },
-            // 6-fold symmetry fold to create branching arm structure
+            // 6-fold symmetry fold to create branching arm structure.
+            // centerX/centerY renamed to foldCenterX/foldCenterY.
             { id: 3, type: 'symmetryFoldNode',
-              params: { folds: 6, centerX: 0, centerY: 0, rotation: 0,
+              params: { folds: 6, foldCenterX: 0, foldCenterY: 0, rotation: 0,
                         reflectX: 'yes', reflectY: 'no' },
               uiPos:  { x: 540, y: 60 } },
             // Central sphere — the organism's body
             { id: 4, type: 'sphere',
-              params: { radius: 0.65, posX: 0, posY: 0, posZ: 0 },
+              params: { radius: 0.65 },
               uiPos:  { x: 60, y: 300 } },
-            // Smooth union — merges arms into the central body
+            // Smooth union — merges arms into the central body.
+            // rotation/scale/posX/posY removed — redundant with the node's
+            // own transform, which stays identity here.
             { id: 5, type: 'schurBlend',
-              params: { operation: 'union', smoothness: 12,
-                        rotation: 0, scale: 1, posX: 0, posY: 0, isoOffset: 0.15 },
+              params: { operation: 'union', smoothness: 12, isoOffset: 0.15 },
               uiPos:  { x: 780, y: 180 } },
             // Organic noise displacement — makes it look grown, not made
             { id: 6, type: 'noiseDisplaceNode',
@@ -690,8 +690,6 @@ export const PRESET_WINGED_FORM = {
                     startAngle: 0.35,
                     endAngle:   2.85,
                     segments:   24,
-                    posX:       0,
-                    posY:       0,
                 },
                 uiPos: { x: 60, y: 60 },
             },
@@ -699,8 +697,10 @@ export const PRESET_WINGED_FORM = {
             // ── Revolve the arc into a 3D swept wing blade ─────────────────────
             // offset matches the arc's general radial position so the
             // revolution sweeps the blade around at a sensible distance
-            // from the central axis — too small and the wing roots
-            // overlap awkwardly; too large and they detach from the body.
+            // from the central axis. revolveNode's 'axis' param is its own
+            // shape-defining choice (which world axis to revolve around) —
+            // unlike cylinder/cone's old axis dropdown, this was never
+            // touched by the transform overhaul and stays as-is.
             {
                 id:    2,
                 type:  'revolveNode',
@@ -712,13 +712,14 @@ export const PRESET_WINGED_FORM = {
             // Turns the single swept wing blade into four wings arranged
             // radially around the body. rotation offsets the fold axes so
             // wings point diagonally rather than along world axes.
+            // centerX/centerY renamed to foldCenterX/foldCenterY.
             {
                 id:    3,
                 type:  'symmetryFoldNode',
                 params: {
                     folds:    4,
-                    centerX:  0,
-                    centerY:  0,
+                    foldCenterX:  0,
+                    foldCenterY:  0,
                     rotation: 0.4,
                     reflectX: 'no',
                     reflectY: 'no',
@@ -730,21 +731,19 @@ export const PRESET_WINGED_FORM = {
             {
                 id:    4,
                 type:  'sphere',
-                params: { radius: 0.85, posX: 0, posY: 0, posZ: 0 },
+                params: { radius: 0.85 },
                 uiPos: { x: 60, y: 280 },
             },
 
             // ── Merge wings with body ───────────────────────────────────────────
+            // rotation/scale/posX/posY removed — redundant with the node's
+            // own transform, which stays identity here.
             {
                 id:    5,
                 type:  'schurBlend',
                 params: {
                     operation:  'union',
                     smoothness: 14,
-                    rotation:   0,
-                    scale:      1,
-                    posX:       0,
-                    posY:       0,
                     isoOffset:  0.15,
                 },
                 uiPos: { x: 780, y: 170 },

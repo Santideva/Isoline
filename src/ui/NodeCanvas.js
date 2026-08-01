@@ -59,6 +59,7 @@
     'noiseDisplaceNode', 'twistNode', 'bendNode', 'repeatNode',
     'transform3DNode',
     'rUnion', 'rIntersection', 'rDifference', 'schurBlend', 'ifsBlend',
+    'rBlend', 'morphBlend', 'embedNode',
     'identityMapper', 'polynomialMapper', 'sinusoidalMapper',
     'exponentialMapper', 'logarithmicMapper', 'powerMapper',
     'periodicMapper', 'temporalMapper', 'recursiveMapper',
@@ -122,8 +123,25 @@ function _isConvexPolygon(vertices) {
         this._graphUnlisten  = null;
         this._selectedIds          = new Set();
         this._altDragging          = false;
-        this._recomposeTimer       = null;
-        this._viewportDragAttached = false;
+        this._recomposeTimer          = null;
+        this._viewportDragAttached    = false;
+        this._viewportPickingAttached = false;
+        // The single node (if any) currently showing a pivot gizmo.
+        // Singleton by design — opening a DIFFERENT card's Transform
+        // section replaces this rather than showing a second simultaneous
+        // gizmo. Read by _attachViewportDrag/_applySnapCandidate/
+        // _onTransformChange to decide whether to refresh the gizmo's
+        // position during a drag; written by _onTransformSectionToggle
+        // and _togglePivotGizmoShortcut below.
+        this._activeGizmoNodeId = null;
+
+        // embedNode anchor-picking mode. When set, the NEXT viewport click
+        // is intercepted by _handleViewportClick (before normal selection
+        // logic runs) and used to place that embedNode's anchor on the
+        // clicked point of its host shape, instead of selecting whatever's
+        // under the cursor.
+        this._anchorPickMode = null; // { embedNodeId, hostNodeId } | null
+        this._embedRegionVisibleFor = null; // nodeId currently showing its ring, or null
 
         // Auto-orbit speed — degrees per second (internal OrbitControls units).
         // Range exposed to user: 0.5 (very slow, cinematic) to 10.0 (fast).
@@ -179,7 +197,115 @@ function _isConvexPolygon(vertices) {
             document.head.appendChild(_os);
         }
 
-        // ── Overlay root ──────────────────────────────────────────────────────
+        // ── Progressive disclosure (Phase 6a) ─────────────────────────────────
+        // A single class on the overlay root controls visibility of every
+        // element tagged .nc-advanced-only, via one CSS rule. This means
+        // newly created NodeCards (built after the toggle state is already
+        // set) are correctly hidden/shown automatically through the CSS
+        // cascade — no per-card JS bookkeeping needed regardless of when a
+        // card's DOM is constructed.
+        if (!document.getElementById('nc-tier-styles')) {
+            const _tierStyle = document.createElement('style');
+            _tierStyle.id = 'nc-tier-styles';
+            _tierStyle.textContent = `
+                .nc-tier-basic .nc-advanced-only { display: none !important; }
+            `;
+            document.head.appendChild(_tierStyle);
+        }
+
+        // ── Custom hover tooltips (Phase 6b) ───────────────────────────────────
+        // Delegated on document.body (not this._overlay) — several floating
+        // panels (export panel, preset panel, view menu, dropdown panels)
+        // attach directly to document.body rather than the overlay's
+        // subtree, so a single body-level listener is the only way to
+        // cover every current AND future titled element with zero
+        // per-element wiring, including dynamically rebuilt NodeCards.
+        if (!this._tooltipAttached) {
+            this._tooltipAttached = true;
+            this._tooltipEl = document.createElement('div');
+            this._tooltipEl.style.cssText = `
+                position: fixed;
+                z-index: 99999;
+                background: rgba(16,16,22,0.98);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+                line-height: 1.4;
+                color: rgba(230,230,235,0.95);
+                font-family: var(--font-sans, sans-serif);
+                max-width: 240px;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 0.12s ease;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+            `;
+            document.body.appendChild(this._tooltipEl);
+
+            let hoverTimer = null;
+            let activeEl   = null;
+
+            const showTooltip = (el, x, y) => {
+                const text = el.dataset.tooltipText;
+                if (!text) return;
+                this._tooltipEl.textContent = text;
+                this._tooltipEl.style.opacity = '1';
+
+                // Position near cursor, clamped so it never renders off-screen
+                const PAD = 14;
+                let left = x + PAD;
+                let top  = y + PAD;
+                const rect = this._tooltipEl.getBoundingClientRect();
+                if (left + rect.width  > window.innerWidth)  left = x - rect.width - PAD;
+                if (top  + rect.height > window.innerHeight) top  = y - rect.height - PAD;
+                this._tooltipEl.style.left = `${Math.max(4, left)}px`;
+                this._tooltipEl.style.top  = `${Math.max(4, top)}px`;
+            };
+
+            const hideTooltip = () => {
+                this._tooltipEl.style.opacity = '0';
+            };
+
+            document.body.addEventListener('mouseover', (e) => {
+                const el = e.target.closest('[title]');
+                if (!el || el === activeEl) return;
+
+                // Suppress the native browser tooltip, but remember the
+                // original text so it can be restored later.
+                if (el.title) {
+                    el.dataset.tooltipText = el.title;
+                    el.dataset.tooltipHadTitle = 'true';
+                    el.title = '';
+                }
+                activeEl = el;
+
+                clearTimeout(hoverTimer);
+                hoverTimer = setTimeout(() => {
+                    if (activeEl === el) showTooltip(el, e.clientX, e.clientY);
+                }, 400);
+            });
+
+            document.body.addEventListener('mousemove', (e) => {
+                if (activeEl && this._tooltipEl.style.opacity === '1') {
+                    showTooltip(activeEl, e.clientX, e.clientY);
+                }
+            });
+
+            document.body.addEventListener('mouseout', (e) => {
+                const el = e.target.closest('[title], [data-tooltip-had-title]');
+                if (!el) return;
+                if (el.dataset.tooltipHadTitle === 'true' && el.dataset.tooltipText) {
+                    el.title = el.dataset.tooltipText;
+                }
+                if (el === activeEl) {
+                    clearTimeout(hoverTimer);
+                    activeEl = null;
+                    hideTooltip();
+                }
+            });
+        }
+
+         // ── Overlay root ──────────────────────────────────────────────────────
         this._overlay = document.createElement('div');
         this._overlay.id = 'node-canvas-overlay';
         this._overlay.style.cssText = `
@@ -284,10 +410,18 @@ function _isConvexPolygon(vertices) {
             `;
 
             // Build one row per item
-            items.forEach(({ value, label }) => {
+            items.forEach(({ value, label, hint, advanced }) => {
                 const item = document.createElement('div');
                 item.textContent = label;
                 item.dataset.value = value;
+                if (hint) item.title = hint;
+                // Advanced-tier gating (Phase 6a): this panel is appended to
+                // document.body (see the `document.body.appendChild(panel);`
+                // line further down in this same function), which is
+                // exactly where the tier class lives — so the identical CSS
+                // rule that hides the Pivot section also hides these rows
+                // when Basic tier is active.
+                if (advanced) item.classList.add('nc-advanced-only');
                 item.style.cssText = `
                     padding: 7px 14px;
                     font-size: 12px;
@@ -379,7 +513,11 @@ function _isConvexPolygon(vertices) {
           'mobius','noisedisplace','twist','bend','repeat','position3d'
         ]);
         const _BLEND = new Set([
-          'schurBlend','rUnion','rIntersection','rDifference'
+          'schurBlend','rBlend','morphBlend','embedNode'
+        ]);
+        const _MAPPER = new Set([
+          'polynomialMapper','sinusoidalMapper','exponentialMapper',
+          'logarithmicMapper','powerMapper'
         ]);
 
         const _dispatchAdd = (v, selectEl) => {
@@ -421,6 +559,8 @@ function _isConvexPolygon(vertices) {
             this._addTransformNode(v);  // snapshot taken inside _addTransformNode
           } else if (_BLEND.has(v)) {
             this._addBlendNode(v);      // snapshot taken inside _addBlendNode
+          } else if (_MAPPER.has(v)) {
+            this._addMapperNode(v);     // snapshot taken inside _addMapperNode
           }
         };
 
@@ -428,12 +568,12 @@ function _isConvexPolygon(vertices) {
         const _2dDropdown = _makeCustomDropdown(
             '2D ▾',
             [
-                { value: 'line',     label: 'Line'          },
-                { value: 'triangle', label: 'Triangle'       },
-                { value: 'arc',      label: 'Arc'            },
-                { value: 'circle',   label: 'Circle'         },
-                { value: 'polygon',  label: 'Polygon'        },
-                { value: 'polytope', label: 'Conv. Polygon'  },
+                { value: 'line',     label: 'Line',         hint: 'A straight line segment between two points.' },
+                { value: 'triangle', label: 'Triangle',     hint: 'A simple three-sided shape.' },
+                { value: 'arc',      label: 'Arc',          hint: 'A curved slice of a circle, like a rainbow or a crescent.' },
+                { value: 'circle',   label: 'Circle',       hint: 'A perfect round shape.' },
+                { value: 'polygon',  label: 'Polygon',      hint: 'A shape with equal sides, like a hexagon or octagon.' },
+                { value: 'polytope', label: 'Conv. Polygon', hint: 'A custom shape you outline yourself, point by point.' },
             ],
             (v) => _dispatchAdd(v, { value: v })
         );
@@ -444,13 +584,13 @@ function _isConvexPolygon(vertices) {
         const _3dDropdown = _makeCustomDropdown(
             '3D ▾',
             [
-                { value: 'sphere',   label: 'Sphere'    },
-                { value: 'box',      label: 'Box'       },
-                { value: 'cylinder', label: 'Cylinder'  },
-                { value: 'capsule',  label: 'Capsule'   },
-                { value: 'torus',    label: 'Torus'     },
-                { value: 'cone',     label: 'Cone'      },
-                { value: 'plane',    label: 'Plane'     },
+                { value: 'sphere',   label: 'Sphere',   hint: 'A round ball.' },
+                { value: 'box',      label: 'Box',      hint: 'A cube or rectangular block.' },
+                { value: 'cylinder', label: 'Cylinder', hint: 'A tube or pillar shape.' },
+                { value: 'capsule',  label: 'Capsule',  hint: 'A cylinder with rounded, pill-like ends.' },
+                { value: 'torus',    label: 'Torus',    hint: 'A ring or donut shape.' },
+                { value: 'cone',     label: 'Cone',     hint: 'A shape that tapers to a point, like an ice cream cone.' },
+                { value: 'plane',    label: 'Plane',    hint: 'An endless flat surface, like a floor with no edges.' },
             ],
             (v) => _dispatchAdd(v, { value: v })
         );
@@ -461,17 +601,18 @@ function _isConvexPolygon(vertices) {
         const _xformDropdown = _makeCustomDropdown(
             'Transform ▾',
             [
-                { value: 'extrude',       label: 'Extrude'          },
-                { value: 'revolve',       label: 'Revolve'          },
-                { value: 'tiling',        label: 'Tiling'           },
-                { value: 'symmetryfold',  label: 'Sym. Fold'        },
-                { value: 'symmetryorbit', label: 'Sym. Orbit'       },
-                { value: 'mobius',        label: 'Möbius'           },
-                { value: 'noisedisplace', label: 'Noise Disp.'      },
-                { value: 'twist',         label: 'Twist'            },
-                { value: 'bend',          label: 'Bend'             },
-                { value: 'repeat',        label: 'Repeat'           },
-                { value: 'position3d',    label: 'Position / Orient'},
+                { value: 'extrude',       label: 'Extrude',           hint: 'Pushes a flat shape through space to give it depth, turning 2D into 3D.' },
+                { value: 'revolve',       label: 'Revolve',           hint: 'Spins a flat shape around a line to make a solid, like a potter\'s wheel.' },
+                { value: 'tiling',        label: 'Tiling / Repeat',   hint: 'Repeats the shape in a pattern — infinitely, or a limited number of times with exact count and spacing control.' },
+                { value: 'symmetryfold',  label: 'Sym. Fold',         hint: 'Mirrors the shape like a kaleidoscope.' },
+                { value: 'symmetryorbit', label: 'Sym. Orbit',        hint: 'Places several copies of the shape in a circle around a center point.', advanced: true },
+                { value: 'mobius',        label: 'Möbius',            hint: 'An experimental, swirling warp. Results can be surprising — just try values and see.', advanced: true },
+                { value: 'noisedisplace', label: 'Noise Disp.',       hint: 'Adds a bumpy, organic texture to the surface.' },
+                { value: 'twist',         label: 'Twist',             hint: 'Twists the shape like wringing a towel.' },
+                { value: 'bend',          label: 'Bend',              hint: 'Curves the shape, like bending a straw.' },
+                // 'position3d' (Position / Orient) intentionally removed —
+                // redundant now that every node has its own Transform
+                // section. NodeSpec/evaluators left intact for old scenes.
             ],
             (v) => _dispatchAdd(v, { value: v })
         );
@@ -485,15 +626,29 @@ function _isConvexPolygon(vertices) {
         const _blendDropdown = _makeCustomDropdown(
             'Blend ▾',
             [
-                { value: 'schurBlend',    label: 'Schur'       },
-                { value: 'rUnion',        label: 'R-Union'     },
-                { value: 'rIntersection', label: 'R-Intersect' },
-                { value: 'rDifference',   label: 'R-Difference'},
+                { value: 'rBlend',     label: 'R-Blend', hint: 'Combines two shapes — merge them, keep only the overlap, or cut one from the other. Choose which on the card.' },
+                { value: 'morphBlend', label: 'Morph',   hint: 'Smoothly dissolves from the first shape into the second shape.' },
+                { value: 'embedNode',  label: 'Emboss / Engrave', hint: 'Decorates the surface of one shape with another, in a small area you choose.' },
+                { value: 'schurBlend', label: 'Schur',    hint: 'Like R-Blend, but with extra fine control over the seam — useful when a blend looks too thin or hollow.', advanced: true },
             ],
             (v) => _dispatchAdd(v, { value: v })
         );
         _blendDropdown.el.title = 'Click a blend mode to add it to the graph';
         toolbar.appendChild(_blendDropdown.el);
+        // ── Mapper dropdown ───────────────────────────────────────────────────
+        const _mapperDropdown = _makeCustomDropdown(
+            'Mapper ▾',
+            [
+                { value: 'polynomialMapper',  label: 'Polynomial',  hint: 'Warps the edge based on distance — can create a bulging or pinched boundary.' },
+                { value: 'sinusoidalMapper',  label: 'Sinusoidal',  hint: 'Adds rippling rings inside and outside the edge. Can pulse in and out over time.' },
+                { value: 'exponentialMapper', label: 'Exponential', hint: 'Stretches the falloff unevenly — sharp near the edge, soft further out.', advanced: true },
+                { value: 'logarithmicMapper', label: 'Logarithmic', hint: 'Compresses the falloff unevenly — soft near the edge, sharp further out.', advanced: true },
+                { value: 'powerMapper',       label: 'Power',        hint: 'Reshapes the falloff curve — try different strengths for different effects.', advanced: true },
+            ],
+            (v) => _dispatchAdd(v, { value: v })
+        );
+        _mapperDropdown.el.title = 'Add a mapper, then drag-connect it into a shape\'s "mapper" input to reshape its edge.';
+        toolbar.appendChild(_mapperDropdown.el);
 
         // ── Section 3: HISTORY ────────────────────────────────────────────────
         // Camera zoom, view presets, card layout, and card zoom have all moved
@@ -600,6 +755,7 @@ function _isConvexPolygon(vertices) {
         setTimeout(() => { saveBtn.textContent = '💾 Save'; }, 1500);
       }
     });
+    saveBtn.title = 'Save your current scene so you can come back to it later.';
     saveBtn.style.cssText += 'border-color: rgba(80,180,80,0.4); color: rgba(160,255,160,0.9);';
     toolbar.appendChild(saveBtn);
 
@@ -727,6 +883,7 @@ function _isConvexPolygon(vertices) {
         }
       }, 100);
     });
+    loadBtn.title = 'Open a scene you saved earlier.';
     loadBtn.style.cssText += 'border-color: rgba(80,140,255,0.4); color: rgba(160,200,255,0.9);';
     toolbar.appendChild(loadBtn);
 
@@ -747,6 +904,29 @@ function _isConvexPolygon(vertices) {
     _feedbackBtn.title = 'Share feedback or report an issue (opens in a new tab)';
     _feedbackBtn.style.cssText += 'border-color: rgba(150,150,255,0.3); color: rgba(190,190,255,0.85);';
     toolbar.appendChild(_feedbackBtn);
+
+    // ── Advanced-mode toggle (Phase 6a) ──────────────────────────────────────
+    // Session-only state (not persisted across reloads — mirrors
+    // _sidebarPinned). Off by default: hides the Pivot sub-section on every
+    // NodeCard's Transform section, and the GLSL shader export row in the
+    // Export panel — the two controls identified as genuinely advanced
+    // (requiring the unfamiliar "pivot" concept, or only useful to someone
+    // embedding output elsewhere). Everything else stays visible regardless
+    // of this toggle, including keyboard shortcuts and drag gestures, since
+    // those add no visible clutter to begin with.
+    this._advancedMode = false;
+    const _advancedBtn = this._makeButton('⚙ Advanced', () => {
+        this._advancedMode = !this._advancedMode;
+        document.body.classList.toggle('nc-tier-advanced', this._advancedMode);
+        document.body.classList.toggle('nc-tier-basic', !this._advancedMode);
+        _advancedBtn.style.background = this._advancedMode
+            ? 'rgba(127,119,221,0.35)' : 'rgba(255,255,255,0.08)';
+        _advancedBtn.style.borderColor = this._advancedMode
+            ? 'rgba(127,119,221,0.7)' : 'rgba(255,255,255,0.15)';
+    });
+    _advancedBtn.title = 'Show advanced controls (pivot placement, shader export). ' +
+        'Off by default to keep the interface simple for common tasks.';
+    toolbar.appendChild(_advancedBtn);
 
     
         this._overlay.appendChild(toolbar);
@@ -781,6 +961,12 @@ function _isConvexPolygon(vertices) {
         canvasArea.appendChild(this._inner);
 
         this._overlay.appendChild(canvasArea);
+        // Basic tier by default. Applied to document.body, NOT this._overlay —
+        // several floating panels (export panel, preset panel, view menu,
+        // dropdown panels) attach directly to document.body rather than the
+        // overlay's subtree, so an overlay-scoped class would never reach
+        // them. document.body is an ancestor of everything.
+        document.body.classList.add('nc-tier-basic');
         document.body.appendChild(this._overlay);
 
         // ── EdgeRenderer ──────────────────────────────────────────────────────
@@ -1113,81 +1299,84 @@ function _isConvexPolygon(vertices) {
         _camResetBtn.style.cssText += 'flex:1; min-width:0; font-size:11px;';
         camRow2.appendChild(_camResetBtn);
 
-        // ── Auto-orbit speed slider ───────────────────────────────────────
-        // Controls how fast the camera revolves when auto-orbit (R key) is
-        // active. Graduated from very slow (0.5 — cinematic, good for long
-        // establishing shots) to fast (10.0 — quick demo spins). Updates
-        // live even while orbit is already running, so the user can dial
-        // in the right speed while watching the result.
-        const orbitSpeedRow = document.createElement('div');
-        orbitSpeedRow.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 6px;
-            margin-bottom: 2px;
+        // ── Orbit generator dropdown ───────────────────────────────────────
+        // Replaces OrbitControls.autoRotate (fixed-axis circular only) with
+        // the pluggable generator registry in orbitGenerators.js. Circular
+        // remains the default/cheapest option; the others are opt-in.
+        const orbitGenRow = document.createElement('div');
+        orbitGenRow.style.cssText = 'display:flex; align-items:center; gap:8px; margin-top:8px;';
+        const orbitGenLabel = document.createElement('label');
+        orbitGenLabel.textContent = 'Orbit path';
+        orbitGenLabel.title = 'Which camera path auto-orbit (R key) follows.';
+        orbitGenLabel.style.cssText = 'font-size:12px; opacity:0.75; min-width:72px; flex-shrink:0; cursor:help; color:rgba(220,220,230,0.9);';
+        const orbitGenSelect = document.createElement('select');
+        orbitGenSelect.style.cssText = `
+            background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 4px; color: rgba(255,255,255,0.8); font-size: 11px;
+            padding: 3px 4px; flex: 1; min-width: 0; cursor: pointer;
         `;
+        [
+            ['circular', 'Circular'],
+            ['spiral', 'Spiral'],
+            ['lissajous', 'Lissajous'],
+            ['curvatureGuided', 'Curvature-Guided'],
+        ].forEach(([val, label]) => {
+            const o = document.createElement('option');
+            o.value = val; o.textContent = label;
+            o.style.backgroundColor = '#1c1c22'; o.style.color = 'rgba(220,220,230,0.95)';
+            if (val === this._orbitGenerator) o.selected = true;
+            orbitGenSelect.appendChild(o);
+        });
+        this._orbitGenerator = this._orbitGenerator || 'circular';
+        orbitGenSelect.addEventListener('change', () => {
+            this._orbitGenerator = orbitGenSelect.value;
+            recomputeBtn.style.display = this._orbitGenerator === 'curvatureGuided' ? 'block' : 'none';
+            if (this.sceneManager.isOrbitActive()) {
+                this.sceneManager.startOrbit(this._orbitGenerator, { speed: this._autoOrbitSpeed });
+            }
+        });
+        orbitGenRow.appendChild(orbitGenLabel);
+        orbitGenRow.appendChild(orbitGenSelect);
+        camSection.appendChild(orbitGenRow);
 
+        // ── Orbit speed slider ──────────────────────────────────────────────
+        const orbitSpeedRow = document.createElement('div');
+        orbitSpeedRow.style.cssText = 'display:flex; align-items:center; gap:8px; margin-top:6px; margin-bottom:2px;';
         const orbitSpeedLabel = document.createElement('label');
         orbitSpeedLabel.textContent = 'Orbit speed';
-        orbitSpeedLabel.title = 'Auto-orbit rotation speed (R key). ' +
-            'Slow (left) for cinematic shots and GIFs. ' +
-            'Fast (right) for quick demo spins. ' +
-            'Updates live while orbit is running.';
-        orbitSpeedLabel.style.cssText = `
-            font-size: 12px;
-            opacity: 0.75;
-            min-width: 72px;
-            flex-shrink: 0;
-            cursor: help;
-            white-space: nowrap;
-            color: rgba(220,220,230,0.9);
-        `;
-
+        orbitSpeedLabel.title = 'Auto-orbit speed (R key). Slow (left) for cinematic shots, fast (right) for quick demo spins.';
+        orbitSpeedLabel.style.cssText = 'font-size:12px; opacity:0.75; min-width:72px; flex-shrink:0; cursor:help; color:rgba(220,220,230,0.9);';
         const orbitSpeedSlider = document.createElement('input');
-        orbitSpeedSlider.type  = 'range';
-        orbitSpeedSlider.min   = '0.5';
-        orbitSpeedSlider.max   = '10.0';
-        orbitSpeedSlider.step  = '0.5';
+        orbitSpeedSlider.type = 'range';
+        orbitSpeedSlider.min = '0.05'; orbitSpeedSlider.max = '2.0'; orbitSpeedSlider.step = '0.05';
         orbitSpeedSlider.value = String(this._autoOrbitSpeed);
         orbitSpeedSlider.title = orbitSpeedLabel.title;
-        orbitSpeedSlider.style.cssText = `
-            flex: 1;
-            min-width: 0;
-            height: 14px;
-            accent-color: #378ADD;
-            cursor: pointer;
-        `;
-
+        orbitSpeedSlider.style.cssText = 'flex:1; min-width:0; height:14px; accent-color:#378ADD; cursor:pointer;';
         const orbitSpeedDisplay = document.createElement('span');
-        orbitSpeedDisplay.textContent = this._autoOrbitSpeed.toFixed(1);
-        orbitSpeedDisplay.style.cssText = `
-            font-size: 11px;
-            opacity: 0.8;
-            min-width: 28px;
-            text-align: right;
-            font-variant-numeric: tabular-nums;
-            flex-shrink: 0;
-            color: rgba(220,220,230,0.85);
-        `;
-
+        orbitSpeedDisplay.textContent = this._autoOrbitSpeed.toFixed(2);
+        orbitSpeedDisplay.style.cssText = 'font-size:11px; opacity:0.8; min-width:32px; text-align:right; font-variant-numeric:tabular-nums; flex-shrink:0; color:rgba(220,220,230,0.85);';
         orbitSpeedSlider.addEventListener('input', () => {
             const val = parseFloat(orbitSpeedSlider.value);
             this._autoOrbitSpeed = val;
-            orbitSpeedDisplay.textContent = val.toFixed(1);
-
-            // Apply live if orbit is currently running — user sees the
-            // speed change immediately without needing to stop and restart.
-            const ctrl = this.sceneManager.controls;
-            if (ctrl && ctrl.autoRotate) {
-                ctrl.autoRotateSpeed = val;
+            orbitSpeedDisplay.textContent = val.toFixed(2);
+            if (this.sceneManager.isOrbitActive()) {
+                this.sceneManager.startOrbit(this._orbitGenerator, { speed: val });
             }
         });
-
         orbitSpeedRow.appendChild(orbitSpeedLabel);
         orbitSpeedRow.appendChild(orbitSpeedSlider);
         orbitSpeedRow.appendChild(orbitSpeedDisplay);
         camSection.appendChild(orbitSpeedRow);
+
+        // ── Recompute Interest Map button (curvature-guided only) ───────────
+        const recomputeBtn = this._makeButton('🔍 Recompute Interest Map', () => {
+            this.sceneManager.computeCurvatureInterestMap();
+            this._showToast('Curvature interest map recomputed.', 1500);
+        });
+        recomputeBtn.title = 'Re-scan the scene for high-curvature (visually interesting) regions after a major edit.';
+        recomputeBtn.style.cssText += 'margin-top:6px; width:100%; font-size:11px;';
+        recomputeBtn.style.display = this._orbitGenerator === 'curvatureGuided' ? 'block' : 'none';
+        camSection.appendChild(recomputeBtn);
 
         // ════════════════════════════════════════════════════════════════════
         // SECTION 2 — LAYOUT
@@ -1587,6 +1776,19 @@ function _isConvexPolygon(vertices) {
         if (this._open) return;
         this._open = true;
 
+        // One-time rollout notice (Phase 6a) — existing users who relied on
+        // Pivot being visible by default need a pointer to where it went.
+        // Fires once per session, on first open only.
+        if (!this._advancedRolloutShown) {
+            this._advancedRolloutShown = true;
+            setTimeout(() => {
+                this._showToast(
+                    'Interface simplified — click ⚙ Advanced (top right) to show pivot placement and shader export.',
+                    5000
+                );
+            }, 600);
+        }
+
         this._overlay.style.display = 'flex';
         this._resizeCanvas();
 
@@ -1614,6 +1816,12 @@ function _isConvexPolygon(vertices) {
         if (!this._viewportDragAttached) {
         this._attachViewportDrag();
         this._viewportDragAttached = true;
+        }
+
+        // Attach click-to-select picking once
+        if (!this._viewportPickingAttached) {
+        this._attachViewportPicking();
+        this._viewportPickingAttached = true;
         }
 
     // Auto-layout on first open, or if new nodes have been added at origin
@@ -1726,7 +1934,15 @@ function _isConvexPolygon(vertices) {
               this._drawEdges();
             },
             (nodeId, previewCanvas) => this._renderSDFPreview(nodeId, previewCanvas),
-            this._undo
+            this._undo,
+            (nodeId, field, value) => this._onTransformChange(nodeId, field, value),
+            (nodeId, isOpen) => this._onTransformSectionToggle(nodeId, isOpen),
+            (nodeId) => {
+                const hostEdge = this.stateStore.nodeGraph.getIncomingEdge(nodeId, 'hostSdf');
+                this._armAnchorPicking(nodeId, hostEdge?.fromNode);
+            },
+            (nodeId) => this._autoFitMorph(nodeId),
+            (nodeId) => this._autoFitEmbedGuest(nodeId)
         );
 
         // Select on header click
@@ -1749,6 +1965,8 @@ function _isConvexPolygon(vertices) {
             `Delete "${nodeType}" node #${nodeId} and all its connections?`
           )) return;
 
+          this.sceneManager.hidePivotGizmo();
+          this._activeGizmoNodeId = null;
           this._undo.snapshot();
           const graph = this.stateStore.nodeGraph;
 
@@ -1830,6 +2048,11 @@ function _isConvexPolygon(vertices) {
     _deleteSelectedNodes() {
         const idsToDelete = [...this._selectedIds];
         if (idsToDelete.length === 0) return;
+
+        // Hide the gizmo unconditionally — simpler and safer than tracking
+        // which specific node it was attached to and checking membership.
+        this.sceneManager.hidePivotGizmo();
+        this._activeGizmoNodeId = null;
 
         this._undo.snapshot();
         const graph = this.stateStore.nodeGraph;
@@ -1948,6 +2171,8 @@ function _isConvexPolygon(vertices) {
         }
 
         if (nodeId === null) {
+            this.sceneManager.hidePivotGizmo();
+            this._activeGizmoNodeId = null;
             // Selection cleared — re-evaluate bridge availability now that
             // no specific node is selected (Priority 2 logic takes over).
             this._updateDropdownAvailability();
@@ -1960,17 +2185,38 @@ function _isConvexPolygon(vertices) {
         card.el.style.outline = '2px solid rgba(100,180,255,0.8)';
         card.el.style.outlineOffset = '2px';
         }
+        // NOTE: the pivot gizmo is deliberately NOT shown here. Selecting a
+        // card (e.g. to drag it around the graph canvas) is a different
+        // intent from wanting to see/edit that node's placement — the
+        // gizmo is triggered by _onTransformSectionToggle instead, which
+        // fires only when the card's Transform section is actually opened.
         // Re-evaluate bridge availability for the newly selected node.
         this._updateDropdownAvailability();
-    }  
+    } 
 
+    /**
+     * Viewport spatial drag — moves a selected node's POSITION or PIVOT
+     * directly in 3D, with optional snapping to landmark points on other
+     * (or, for pivot, the same) shapes.
+     *
+     * Gesture scheme:
+     *   Alt + Left-drag         → move position
+     *   Alt + Shift + Left-drag → move pivot
+     *   Ctrl (held during drag) → temporarily inverts the dragged node's
+     *                             card Snap toggle for this drag only
+     *                             (Blender convention: on→off or off→on)
+     *
+     * Snapping is scoped to SINGLE-node selections only — with multiple
+     * nodes selected, which one's nearby point should govern the whole
+     * group's snap has no single correct answer, so multi-select drags
+     * always use plain pixel-delta movement, unchanged from before.
+     */
     _attachViewportDrag() {
         const renderer = this.sceneManager.renderer.domElement;
         let isDragging = false;
+        let dragMode   = null; // 'position' | 'pivot'
         let lastX, lastY;
 
-        // World units per pixel — matches OrbitControls pan speed exactly
-        // so alt+drag feels identical to plain drag but for one shape only
         const pixelToWorld = () => {
         const cam    = this.sceneManager.camera;
         const dist   = cam.position.distanceTo(
@@ -1984,59 +2230,93 @@ function _isConvexPolygon(vertices) {
         if (!e.altKey || this._selectedIds.size === 0) return;
         e.preventDefault();
         e.stopPropagation();
-        // Disable OrbitControls so the camera does not move during shape drag
         this.sceneManager.controls.enabled = false;
         this._undo.snapshot();
         isDragging = true;
+        dragMode = e.shiftKey ? 'pivot' : 'position';
         lastX = e.clientX;
         lastY = e.clientY;
-        renderer.style.cursor = 'move';
+        renderer.style.cursor = dragMode === 'pivot' ? 'crosshair' : 'move';
         });
 
         document.addEventListener('mousemove', (e) => {
         if (!isDragging) return;
-        const scale = pixelToWorld();
-        const dx =  (e.clientX - lastX) * scale;
-        const dy = -(e.clientY - lastY) * scale;
+        const graph = this.stateStore.nodeGraph;
+        const singleNodeId = this._selectedIds.size === 1
+            ? [...this._selectedIds][0] : null;
+
+        let snapped = false;
+
+        if (singleNodeId !== null) {
+            const card = this._cards.get(singleNodeId);
+            const baseSnapOn = card ? card._snapEnabled : false;
+            const effectiveSnap = e.ctrlKey ? !baseSnapOn : baseSnapOn;
+
+            if (effectiveSnap) {
+                const candidate = this.sceneManager.findNearestSnapPoint(
+                    e.clientX, e.clientY, dragMode, singleNodeId, 24
+                );
+                if (candidate) {
+                    this.sceneManager.showSnapHighlight(candidate.world);
+                    this._applySnapCandidate(singleNodeId, dragMode, candidate);
+                    snapped = true;
+                } else {
+                    this.sceneManager.hideSnapHighlight();
+                }
+            } else {
+                this.sceneManager.hideSnapHighlight();
+            }
+        }
+
+        if (!snapped) {
+            const scale = pixelToWorld();
+            const dx =  (e.clientX - lastX) * scale;
+            const dy = -(e.clientY - lastY) * scale;
+
+            this._selectedIds.forEach(nodeId => {
+                const node = graph.nodes.get(nodeId);
+                if (!node || !node.transform) return;
+                const fieldX = dragMode === 'pivot' ? 'pivotX' : 'posX';
+                const fieldY = dragMode === 'pivot' ? 'pivotY' : 'posY';
+                const newX = (node.transform[fieldX] || 0) + dx;
+                const newY = (node.transform[fieldY] || 0) + dy;
+
+                graph.updateNodeTransform(nodeId, fieldX, newX);
+                graph.updateNodeTransform(nodeId, fieldY, newY);
+
+                const card = this._cards.get(nodeId);
+                if (card) {
+                    card.updateTransformParam(fieldX, newX);
+                    card.updateTransformParam(fieldY, newY);
+                }
+                const primEntry = this.sceneManager.activePrimitives.find(
+                    p => p.instance.id === nodeId
+                );
+                if (primEntry) {
+                    this.sceneManager._applyNodeTransformToMesh(nodeId, primEntry.object);
+                }
+                if (this._activeGizmoNodeId === nodeId) {
+                    this.sceneManager.showPivotGizmo(nodeId);
+                }
+            });
+        }
+
         lastX = e.clientX;
         lastY = e.clientY;
 
-        // Move all selected shapes
-        this._selectedIds.forEach(nodeId => {
-            const node  = this.stateStore.nodeGraph.nodes.get(nodeId);
-            const shape = this.stateStore.getShape(nodeId);
-            if (!node || !shape) return;
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
 
-            const newX = (node.params.posX || 0) + dx;
-            const newY = (node.params.posY || 0) + dy;
-
-            // Update node graph record
-            this.stateStore.nodeGraph.updateNodeParam(nodeId, 'posX', newX);
-            this.stateStore.nodeGraph.updateNodeParam(nodeId, 'posY', newY);
-
-            // Update card slider display
-            const card = this._cards.get(nodeId);
-            if (card) {
-            card.updateParam('posX', newX);
-            card.updateParam('posY', newY);
-            }
-
-            // Update the live shape instance
-            if (typeof shape.updateParameters === 'function') {
-            shape.updateParameters({ position: { x: newX, y: newY } });
-            this.stateStore.triggerVisualUpdate(nodeId);
-            }
-        });
-
-        // Re-render after movement settles
+        // Re-render regardless of prior compose history — see the
+        // _onTransformChange/_onParamChange fix for why the old
+        // currentSchur-gated version silently went stale in Marching
+        // Squares mode; same fix applied here.
         clearTimeout(this._recomposeTimer);
         this._recomposeTimer = setTimeout(() => {
-            if (this.sceneManager.currentSchur) {
-            const current = this.sceneManager.currentSchur.instance;
-            this.sceneManager.rerender(
-                this.renderParams.method,
-                pt => current.computeSDF(pt)
-            );
+            const sdf = this.sceneManager.evaluator.getRootSDF();
+            if (sdf) {
+                this.sceneManager.renderSDF(sdf, this._getOutputParam('renderMethod'));
             }
         }, 150);
         });
@@ -2044,12 +2324,175 @@ function _isConvexPolygon(vertices) {
         document.addEventListener('mouseup', () => {
         if (isDragging) {
             isDragging = false;
-            // Re-enable OrbitControls after shape drag completes
+            dragMode = null;
             this.sceneManager.controls.enabled = true;
+            this.sceneManager.hideSnapHighlight();
             renderer.style.cursor = '';
         }
         });
-    }  
+    }
+
+    /**
+     * Write a chosen snap candidate into the dragged node's transform.
+     * See the class-level design comment on _attachViewportDrag for the
+     * position vs. pivot write-back derivations.
+     */
+    _applySnapCandidate(nodeId, mode, candidate) {
+        const graph = this.stateStore.nodeGraph;
+        const node = graph.nodes.get(nodeId);
+        if (!node || !node.transform) return;
+
+        let newX, newY, newZ;
+
+        if (mode === 'position') {
+            newX = candidate.world.x;
+            newY = candidate.world.y;
+            newZ = candidate.world.z;
+            graph.updateNodeTransform(nodeId, 'posX', newX);
+            graph.updateNodeTransform(nodeId, 'posY', newY);
+            graph.updateNodeTransform(nodeId, 'posZ', newZ);
+        } else {
+            if (candidate.isSelf && candidate.local) {
+                // Self point: local coordinate IS the pivot value directly.
+                newX = candidate.local.x;
+                newY = candidate.local.y;
+                newZ = candidate.local.z;
+            } else {
+                // Cross-shape point: pivot = targetWorld - position, from
+                // pivotWorld = position + pivot (exact, rotation-invariant).
+                newX = candidate.world.x - (node.transform.posX ?? 0);
+                newY = candidate.world.y - (node.transform.posY ?? 0);
+                newZ = candidate.world.z - (node.transform.posZ ?? 0);
+            }
+            graph.updateNodeTransform(nodeId, 'pivotX', newX);
+            graph.updateNodeTransform(nodeId, 'pivotY', newY);
+            graph.updateNodeTransform(nodeId, 'pivotZ', newZ);
+        }
+
+        const card = this._cards.get(nodeId);
+        if (card) {
+            const fields = mode === 'position'
+                ? ['posX', 'posY', 'posZ']
+                : ['pivotX', 'pivotY', 'pivotZ'];
+            card.updateTransformParam(fields[0], newX);
+            card.updateTransformParam(fields[1], newY);
+            card.updateTransformParam(fields[2], newZ);
+        }
+        const primEntry = this.sceneManager.activePrimitives.find(p => p.instance.id === nodeId);
+        if (primEntry) this.sceneManager._applyNodeTransformToMesh(nodeId, primEntry.object);
+        if (this._activeGizmoNodeId === nodeId) this.sceneManager.showPivotGizmo(nodeId);
+    }
+
+    /**
+     * Attach click-to-select picking on the 3D viewport.
+     *
+     * Listens on the mount CONTAINER (not renderer.domElement) — same
+     * reasoning as OrbitControls' own attachment (see SceneManager
+     * constructor comment): in GLSL/Ray March modes the GPU canvas sits on
+     * top and the Three.js canvas has pointer-events:none, so listening on
+     * the container is the only way this works consistently across all
+     * three render modes.
+     *
+     * Distinguishes a genuine click from the start of an orbit-drag by
+     * movement distance and elapsed time between mousedown and mouseup —
+     * OrbitControls itself has no "click" event, so we track this
+     * ourselves rather than fighting over the same mousedown.
+     */
+    _attachViewportPicking() {
+        const container = this.sceneManager._mountEl;
+        if (!container) return;
+
+        const CLICK_MOVE_THRESHOLD_PX = 5;
+        const CLICK_TIME_THRESHOLD_MS = 350;
+        let downX, downY, downTime;
+
+        container.addEventListener('mousedown', (e) => {
+            // Alt+mousedown is reserved for shape-dragging (_attachViewportDrag)
+            // and middle-mouse/Alt+left is reserved for canvas panning
+            // elsewhere in this file — picking only engages on a plain click.
+            if (e.altKey || e.button !== 0) { downX = undefined; return; }
+            downX = e.clientX;
+            downY = e.clientY;
+            downTime = performance.now();
+        });
+
+        container.addEventListener('mouseup', (e) => {
+            if (downX === undefined) return;
+            const dx = e.clientX - downX;
+            const dy = e.clientY - downY;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const dt = performance.now() - downTime;
+            downX = undefined;
+
+            // Moved too far or held too long — this was an orbit-drag, not
+            // a click. Let OrbitControls' own interpretation stand.
+            if (dist > CLICK_MOVE_THRESHOLD_PX || dt > CLICK_TIME_THRESHOLD_MS) return;
+
+            this._handleViewportClick(e);
+        });
+    }
+
+    _handleViewportClick(e) {
+        // Anchor-picking mode takes priority over normal selection — a
+        // click while armed places the anchor, it never selects a node.
+        if (this._anchorPickMode) {
+            const { embedNodeId, hostNodeId } = this._anchorPickMode;
+            const hit = this.sceneManager.pickSurfacePointOnNode(hostNodeId, e.clientX, e.clientY);
+            this._anchorPickMode = null;
+            this.sceneManager.clearHighlight(hostNodeId);
+
+            if (!hit) {
+                this._showToast('No surface found there — click directly on the glowing shape.', 3000);
+                return;
+            }
+
+            const graph = this.stateStore.nodeGraph;
+            this._undo.snapshot();
+            graph.updateNodeParam(embedNodeId, 'anchorX', hit.x);
+            graph.updateNodeParam(embedNodeId, 'anchorY', hit.y);
+            graph.updateNodeParam(embedNodeId, 'anchorZ', hit.z);
+            const embedNodeRef = graph.nodes.get(embedNodeId);
+            if (embedNodeRef) embedNodeRef._anchorPicked = true;
+            this.sceneManager._lastGLSLSource     = null;
+            this.sceneManager._lastRayMarchSource = null;
+            this.sceneManager.evaluator.invalidate();
+            this._rebuildCards(); // refresh the card's anchor sliders
+            this._renderInPlace();
+            this.sceneManager.showEmbedRegion(embedNodeId);
+            this._embedRegionVisibleFor = embedNodeId;
+            this._showToast('Anchor placed. Click the button again to hide the marker.', 2500);
+            return;
+        }
+
+        const nodeId = this.sceneManager.pickNodeAtScreenPosition(e.clientX, e.clientY);
+        if (nodeId === null) {
+            // Clicked empty space — deselect everything, matching the
+            // existing Escape-key deselect behavior.
+            this._setSelected(null);
+            return;
+        }
+        this._setSelected(nodeId, e.shiftKey);
+
+        // Bring the selected node's card into view if it's currently
+        // scrolled/panned off-screen, so picking in the viewport always
+        // has a visible graph-side result to look at.
+        const card = this._cards.get(nodeId);
+        if (card) {
+            const cardX = card.node.uiPos?.x ?? 0;
+            const cardY = card.node.uiPos?.y ?? 0;
+            const screenX = cardX * this._transform.scale + this._transform.tx;
+            const screenY = cardY * this._transform.scale + this._transform.ty;
+            const areaW = this._bgCanvas.width;
+            const areaH = this._bgCanvas.height;
+            const offScreen = screenX < 0 || screenY < 0 || screenX > areaW || screenY > areaH;
+            if (offScreen) {
+                this._transform.tx += (areaW / 2) - screenX;
+                this._transform.ty += (areaH / 2) - screenY;
+                this._applyTransform();
+                this._drawEdges();
+            }
+        }
+    }
 
     // ── Edge drawing ──────────────────────────────────────────────────────────
 
@@ -2248,18 +2691,297 @@ function _isConvexPolygon(vertices) {
         if (paramName === 'isoOffset')  this.schurParams.isoOffset   = value;
         }
 
-        // Re-render after param change
-        if (this.sceneManager.currentSchur) {
+       // Re-render after param change — same fix as _onTransformChange:
+        // _renderInPlace() is mode-aware and does not depend on a previous
+        // compose having already happened, unlike the old currentSchur-
+        // gated block this replaces.
         clearTimeout(this._recomposeTimer);
         this._recomposeTimer = setTimeout(() => {
-            // For cascade compositions, re-render using the existing instance
-            // directly — do NOT call compose() which would rebuild the cascade.
-            const current = this.sceneManager.currentSchur.instance;
-            this.sceneManager.rerender(
-            this.renderParams.method,
-            pt => current.computeSDF(pt)
-            );
+            this._renderInPlace();
         }, 300);
+    }
+
+    /**
+     * Handle a transform slider change (posX/Y/Z, pivotX/Y/Z, rotateX/Y/Z,
+     * scale) from a NodeCard's Transform section. Structurally parallel to
+     * _onParamChange, but writes through updateNodeTransform and, for
+     * geometry primitives, also updates the live Three.js preview mesh
+     * directly (primitives no longer know their own placement — see
+     * SceneManager._applyNodeTransformToMesh).
+     */
+    _onTransformChange(nodeId, field, value) {
+        // Any transform change can affect the generated GLSL (every node's
+        // wrapper is regenerated from its transform block), so always
+        // invalidate shader caches, same as _onParamChange does for params.
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+
+        // If this node has a live Three.js preview mesh (i.e. it's a
+        // geometry primitive currently in activePrimitives), keep its mesh
+        // in sync immediately so Marching Squares mode reflects the change
+        // without waiting for a full rebuild.
+        const primEntry = this.sceneManager.activePrimitives.find(
+            p => p.instance.id === nodeId
+        );
+        if (primEntry) {
+            this.sceneManager._applyNodeTransformToMesh(nodeId, primEntry.object);
+        }
+        // Keep the gizmo's position live while dragging, IF it's currently
+        // showing for this node. Singleton gizmo: SceneManager tracks at
+        // most one active node internally, so just re-call showPivotGizmo —
+        // it's a no-op-shaped refresh when nodeId isn't the currently shown
+        // one, since showPivotGizmo(nodeId) always (re)targets whichever
+        // node is passed to it.
+        if (this._activeGizmoNodeId === nodeId) {
+            this.sceneManager.showPivotGizmo(nodeId);
+        }
+
+        this.sceneManager.evaluator.invalidate();
+
+        // Re-render regardless of render mode, and regardless of whether a
+        // previous CPU compose has already happened this session.
+        //
+        // BUG FIX: the old version gated this behind
+        // `if (this.sceneManager.currentSchur)`. currentSchur is only set
+        // after the user has explicitly clicked Render (or touched an
+        // Output-panel slider) at least once — switching TO Marching
+        // Squares mode via the toolbar does NOT itself compose anything.
+        // A graph only ever viewed in Ray March mode therefore had
+        // currentSchur === null, so this block silently did nothing —
+        // the SDF data was always correct (Ray March re-renders every
+        // frame unconditionally and proves it), only the Marching Squares
+        // VIEW was stale. _renderInPlace() is mode-aware and has no such
+        // dependency on prior render history.
+        clearTimeout(this._recomposeTimer);
+        this._recomposeTimer = setTimeout(() => {
+            this._renderInPlace();
+        }, 150);
+    }
+
+    /**
+     * Called when a NodeCard's Transform section is expanded or collapsed.
+     * This — not card selection — is the actual trigger for the pivot
+     * gizmo, since opening Transform is a real statement of intent to look
+     * at/edit placement, while selecting a card's header (e.g. to drag it
+     * around the graph canvas) is unrelated graph-editing behavior.
+     */
+    _onTransformSectionToggle(nodeId, isOpen) {
+        if (isOpen) {
+            this._activeGizmoNodeId = nodeId;
+            this.sceneManager.showPivotGizmo(nodeId);
+        } else if (this._activeGizmoNodeId === nodeId) {
+            this._activeGizmoNodeId = null;
+            this.sceneManager.hidePivotGizmo();
+        }
+
+        // embedNode also gets its anchor+region ring shown/hidden in step
+        // with its own Transform section, so opening it to check placement
+        // shows both the pivot AND the decoration boundary together.
+        const node = this.stateStore.nodeGraph.nodes.get(nodeId);
+        if (node?.type === 'embedNode') {
+            if (isOpen) {
+                this.sceneManager.showEmbedRegion(nodeId);
+                this._embedRegionVisibleFor = nodeId;
+            } else if (this._embedRegionVisibleFor === nodeId) {
+                // Only hide if THIS node's ring is the one currently
+                // showing — same singleton-safety fix already applied to
+                // the pivot gizmo elsewhere in this file.
+                this.sceneManager.hideEmbedRegion();
+                this._embedRegionVisibleFor = null;
+            }
+        }
+    }
+
+    /**
+     * Arm anchor-picking mode for an embedNode. The host shape glows so
+     * the user is never confused about which geometry a click will
+     * anchor to. The next viewport click (handled in _handleViewportClick)
+     * consumes this mode and places the anchor there.
+     */
+    /**
+     * Three-state toggle for embedNode's anchor UI:
+     *   idle → armed (click a point) → placed (ring stays visible, click
+     *   the button again to hide) → idle.
+     * This is the answer to "how do I turn the anchor ring off": click the
+     * same "🎯 Pick Anchor on Surface" button again once it's placed.
+     */
+    _armAnchorPicking(embedNodeId, hostNodeId) {
+        // Currently mid-pick for this exact node — treat as cancel.
+        if (this._anchorPickMode?.embedNodeId === embedNodeId) {
+            this.sceneManager.clearHighlight(this._anchorPickMode.hostNodeId);
+            this.sceneManager.hideEmbedRegion();
+            this._anchorPickMode = null;
+            this._embedRegionVisibleFor = null;
+            this._showToast('Anchor picking cancelled.', 1500);
+            return;
+        }
+        // Ring already showing for this node (a previous placement) and
+        // we're not picking — treat this click as "hide it".
+        if (!this._anchorPickMode && this._embedRegionVisibleFor === embedNodeId) {
+            this.sceneManager.hideEmbedRegion();
+            this._embedRegionVisibleFor = null;
+            return;
+        }
+        if (hostNodeId == null) {
+            this._showToast('Connect a shape to this node\'s host input first.', 3000);
+            return;
+        }
+        this._anchorPickMode = { embedNodeId, hostNodeId };
+        this.sceneManager.highlightNode(hostNodeId, 1e9);
+        this.sceneManager.showEmbedRegion(embedNodeId);
+        this._embedRegionVisibleFor = embedNodeId;
+        this._showToast('Click a point on the glowing shape to place the decoration. Click the button again to cancel.', 6000);
+    }
+
+    /**
+     * Auto-Fit: samples both of a morphBlend node's source shapes'
+     * approximate radius, scales each (relative to its current scale, not
+     * overwriting deliberate choices) so both read as roughly the same
+     * size, and aligns their positions to a shared centroid — the two
+     * most common causes of a broken-looking morph (one shape swallowing
+     * the other, or a shape barely visible at t=0.5).
+     */
+    _autoFitMorph(morphNodeId) {
+        const graph = this.stateStore.nodeGraph;
+        const edgeA = graph.getIncomingEdge(morphNodeId, 'sdfA');
+        const edgeB = graph.getIncomingEdge(morphNodeId, 'sdfB');
+        if (!edgeA || !edgeB) {
+            this._showToast('Connect two shapes to this node\'s sdfA and sdfB inputs first.', 3000);
+            return;
+        }
+        const nodeAId = edgeA.fromNode, nodeBId = edgeB.fromNode;
+        const nodeA = graph.nodes.get(nodeAId), nodeB = graph.nodes.get(nodeBId);
+        if (!nodeA || !nodeB) return;
+
+        const radiusA = this.sceneManager.estimateNodeRadius(nodeAId);
+        const radiusB = this.sceneManager.estimateNodeRadius(nodeBId);
+        if (!isFinite(radiusA) || !isFinite(radiusB) || radiusA <= 0 || radiusB <= 0) {
+            this._showToast('Could not measure one of the shapes — try again after adjusting it.', 3000);
+            return;
+        }
+
+        this._undo.snapshot();
+
+        const target    = (radiusA + radiusB) / 2;
+        const curScaleA = nodeA.transform?.scale ?? 1;
+        const curScaleB = nodeB.transform?.scale ?? 1;
+        graph.updateNodeTransform(nodeAId, 'scale', curScaleA * (target / radiusA));
+        graph.updateNodeTransform(nodeBId, 'scale', curScaleB * (target / radiusB));
+
+        const cx = ((nodeA.transform?.posX ?? 0) + (nodeB.transform?.posX ?? 0)) / 2;
+        const cy = ((nodeA.transform?.posY ?? 0) + (nodeB.transform?.posY ?? 0)) / 2;
+        const cz = ((nodeA.transform?.posZ ?? 0) + (nodeB.transform?.posZ ?? 0)) / 2;
+        [nodeAId, nodeBId].forEach(id => {
+            graph.updateNodeTransform(id, 'posX', cx);
+            graph.updateNodeTransform(id, 'posY', cy);
+            graph.updateNodeTransform(id, 'posZ', cz);
+        });
+
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
+        this._rebuildCards();
+        this._renderInPlace();
+        this._showToast('Auto-fit applied — both shapes scaled and centered to match.', 2500);
+    }
+
+    /**
+     * Auto-Fit Guest to Region: removes the manual "wrestle the guest's
+     * Transform into place" step for embedNode. Resets the guest's own
+     * position to (0,0,0) (its coordinates are already relative to the
+     * anchor's local frame, so a non-zero position there just means an
+     * unwanted extra offset), scales it to comfortably fit within depth
+     * (usually the tighter of the two constraints for a shallow relief),
+     * and — if the guest is a Repeat node or a finite-extent Tiling node —
+     * shrinks its SPACING (never its count, which is a deliberate user
+     * choice) so the whole array's footprint fits within regionSize.
+     *
+     * Deliberately NOT solving "how many copies should there be" — that
+     * would mean overriding a choice the user made intentionally. This
+     * fits the choice they made into the space available.
+     */
+    _autoFitEmbedGuest(embedNodeId) {
+        const graph = this.stateStore.nodeGraph;
+        const guestEdge = graph.getIncomingEdge(embedNodeId, 'guestSdf');
+        if (!guestEdge) {
+            this._showToast('Connect a shape to this node\'s guest input first.', 3000);
+            return;
+        }
+        const guestNodeId = guestEdge.fromNode;
+        const guestNode   = graph.nodes.get(guestNodeId);
+        const embedNode   = graph.nodes.get(embedNodeId);
+        if (!guestNode || !embedNode) return;
+
+        const regionSize = embedNode.params.regionSize ?? 1.0;
+        const depth       = embedNode.params.depth ?? 0.35;
+
+        this._undo.snapshot();
+
+        // Guest coordinates are already relative to the anchor's local
+        // frame — its own Transform position should stay at the origin,
+        // otherwise it's offset from where you placed the anchor.
+        graph.updateNodeTransform(guestNodeId, 'posX', 0);
+        graph.updateNodeTransform(guestNodeId, 'posY', 0);
+        graph.updateNodeTransform(guestNodeId, 'posZ', 0);
+
+        // Repeat / finite Tiling: shrink SPACING (preserving the user's
+        // chosen count) so the whole array's tangential footprint fits
+        // comfortably inside regionSize.
+        const isFiniteArray =
+            guestNode.type === 'repeatNode' ||
+            (guestNode.type === 'tilingNode' && guestNode.params.extent === 'finite');
+        if (isFiniteArray) {
+            const cx = guestNode.params.countX ?? 1;
+            const cy = guestNode.params.countY ?? 1;
+            const spanX = (cx - 1) * (guestNode.params.spacingX ?? 1);
+            const spanY = (cy - 1) * (guestNode.params.spacingY ?? 1);
+            const maxSpan = Math.max(spanX, spanY, 1e-6);
+            const targetSpan = regionSize * 1.6; // comfortably within the tangential disc
+            const spacingScale = Math.min(1, targetSpan / maxSpan);
+            graph.updateNodeParam(guestNodeId, 'spacingX', (guestNode.params.spacingX ?? 1) * spacingScale);
+            graph.updateNodeParam(guestNodeId, 'spacingY', (guestNode.params.spacingY ?? 1) * spacingScale);
+        }
+
+        // Scale the guest's own natural size to fit within the tighter of
+        // depth/regionSize — depth is usually the binding constraint for
+        // a shallow emboss/engrave relief.
+        const naturalRadius = this.sceneManager.estimateNodeRadius(guestNodeId);
+        if (isFinite(naturalRadius) && naturalRadius > 1e-6) {
+            const curScale = guestNode.transform?.scale ?? 1;
+            const targetRadius = Math.min(depth, regionSize) * 0.9;
+            graph.updateNodeTransform(guestNodeId, 'scale', curScale * (targetRadius / naturalRadius));
+        }
+
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
+        this._rebuildCards();
+        this._renderInPlace();
+        this._showToast('Guest auto-fitted to the region. Check the result and fine-tune if needed.', 3000);
+    }
+
+    /**
+     * 'P' keyboard shortcut — toggle the pivot gizmo for the currently
+     * selected node, independent of the Transform section's open state.
+     * Tracks its own on/off flag (_pivotGizmoManuallyShown) since the
+     * gizmo's visibility is otherwise driven by _onTransformSectionToggle,
+     * not a simple boolean — this shortcut needs to know whether IT was
+     * the one that turned the gizmo on, so a second press turns it off
+     * again rather than fighting with the Transform-section-driven state.
+     */
+    _togglePivotGizmoShortcut() {
+        if (this._selectedIds.size === 0) {
+            this._showToast('Select a node first to toggle its pivot gizmo (P)', 2000);
+            return;
+        }
+        const nodeId = [...this._selectedIds].pop();
+
+        if (this._activeGizmoNodeId === nodeId) {
+            this._activeGizmoNodeId = null;
+            this.sceneManager.hidePivotGizmo();
+        } else {
+            this._activeGizmoNodeId = nodeId;
+            this.sceneManager.showPivotGizmo(nodeId);
         }
     }
 
@@ -2336,6 +3058,11 @@ function _isConvexPolygon(vertices) {
           this._renderModeBtn.textContent = '⬛ GLSL Mode';
         }
 
+        // 0b. Hide the pivot gizmo and forget which node had it open — that
+        // node no longer exists after the clear.
+        this.sceneManager.hidePivotGizmo();
+        this._activeGizmoNodeId = null;
+
         // 1. Remove currentSchur from scene
         if (this.sceneManager.currentSchur) {
         this.sceneManager._removeFromScene(this.sceneManager.currentSchur);
@@ -2381,14 +3108,53 @@ function _isConvexPolygon(vertices) {
       this._undo.snapshot();
       const graph  = this.stateStore.nodeGraph;
       const params = {
-        schurBlend:    { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
-        rUnion:        { smoothness: 8 },
-        rIntersection: { smoothness: 8 },
-        rDifference:   { smoothness: 8 },
+        schurBlend: { operation:'union', smoothness:8, rotation:0, scale:1, posX:0, posY:0, isoOffset:0 },
+        rBlend:     { operation:'union', smoothness:8 },
+        morphBlend: { t: 0.5, animated: 'no' },
+        embedNode:  { operation: 'emboss', anchorX:0, anchorY:0, anchorZ:0, regionSize:1.5 },
       }[type] || {};
 
       const newNode = graph.addNode(type, params, this._nextCardPosition());
+      // Session-only flag (deliberately NOT a NodeSpec param — it's a UI
+      // nicety, not scene state, so it does not get serialized/persisted;
+      // it simply resets to "unconfirmed" on reload, which is a safe
+      // default). Tracks whether the anchor has ever been explicitly
+      // placed via Pick Anchor, so the card can keep nudging the user
+      // toward it rather than silently trusting the origin default.
+      if (type === 'embedNode') {
+        newNode._anchorPicked = false;
+        this._showToast(
+          'New Emboss/Engrave node — click "Pick Anchor on Surface" before adjusting other settings. ' +
+          'The default anchor sits at the host\'s ORIGIN, which is often its exact center — unstable ' +
+          'on symmetric shapes (sphere, cylinder, capsule).',
+          6000
+        );
+      }
 
+      setTimeout(() => {
+        this._rebuildCards();
+        this._drawEdges();
+        this._updateGraphStatusLabel();
+      }, 50);
+    }
+
+    /**
+     * Add a mapper node WITHOUT auto-wiring. Mappers attach to a shape's
+     * 'mapper' input port, not the 'sdf' chain — there's no equivalent
+     * "chain tail" concept for this port, so (like blend nodes) the user
+     * drag-connects it manually.
+     */
+    _addMapperNode(type) {
+      this._undo.snapshot();
+      const graph = this.stateStore.nodeGraph;
+      const defaults = {
+        polynomialMapper:  { c0:0, c1:1, c2:0, c3:0 },
+        sinusoidalMapper:  { a:1, b:4, c:0, e:0, animated:'no' },
+        exponentialMapper: { a:1, b:1, c:0 },
+        logarithmicMapper: { a:1, b:1, c:1, e:0 },
+        powerMapper:       { a:1, b:2, c:0 },
+      };
+      graph.addNode(type, defaults[type] || {}, this._nextCardPosition());
       setTimeout(() => {
         this._rebuildCards();
         this._drawEdges();
@@ -2447,7 +3213,7 @@ function _isConvexPolygon(vertices) {
     const defaults = {
       extrude:       { type: 'extrudeNode',      params: { height: 2 } },
       revolve:       { type: 'revolveNode',       params: { offset: 0, axis: 'Y' } },
-      tiling:        { type: 'tilingNode',        params: { lattice:'hexagonal', periodX:3, periodY:3, offsetX:0, offsetY:0, isoOffset:0 } },
+      tiling:        { type: 'tilingNode',        params: { lattice:'hexagonal', periodX:3, periodY:3, periodZ:3, offsetX:0, offsetY:0, isoOffset:0, extent:'infinite', countX:3, countY:3, countZ:1 } },
       symmetryfold:  { type: 'symmetryFoldNode',  params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', reflectY:'no' } },
       symmetryorbit: { type: 'symmetryOrbitNode', params: { folds:6, centerX:0, centerY:0, rotation:0, reflectX:'no', combiner:'min', smoothness:8 } },
       mobius:        { type: 'mobiusNode',        params: { aRe:1, aIm:0, bRe:0, bIm:0, cRe:0, cIm:0, dRe:1, dIm:0 } },
@@ -2485,7 +3251,8 @@ function _isConvexPolygon(vertices) {
     // because they have two input ports (sdfA, sdfB) and the system cannot
     // guess which branch each source belongs to.
     const MERGE_TYPES = new Set([
-      'schurBlend','rUnion','rIntersection','rDifference','ifsBlend'
+      'schurBlend','rBlend','morphBlend','embedNode',
+      'rUnion','rIntersection','rDifference','ifsBlend'
     ]);
 
     // ── Chain tail walker ──────────────────────────────────────────────────
@@ -2954,10 +3721,34 @@ function _isConvexPolygon(vertices) {
         // SceneManager._getEffectiveBounds() also reads them to expand the scan
         // window when the geometry has been rotated or translated.
         const placementSection = document.createElement('div');
+        placementSection.className = 'nc-advanced-only';
         placementSection.style.cssText = `
             width: 100%;
             margin-top: 12px;
         `;
+
+        // Warning banner — shown only while any placement value is
+        // non-identity, since that's exactly when the wireframe/render
+        // mismatch described above becomes real.
+        const _isNonIdentity = () => ['posX','posY','posZ','rotateX','rotateY','rotateZ']
+            .some(k => Math.abs(this._getOutputParam(k) || 0) > 1e-6);
+        const placementWarning = document.createElement('div');
+        placementWarning.style.cssText = `
+            font-size: 10px;
+            color: rgba(255,190,120,0.9);
+            background: rgba(255,150,60,0.1);
+            border: 1px solid rgba(255,150,60,0.3);
+            border-radius: 4px;
+            padding: 5px 7px;
+            margin-bottom: 8px;
+            line-height: 1.4;
+            display: ${_isNonIdentity() ? 'block' : 'none'};
+        `;
+        placementWarning.textContent = '⚠ Active — node previews will look different from the actual render/export until this is reset.';
+        placementSection._syncWarning = () => {
+            placementWarning.style.display = _isNonIdentity() ? 'block' : 'none';
+        };
+        placementSection.appendChild(placementWarning);
 
         const placementLabel = document.createElement('span');
         placementLabel.textContent = 'Object placement:';
@@ -3042,6 +3833,7 @@ function _isConvexPolygon(vertices) {
                 display.textContent = val.toFixed(2);
                 this._setOutputParam(param, val);
                 this._syncOutputControls(param, val);
+                if (placementSection._syncWarning) placementSection._syncWarning();
                 this._renderInPlace();
             });
 
@@ -3134,9 +3926,6 @@ function _isConvexPolygon(vertices) {
     _renderSDFPreview(nodeId, previewCanvas) {
         // Debounce preview renders — each card schedules a delayed render
         // rather than firing immediately on every graph change event.
-        // This dramatically reduces CPU load when many cards are visible
-        // or when sliders are being dragged rapidly, since intermediate
-        // states are skipped and only the settled state is rendered.
         if (!this._previewTimers) this._previewTimers = new Map();
         clearTimeout(this._previewTimers.get(nodeId));
         this._previewTimers.set(nodeId, setTimeout(() => {
@@ -3147,7 +3936,17 @@ function _isConvexPolygon(vertices) {
                 const result = evaluator.evaluate(nodeId);
                 const sdfFn  = result?.sdf || result?.result;
                 if (typeof sdfFn !== 'function') return;
-                drawSDFPreview(previewCanvas, sdfFn, [-2.5, -2.5, 2.5, 2.5]);
+                // Center the preview window on this node's current
+                // transform position, not a fixed world-space window.
+                // evaluate()'s result now always reflects the node's own
+                // transform (universal wrap — NodeEvaluator._applyNodeTransform),
+                // so a fixed window would show a blank thumbnail as soon as
+                // the shape moves away from world origin via drag or slider.
+                const node = this.stateStore.nodeGraph.nodes.get(nodeId);
+                const cx = node?.transform?.posX ?? 0;
+                const cy = node?.transform?.posY ?? 0;
+                const HALF = 2.5;
+                drawSDFPreview(previewCanvas, sdfFn, [cx - HALF, cy - HALF, cx + HALF, cy + HALF]);
             } catch (e) {
                 // Silently ignore
             }
@@ -3532,7 +4331,8 @@ function _isConvexPolygon(vertices) {
             'symmetryOrbitNode', 'ifsBlend', 'transform3DNode',
         ]);
         const BLEND_TYPES = new Set([
-            'schurBlend', 'rUnion', 'rIntersection', 'rDifference',
+            'schurBlend', 'rBlend', 'morphBlend', 'embedNode',
+            'rUnion', 'rIntersection', 'rDifference',
         ]);
 
         graph.nodes.forEach((node, id) => {
@@ -3850,7 +4650,13 @@ function _isConvexPolygon(vertices) {
         // selected node cards. The overlay is permanently visible so Escape
         // no longer closes it.
         if (e.key === 'Escape' && this._open) {
-            if (this._presentationMode) {
+            if (this._anchorPickMode) {
+                this.sceneManager.clearHighlight(this._anchorPickMode.hostNodeId);
+                this.sceneManager.hideEmbedRegion();
+                this._anchorPickMode = null;
+                this._embedRegionVisibleFor = null;
+                this._showToast('Anchor picking cancelled.', 1500);
+            } else if (this._presentationMode) {
                 this._togglePresentationMode();
             } else {
                 this._setSelected(null);
@@ -3896,6 +4702,16 @@ function _isConvexPolygon(vertices) {
         if (e.key === 'Home' && !this._presentationMode) {
             e.preventDefault();
             this._revealAllCards();
+        }
+
+        // 'P' key: toggle the pivot gizmo for the currently selected node,
+        // independent of whether that card's Transform section is open.
+        // A quick "just let me see the pivot" shortcut. If multiple nodes
+        // are selected, uses the most recently selected one (same
+        // convention _addTransformNode already uses elsewhere in this file).
+        if ((e.key === 'p' || e.key === 'P') && this._open) {
+            e.preventDefault();
+            this._togglePivotGizmoShortcut();
         }
         });
 
@@ -4097,20 +4913,15 @@ function _isConvexPolygon(vertices) {
      * V1 a simple press-R-again toggle is sufficient.
      */
     _toggleAutoOrbit() {
-        const ctrl = this.sceneManager.controls;
-        if (!ctrl) return;
-
-        const next = !ctrl.autoRotate;
-        ctrl.autoRotate = next;
-        // Read from the stored speed value so the sidebar slider and the
-        // R-key hotkey are always in sync — changing the slider then
-        // pressing R uses the slider's current value, not a hardcoded one.
-        ctrl.autoRotateSpeed = this._autoOrbitSpeed;
-
+        if (this.sceneManager.isOrbitActive()) {
+            this.sceneManager.stopOrbit();
+            this._showToast('Auto-orbit OFF', 1500);
+            return;
+        }
+        const generatorKey = this._orbitGenerator || 'circular';
+        this.sceneManager.startOrbit(generatorKey, { speed: this._autoOrbitSpeed });
         this._showToast(
-            next
-                ? `Auto-orbit ON  (speed ${this._autoOrbitSpeed.toFixed(1)}) — press R to stop`
-                : 'Auto-orbit OFF',
+            `Auto-orbit ON — ${generatorKey} (speed ${this._autoOrbitSpeed.toFixed(2)}) — press R to stop`,
             2200
         );
     }
@@ -4333,7 +5144,8 @@ function _isConvexPolygon(vertices) {
                         nodeDef.type,
                         { ...nodeDef.params },
                         nodeDef.uiPos || { x: 0, y: 0 },
-                        nodeDef.id
+                        nodeDef.id,
+                        nodeDef.transform ? { ...nodeDef.transform } : null
                     );
                 }
                 // Add edges after all nodes exist
@@ -4458,6 +5270,19 @@ function _isConvexPolygon(vertices) {
         const existing = document.getElementById('nc-export-panel');
         if (existing) { existing.remove(); return; }
 
+        // Ensure the output node exists and is wired BEFORE deciding what's
+        // exportable. Without this, GLSL export stayed unavailable until
+        // the user separately clicked Render or the mode-switch button at
+        // least once — pure friction, since _ensureOutputWired() is cheap
+        // and idempotent (safe to call repeatedly; it no-ops on an already-
+        // wired graph). STL export never had this problem since
+        // _sceneHas3D() checks node types directly rather than requiring
+        // output-node wiring — this brings GLSL export to the same
+        // immediately-available standard.
+        if (this._sceneHasGeometry()) {
+            this._ensureOutputWired();
+        }
+
         const mode      = this.sceneManager.renderMode;
         const modeLabel = {
             marchingSquares: 'Marching Squares (CPU 2D)',
@@ -4541,16 +5366,40 @@ function _isConvexPolygon(vertices) {
             () => this._exportPNG()
         ));
 
-        // ── GLSL shader — only in GLSL or ray march mode ──────────────────────
-        const glslAvail = mode === 'glsl' || mode === 'rayMarch';
+        // ── GLSL shader export ─────────────────────────────────────────────────
+        // Core workflow, NOT gated behind Advanced — export was one of the
+        // most well-received features from v1 and belongs in the always-
+        // visible core workflow, same tier as PNG/JSON/STL export below.
+        //
+        // Deliberately INDEPENDENT of the current render mode (this part IS
+        // kept from the earlier fix — it's a correctness improvement, not a
+        // tiering decision). Generation is done fresh on demand via
+        // glslEvaluator.generate(time, mode) — the same mode-agnostic entry
+        // point the live renderers use — rather than reading a cached
+        // string that only got populated as a side effect of having
+        // previously rendered in that specific mode. The user can export
+        // either shader variant regardless of what's currently on screen;
+        // the only real requirement is that the graph is wired to
+        // something at all.
+        const graphRenderable = this.sceneManager._graphIsRenderable();
         panel.appendChild(_row(
-            '🔷', 'Export GLSL Shader',
-            glslAvail
-                ? 'Download the generated fragment shader, adapted for ShaderToy. ' +
+            '🔷', 'Export 2D GLSL Shader',
+            graphRenderable
+                ? 'Download a 2D fragment shader (contour/fill rendering), adapted for ShaderToy. ' +
                   'Go to shadertoy.com → New Shader → paste the file → click ▶. No edits needed.'
-                : 'Switch to GLSL or Ray March mode and render to unlock shader export.',
-            () => this._exportGLSL(),
-            glslAvail
+                : 'Wire your graph to Output first to unlock shader export.',
+            () => this._exportGLSL('2d'),
+            graphRenderable
+        ));
+
+        panel.appendChild(_row(
+            '🔶', 'Export 3D Ray March Shader',
+            graphRenderable
+                ? 'Download a 3D ray-marching fragment shader, adapted for ShaderToy. ' +
+                  'Go to shadertoy.com → New Shader → paste the file → click ▶. No edits needed.'
+                : 'Wire your graph to Output first to unlock shader export.',
+            () => this._exportGLSL('3d'),
+            graphRenderable
         ));
 
         // ── Scene JSON — always available ─────────────────────────────────────
@@ -4639,21 +5488,28 @@ function _isConvexPolygon(vertices) {
      * Both are self-contained and can be pasted into ShaderToy with minimal
      * wrapping (add a `mainImage` entry point and `iResolution` uniform).
      */
-    _exportGLSL() {
-        const mode = this.sceneManager.renderMode;
-        const injected = mode === 'rayMarch'
-            ? this.sceneManager._lastRayMarchSource
-            : this.sceneManager._lastGLSLSource;
+    /**
+     * @param {'2d'|'3d'} targetMode  Which shader variant to export.
+     *   Deliberately independent of this.sceneManager.renderMode — see the
+     *   comment at this method's two call sites in _toggleExportPanel for
+     *   why. Generates fresh via glslEvaluator.generate() rather than
+     *   reading a cached string, so this works regardless of what render
+     *   mode is currently active on screen.
+     */
+    _exportGLSL(targetMode) {
+        const time = (performance.now() - this.sceneManager._startTime) / 1000;
+        const { source: injected, rootFn } =
+            this.sceneManager.glslEvaluator.generate(time, targetMode);
 
-        if (!injected) {
+        if (!injected || !rootFn) {
             this._showToast(
                 'No shader source available. ' +
-                'Switch to GLSL or Ray March mode, wire your graph to Output, and render once first.'
+                'Wire your graph to Output first.'
             );
             return;
         }
 
-        const renderer = mode === 'rayMarch'
+        const renderer = targetMode === '3d'
             ? this.sceneManager.rayMarchRenderer
             : this.sceneManager.sdfRenderer;
         const fullFragmentShader = renderer._buildFragmentShader(injected);
@@ -4663,7 +5519,7 @@ function _isConvexPolygon(vertices) {
 
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const header = [
-            `// Isoline — ${mode === 'rayMarch' ? 'Ray March (3D)' : 'GLSL 2D'} shader`,
+            `// Isoline — ${targetMode === '3d' ? 'Ray March (3D)' : 'GLSL 2D'} shader`,
             `// Exported: ${new Date().toISOString()}`,
             `// Generated by Isoline (isoline-studio.netlify.app)`,
             '//',

@@ -80,43 +80,31 @@ export class CirclePrimitive extends RegionPrimitive {
     super(params);
     this.type   = 'circle';
     this.radius = params.radius !== undefined ? params.radius : 1;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
     this._params = { ...params };
 
     logger.info(`Created CirclePrimitive with id: ${this.id}, radius: ${this.radius}`);
   }
 
-  // ── Exact analytic SDF ──────────────────────────────────────────────────
-
   computeSDF(point, callStack = [], time = 0, depth = 0) {
-    const dx = point.x - this.posX;
-    const dy = point.y - this.posY;
+    const dx = point.x, dy = point.y;
     const d  = Math.sqrt(dx * dx + dy * dy) - this.radius;
-
     if (this.distanceMapper && typeof this.distanceMapper === 'function') {
       return this.distanceMapper(d);
     }
     return d;
   }
 
-  // ── Three.js wireframe preview ───────────────────────────────────────────
-  // Uses 64 segments for a smooth circle preview.
-  // This does NOT affect SDF accuracy.
-
   createObject(time = 0) {
     const segments = 64;
     const points   = [];
-
     for (let i = 0; i <= segments; i++) {
       const angle = (i / segments) * Math.PI * 2;
       points.push(new THREE.Vector3(
-        this.posX + this.radius * Math.cos(angle),
-        this.posY + this.radius * Math.sin(angle),
+        this.radius * Math.cos(angle),
+        this.radius * Math.sin(angle),
         0
       ));
     }
-
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
     const material = new THREE.LineBasicMaterial({
       color: new THREE.Color().setHSL(
@@ -125,27 +113,24 @@ export class CirclePrimitive extends RegionPrimitive {
         this.color.l || 0.6
       )
     });
-
     return new THREE.Line(geometry, material);
   }
 
-  // ── Parameter update ─────────────────────────────────────────────────────
-
   updateParameters(params = {}) {
     if (params.radius !== undefined) this.radius = params.radius;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
     if (params.color  !== undefined) this.color  = params.color;
     if (params.distanceMapper !== undefined) this.distanceMapper = params.distanceMapper;
-
-    // Also accept position object for consistency with curve primitives
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-    }
-
     logger.info(`Updated CirclePrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const r = this.radius;
+    return [
+      { x:0, y:0, z:0 },
+      { x:r, y:0, z:0 }, { x:-r, y:0, z:0 },
+      { x:0, y:r, z:0 }, { x:0, y:-r, z:0 },
+    ];
   }
 
   clone() {
@@ -183,37 +168,28 @@ export class RegularPolygonPrimitive extends RegionPrimitive {
   constructor(params = {}) {
     super(params);
     this.type     = 'regularPolygon';
-    this.sides    = params.sides    !== undefined ? Math.max(3, Math.round(params.sides)) : 6;
-    this.size     = params.size     !== undefined ? params.size     : 1;
-    this.rotation = params.rotation !== undefined ? params.rotation : 0;
-    this.posX     = params.posX     !== undefined ? params.posX     : 0;
-    this.posY     = params.posY     !== undefined ? params.posY     : 0;
+    this.sides    = params.sides !== undefined ? Math.max(3, Math.round(params.sides)) : 6;
+    this.size     = params.size  !== undefined ? params.size  : 1;
     this._params  = { ...params };
 
     logger.info(`Created RegularPolygonPrimitive with id: ${this.id}, sides: ${this.sides}`);
   }
 
   computeSDF(point, callStack = [], time = 0, depth = 0) {
-    // Translate into polygon-local space
-    let px = point.x - this.posX;
-    let py = point.y - this.posY;
+    let px = point.x, py = point.y;
 
-    // Rotate into polygon-local frame
-    const cosR = Math.cos(-this.rotation + Math.PI / 2);
-    const sinR = Math.sin(-this.rotation + Math.PI / 2);
+    // Fixed +π/2 orientation offset so the flat top faces up by default —
+    // a visual convention, not user rotation (use transform.rotateZ for that).
+    const cosR = Math.cos(Math.PI / 2);
+    const sinR = Math.sin(Math.PI / 2);
     const rx   = px * cosR - py * sinR;
     const ry   = px * sinR + py * cosR;
-    px = rx;
-    py = ry;
+    px = rx; py = ry;
 
-    // Sector angle: each sector spans 2π/N radians
     const sectorAngle = (Math.PI * 2) / this.sides;
-
-    // Fold the point into the first sector
     let angle = Math.atan2(py, px);
     angle = angle - sectorAngle * Math.round(angle / sectorAngle);
 
-    // Signed distance in the folded sector
     const apothem = this.size * Math.cos(Math.PI / this.sides);
     const dist    = Math.sqrt(px * px + py * py);
     const d       = dist * Math.cos(angle) - apothem;
@@ -226,15 +202,25 @@ export class RegularPolygonPrimitive extends RegionPrimitive {
 
   createObject(time = 0) {
     const points = [];
+    const sector = (Math.PI * 2) / this.sides;
     for (let i = 0; i <= this.sides; i++) {
-      const angle = this.rotation + (i / this.sides) * Math.PI * 2;
+      // Derived directly from computeSDF's actual zero-crossing (not a
+      // guessed offset): computeSDF rotates the query point by +π/2
+      // before folding it into sectors, so the boundary in WORLD space is
+      // the canonical polygon rotated by -π/2. The canonical polygon's
+      // edge-midpoints sit at angle = k*sector (that's where the folded
+      // angle is 0), so its VERTICES sit at the midpoint between
+      // consecutive edges: (k+0.5)*sector. Subtracting π/2 maps that into
+      // world space. Verified by hand for N=4: gives vertices at
+      // -45°/45°/135°/225°, which puts an edge centered at 90° (flat top)
+      // — matching computeSDF's own documented convention.
+      const angle = (i + 0.5) * sector - Math.PI / 2;
       points.push(new THREE.Vector3(
-        this.posX + this.size * Math.cos(angle),
-        this.posY + this.size * Math.sin(angle),
+        this.size * Math.cos(angle),
+        this.size * Math.sin(angle),
         0
       ));
     }
-
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
     const material = new THREE.LineBasicMaterial({
       color: new THREE.Color().setHSL(
@@ -243,26 +229,35 @@ export class RegularPolygonPrimitive extends RegionPrimitive {
         this.color.l || 0.6
       )
     });
-
     return new THREE.Line(geometry, material);
   }
 
   updateParameters(params = {}) {
-    if (params.sides    !== undefined) this.sides    = Math.max(3, Math.round(params.sides));
-    if (params.size     !== undefined) this.size     = params.size;
-    if (params.rotation !== undefined) this.rotation = params.rotation;
-    if (params.posX     !== undefined) this.posX     = params.posX;
-    if (params.posY     !== undefined) this.posY     = params.posY;
-    if (params.color    !== undefined) this.color    = params.color;
+    if (params.sides !== undefined) this.sides = Math.max(3, Math.round(params.sides));
+    if (params.size  !== undefined) this.size  = params.size;
+    if (params.color !== undefined) this.color = params.color;
     if (params.distanceMapper !== undefined) this.distanceMapper = params.distanceMapper;
-
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-    }
-
     logger.info(`Updated RegularPolygonPrimitive ${this.id}`);
     return this;
+  }
+
+  /**
+   * NOTE: uses the same +π/2 orientation offset as computeSDF (the
+   * authoritative, actually-rendered orientation), NOT the offset-less
+   * angle createObject()'s wireframe preview currently uses — those two
+   * have been out of sync since the Phase 3 primitive rewrite (a
+   * pre-existing, separate bug, flagged for a future fix, not addressed
+   * here).
+   */
+  getLocalSnapPoints() {
+    const pts = [{ x:0, y:0, z:0 }];
+    const sector = (Math.PI * 2) / this.sides;
+    for (let i = 0; i < this.sides; i++) {
+      // Same corrected derivation as createObject() above.
+      const angle = (i + 0.5) * sector - Math.PI / 2;
+      pts.push({ x: this.size * Math.cos(angle), y: this.size * Math.sin(angle), z: 0 });
+    }
+    return pts;
   }
 
   clone() {
@@ -281,9 +276,6 @@ export class PolytopePrimitive extends RegionPrimitive {
   constructor(params = {}) {
     super(params);
     this.type     = 'polytope';
-    this.posX     = params.posX     !== undefined ? params.posX     : 0;
-    this.posY     = params.posY     !== undefined ? params.posY     : 0;
-    this.rotation = params.rotation !== undefined ? params.rotation : 0;
     this._params  = { ...params };
     this.vertices = this._parseVertices(params.vertices);
     logger.info(`Created PolytopePrimitive with id: ${this.id}, vertices: ${this.vertices.length}`);
@@ -301,13 +293,7 @@ export class PolytopePrimitive extends RegionPrimitive {
   computeSDF(point, callStack = [], time = 0, depth = 0) {
     if (this.vertices.length < 3) return Infinity;
 
-    const px = point.x - this.posX;
-    const py = point.y - this.posY;
-
-    const cosR = Math.cos(-this.rotation);
-    const sinR = Math.sin(-this.rotation);
-    const lx   =  px * cosR - py * sinR;
-    const ly   =  px * sinR + py * cosR;
+    const lx = point.x, ly = point.y;
 
     let maxDist = -Infinity;
     const N = this.vertices.length;
@@ -335,15 +321,7 @@ export class PolytopePrimitive extends RegionPrimitive {
   createObject(time = 0) {
     if (this.vertices.length < 2) return new THREE.Group();
 
-    const points = this.vertices.map(([x, y]) => {
-      const cosR = Math.cos(this.rotation);
-      const sinR = Math.sin(this.rotation);
-      return new THREE.Vector3(
-        this.posX + x * cosR - y * sinR,
-        this.posY + x * sinR + y * cosR,
-        0
-      );
-    });
+    const points = this.vertices.map(([x, y]) => new THREE.Vector3(x, y, 0));
     points.push(points[0].clone());
 
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
@@ -359,16 +337,15 @@ export class PolytopePrimitive extends RegionPrimitive {
 
   updateParameters(params = {}) {
     if (params.vertices !== undefined) this.vertices = this._parseVertices(params.vertices);
-    if (params.posX     !== undefined) this.posX     = params.posX;
-    if (params.posY     !== undefined) this.posY     = params.posY;
-    if (params.rotation !== undefined) this.rotation = params.rotation;
     if (params.color    !== undefined) this.color    = params.color;
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-    }
     logger.info(`Updated PolytopePrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const pts = [{ x:0, y:0, z:0 }];
+    this.vertices.forEach(([x, y]) => pts.push({ x, y, z: 0 }));
+    return pts;
   }
 
   clone() {

@@ -601,6 +601,109 @@ export async function saveScene(nodeGraph, name = 'autosave', meta = {}) {
  * @param {NodeGraph} nodeGraph
  * @returns {Promise<boolean>}
  */
+/**
+ * Migrate legacy per-type position/rotation params (from before the
+ * transform overhaul) into each node's transform block.
+ *
+ * Old saves have posX/posY/posZ/rotation/rotateX../axis living directly in
+ * node.params, using an inconsistent naming scheme across node types (see
+ * NodeSpec.js history: sphere/box/etc. used posX/Y/Z; triangle/regularPolygon
+ * used posX/Y + rotation; cylinder/cone additionally had an axis dropdown;
+ * schurBlend had its own posX/Y/rotation/scale meaning something else
+ * entirely — see NodeEvaluator.js Phase 1 comments for why that one is NOT
+ * migrated the same way).
+ *
+ * This function is idempotent and safe to run on already-migrated data:
+ * if a node's params no longer contain any of the legacy fields (because
+ * it was saved after the overhaul), this is a no-op for that node.
+ *
+ * Axis handling: the old axis dropdown ('X'|'Y'|'Z') is converted to the
+ * equivalent rotateX/rotateZ value, since the new cylinder/cone SDF is
+ * always Y-axis and orientation is purely a transform.rotate* concern.
+ *   axis 'Y' (default) → no rotation needed
+ *   axis 'X' → rotateZ = -π/2  (matches old mesh.rotation.z = -π/2 for cone,
+ *              and the old cylinder swizzle q=(q.y,q.x,q.z))
+ *   axis 'Z' → rotateX = π/2   (matches old mesh.rotation.x = π/2)
+ *
+ * @param {NodeGraph} nodeGraph  Already deserialized, about to be used.
+ */
+function _migrateLegacyPositions(nodeGraph) {
+  // Per-type: which params.field names used to mean position/rotation,
+  // and where they map to in the new transform block.
+  const POSITION_LIKE_TYPES = new Set([
+    'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone',
+    'circle', 'regularPolygon', 'polytope', 'triangle', 'arc',
+  ]);
+
+  let migratedCount = 0;
+
+  nodeGraph.nodes.forEach((node) => {
+    // schurBlend/ifsBlend are intentionally excluded — their old
+    // posX/posY/rotation/scale params meant something structurally
+    // different (pre-blend transform / per-iteration transform), not
+    // "where this node sits." They are left as-is; any pre-overhaul
+    // schurBlend loaded from an old save will simply lose that specific
+    // legacy transform effect, which is an accepted, documented trade-off
+    // of this migration (the old behavior is not equivalent to the new
+    // per-node transform for a two-input blend node in the general case).
+    if (!POSITION_LIKE_TYPES.has(node.type)) return;
+
+    const p = node.params;
+    const hasLegacy =
+      p.posX !== undefined || p.posY !== undefined || p.posZ !== undefined ||
+      p.rotation !== undefined || p.axis !== undefined;
+    if (!hasLegacy) return;
+
+    if (!node.transform) node.transform = createIdentityTransformShim();
+
+    if (p.posX !== undefined) { node.transform.posX = p.posX; delete p.posX; }
+    if (p.posY !== undefined) { node.transform.posY = p.posY; delete p.posY; }
+    if (p.posZ !== undefined) { node.transform.posZ = p.posZ; delete p.posZ; }
+
+    // 'rotation' (used by triangle, regularPolygon, polytope, arc-adjacent
+    // types) always meant Z-axis rotation in the old 2D-plane convention.
+    if (p.rotation !== undefined) {
+      node.transform.rotateZ = p.rotation;
+      delete p.rotation;
+    }
+
+    // axis dropdown (cylinder, cone only) → equivalent rotation
+    if (p.axis !== undefined) {
+      if (p.axis === 'X') {
+        node.transform.rotateZ = -Math.PI / 2;
+      } else if (p.axis === 'Z') {
+        node.transform.rotateX = Math.PI / 2;
+      }
+      // 'Y' needs no rotation — already the default orientation
+      delete p.axis;
+    }
+
+    migratedCount++;
+  });
+
+  if (migratedCount > 0) {
+    logger.info(
+      `_migrateLegacyPositions: migrated ${migratedCount} node(s) from ` +
+      `legacy params-based position to the new transform block.`
+    );
+  }
+}
+
+/**
+ * Minimal identity transform shim — duplicated here rather than imported
+ * from transform3D.js to keep persistence.js's migration self-contained
+ * and avoid a circular import risk between persistence and graph/utils
+ * modules. Kept in exact sync with transform3D.createIdentityTransform().
+ */
+function createIdentityTransformShim() {
+  return {
+    posX: 0, posY: 0, posZ: 0,
+    pivotX: 0, pivotY: 0, pivotZ: 0,
+    rotateX: 0, rotateY: 0, rotateZ: 0,
+    scale: 1,
+  };
+}
+
 export async function loadScene(name = 'autosave', nodeGraph) {
   // Handle both call signatures:
   //   Old:  loadScene({ clearVisuals, createVisual, triggerRender })
@@ -617,8 +720,11 @@ export async function loadScene(name = 'autosave', nodeGraph) {
     }
     const ok = nodeGraph.deserialize(data.nodeGraph);
     if (ok) {
+      // Migrate any legacy params-based position data into transform blocks
+      // BEFORE anything else (evaluator, UI, mesh rebuild) reads the graph.
+      _migrateLegacyPositions(nodeGraph);
+
       logger.info(`Scene loaded: "${name}" (saved ${new Date(data.savedAt).toLocaleString()}, renderMode: ${data.renderMode || 'marchingSquares'})`);
-      // Return the full record so callers can read renderMode etc.
       return data;
     }
     return null;

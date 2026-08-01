@@ -89,12 +89,7 @@ export class SolidPrimitive {
     });
   }
 
-  /** Helper — translate a geometry by the primitive's position */
-  _positioned(mesh) {
-    mesh.position.set(this.posX || 0, this.posY || 0, this.posZ || 0);
-    return mesh;
   }
-}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,40 +117,37 @@ export class SpherePrimitive extends SolidPrimitive {
     super(params);
     this.type   = 'sphere';
     this.radius = params.radius !== undefined ? params.radius : 1;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
-    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
     this._params = { ...params };
 
     logger.info(`Created SpherePrimitive id:${this.id} radius:${this.radius}`);
   }
 
   computeSDF(point) {
-    const dx = point.x - this.posX;
-    const dy = point.y - this.posY;
-    const dz = (point.z || 0) - this.posZ;
+    const dx = point.x, dy = point.y, dz = point.z || 0;
     return Math.sqrt(dx*dx + dy*dy + dz*dz) - this.radius;
   }
 
   createObject() {
     const geo  = new THREE.SphereGeometry(this.radius, 24, 16);
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-    return this._positioned(mesh);
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.radius !== undefined) this.radius = params.radius;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
-    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-      if (params.position.z !== undefined) this.posZ = params.position.z;
-    }
     logger.info(`Updated SpherePrimitive ${this.id}`);
     return this;
+  }
+
+  /** Local-space landmark points used by drag-to-snap (position/pivot). */
+  getLocalSnapPoints() {
+    const r = this.radius;
+    return [
+      { x:0, y:0, z:0 },
+      { x:r, y:0, z:0 }, { x:-r, y:0, z:0 },
+      { x:0, y:r, z:0 }, { x:0, y:-r, z:0 },
+      { x:0, y:0, z:r }, { x:0, y:0, z:-r },
+    ];
   }
 
   clone() {
@@ -193,32 +185,24 @@ export class BoxPrimitive extends SolidPrimitive {
     this.width  = params.width  !== undefined ? params.width  : 2;
     this.height = params.height !== undefined ? params.height : 2;
     this.depth  = params.depth  !== undefined ? params.depth  : 2;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
-    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
     this._params = { ...params };
 
     logger.info(`Created BoxPrimitive id:${this.id} ${this.width}×${this.height}×${this.depth}`);
   }
 
   computeSDF(point) {
-    // Half-extents
     const bx = this.width  / 2;
     const by = this.height / 2;
     const bz = this.depth  / 2;
 
-    // Translate to box-local space
-    const px = Math.abs(point.x - this.posX) - bx;
-    const py = Math.abs(point.y - this.posY) - by;
-    const pz = Math.abs((point.z || 0) - this.posZ) - bz;
+    const px = Math.abs(point.x) - bx;
+    const py = Math.abs(point.y) - by;
+    const pz = Math.abs(point.z || 0) - bz;
 
-    // Exterior: length of the overshot vector (zero inside)
     const ex = Math.max(px, 0);
     const ey = Math.max(py, 0);
     const ez = Math.max(pz, 0);
     const exterior = Math.sqrt(ex*ex + ey*ey + ez*ez);
-
-    // Interior: most-positive face distance (negative when inside)
     const interior = Math.min(Math.max(px, Math.max(py, pz)), 0);
 
     return exterior + interior;
@@ -226,25 +210,27 @@ export class BoxPrimitive extends SolidPrimitive {
 
   createObject() {
     const geo  = new THREE.BoxGeometry(this.width, this.height, this.depth);
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-    return this._positioned(mesh);
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.width  !== undefined) this.width  = params.width;
     if (params.height !== undefined) this.height = params.height;
     if (params.depth  !== undefined) this.depth  = params.depth;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
-    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-      if (params.position.z !== undefined) this.posZ = params.position.z;
-    }
     logger.info(`Updated BoxPrimitive ${this.id}`);
     return this;
+  }
+  getLocalSnapPoints() {
+    const bx = this.width / 2, by = this.height / 2, bz = this.depth / 2;
+    const pts = [{ x:0, y:0, z:0 }];
+    [-bx, bx].forEach(x => [-by, by].forEach(y => [-bz, bz].forEach(z => {
+      pts.push({ x, y, z }); // 8 corners
+    })));
+    pts.push({ x:bx, y:0, z:0 }, { x:-bx, y:0, z:0 }); // face centers
+    pts.push({ x:0, y:by, z:0 }, { x:0, y:-by, z:0 });
+    pts.push({ x:0, y:0, z:bz }, { x:0, y:0, z:-bz });
+    return pts;
   }
 
   clone() {
@@ -284,30 +270,18 @@ export class CylinderPrimitive extends SolidPrimitive {
     this.radius = params.radius !== undefined ? params.radius : 1;
     this.height = params.height !== undefined ? params.height : 2;
     this.capped = params.capped !== undefined ? params.capped : true;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
-    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
     this._params = { ...params };
 
     logger.info(`Created CylinderPrimitive id:${this.id} r:${this.radius} h:${this.height}`);
   }
 
   computeSDF(point) {
-    const px = point.x - this.posX;
-    const py = point.y - this.posY;
-    const pz = (point.z || 0) - this.posZ;
-
-    // Radial distance from the Y axis, minus radius
+    const px = point.x, py = point.y, pz = point.z || 0;
     const radial = Math.sqrt(px*px + pz*pz) - this.radius;
 
-    if (!this.capped) {
-      // Infinite cylinder — only radial distance matters
-      return radial;
-    }
+    if (!this.capped) return radial;
 
-    // Axial distance from the flat caps, minus half-height
     const axial = Math.abs(py) - this.height / 2;
-
     const dx = Math.max(radial, 0);
     const dy = Math.max(axial,  0);
     return Math.min(Math.max(radial, axial), 0) +
@@ -315,51 +289,32 @@ export class CylinderPrimitive extends SolidPrimitive {
   }
 
   createObject() {
-    // THREE.CylinderGeometry is always along Y internally.
-    // For uncapped cylinders we use openEnded=true.
-    // For axis rotation we apply a quaternion to the mesh after creation.
+    // Always Y-axis, origin-centered. Orientation is handled entirely by
+    // the node's own transform (SceneManager applies it to this mesh).
     const openEnded = !this.capped;
     const geo  = new THREE.CylinderGeometry(
       this.radius, this.radius, this.height, 24, 1, openEnded
     );
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-
-    // Apply axis rotation so the proxy matches the SDF orientation.
-    // The SDF swizzles the query point; here we rotate the mesh instead.
-    // Y is the natural axis — no rotation needed.
-    // X: rotate 90° around Z so the cylinder lies along X.
-    // Z: rotate 90° around X so the cylinder lies along Z.
-    const axis = this._params?.axis ?? 'Y';
-    if (axis === 'X') {
-      mesh.rotation.z = Math.PI / 2;
-    } else if (axis === 'Z') {
-      mesh.rotation.x = Math.PI / 2;
-    }
-
-    mesh.position.set(this.posX || 0, this.posY || 0, this.posZ || 0);
-    return mesh;
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.radius !== undefined) this.radius = params.radius;
     if (params.height !== undefined) this.height = params.height;
     if (params.capped !== undefined) this.capped = params.capped;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
-    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
-    // Keep _params in sync so createObject() reads the latest axis value
-    if (params.axis   !== undefined) {
-      if (!this._params) this._params = {};
-      this._params.axis = params.axis;
-    }
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-      if (params.position.z !== undefined) this.posZ = params.position.z;
-    }
     logger.info(`Updated CylinderPrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const r = this.radius, h = this.height / 2;
+    const pts = [{ x:0, y:0, z:0 }, { x:0, y:h, z:0 }, { x:0, y:-h, z:0 }];
+    [0, Math.PI/2, Math.PI, 3*Math.PI/2].forEach(a => {
+      pts.push({ x:r*Math.cos(a), y:h,  z:r*Math.sin(a) });
+      pts.push({ x:r*Math.cos(a), y:-h, z:r*Math.sin(a) });
+    });
+    return pts;
   }
 
   clone() {
@@ -399,9 +354,6 @@ export class CapsulePrimitive extends SolidPrimitive {
     // New user-facing schema
     this.radius = params.radius !== undefined ? params.radius : 0.5;
     this.height = params.height !== undefined ? params.height : 2;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
-    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
 
     this._syncParams();
 
@@ -412,24 +364,13 @@ export class CapsulePrimitive extends SolidPrimitive {
     this._params = {
       radius: this.radius,
       height: this.height,
-      posX: this.posX,
-      posY: this.posY,
-      posZ: this.posZ,
     };
   }
 
   _segmentEnds() {
     return {
-      a: {
-        x: this.posX,
-        y: this.posY - this.height / 2,
-        z: this.posZ,
-      },
-      b: {
-        x: this.posX,
-        y: this.posY + this.height / 2,
-        z: this.posZ,
-      }
+      a: { x: 0, y: -this.height / 2, z: 0 },
+      b: { x: 0, y:  this.height / 2, z: 0 },
     };
   }
 
@@ -461,40 +402,29 @@ export class CapsulePrimitive extends SolidPrimitive {
   }
 
   createObject() {
-    // THREE.CapsuleGeometry(radius, length, capSegments, radialSegments)
-    // "length" is the straight cylindrical middle section, so to match our
-    // logical height (center-to-center segment length) we subtract 2*radius.
     const cylLen = Math.max(this.height - 2 * this.radius, 0);
-
     const geo = typeof THREE.CapsuleGeometry !== 'undefined'
       ? new THREE.CapsuleGeometry(this.radius, cylLen, 8, 16)
       : new THREE.CylinderGeometry(this.radius, this.radius, Math.max(this.height, 0.001), 16);
 
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-
-    mesh.position.set(this.posX, this.posY, this.posZ);
-
-    // CapsuleGeometry is aligned along Y by default, so no quaternion needed.
-    return mesh;
+    // CapsuleGeometry is aligned along Y and centered by default — matches
+    // our origin-centered convention with no offset needed.
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.radius !== undefined) this.radius = params.radius;
     if (params.height !== undefined) this.height = params.height;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
-    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
-
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-      if (params.position.z !== undefined) this.posZ = params.position.z;
-    }
 
     this._syncParams();
     logger.info(`Updated CapsulePrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const h = this.height / 2;
+    return [{ x:0, y:0, z:0 }, { x:0, y:h, z:0 }, { x:0, y:-h, z:0 }];
   }
 
   clone() {
@@ -534,48 +464,38 @@ export class TorusPrimitive extends SolidPrimitive {
     this.type        = 'torus';
     this.majorRadius = params.majorRadius !== undefined ? params.majorRadius : 2;
     this.minorRadius = params.minorRadius !== undefined ? params.minorRadius : 0.5;
-    this.posX        = params.posX        !== undefined ? params.posX        : 0;
-    this.posY        = params.posY        !== undefined ? params.posY        : 0;
-    this.posZ        = params.posZ        !== undefined ? params.posZ        : 0;
     this._params     = { ...params };
 
     logger.info(`Created TorusPrimitive id:${this.id} R:${this.majorRadius} r:${this.minorRadius}`);
   }
 
   computeSDF(point) {
-    const px = point.x - this.posX;
-    const py = point.y - this.posY;
-    const pz = (point.z || 0) - this.posZ;
-
-    // Distance from the ring circle in the XZ plane
+    const px = point.x, py = point.y, pz = point.z || 0;
     const qx = Math.sqrt(px*px + pz*pz) - this.majorRadius;
     const qy = py;
-
     return Math.sqrt(qx*qx + qy*qy) - this.minorRadius;
   }
 
   createObject() {
-    const geo  = new THREE.TorusGeometry(
-      this.majorRadius, this.minorRadius, 16, 48
-    );
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-    return this._positioned(mesh);
+    const geo = new THREE.TorusGeometry(this.majorRadius, this.minorRadius, 16, 48);
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.majorRadius !== undefined) this.majorRadius = params.majorRadius;
     if (params.minorRadius !== undefined) this.minorRadius = params.minorRadius;
-    if (params.posX        !== undefined) this.posX        = params.posX;
-    if (params.posY        !== undefined) this.posY        = params.posY;
-    if (params.posZ        !== undefined) this.posZ        = params.posZ;
     if (params.color       !== undefined) this.color       = params.color;
-    if (params.position !== undefined) {
-      if (params.position.x !== undefined) this.posX = params.position.x;
-      if (params.position.y !== undefined) this.posY = params.position.y;
-      if (params.position.z !== undefined) this.posZ = params.position.z;
-    }
     logger.info(`Updated TorusPrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const R = this.majorRadius;
+    const pts = [{ x:0, y:0, z:0 }];
+    [0, Math.PI/2, Math.PI, 3*Math.PI/2].forEach(a => {
+      pts.push({ x:R*Math.cos(a), y:0, z:R*Math.sin(a) });
+    });
+    return pts;
   }
 
   clone() {
@@ -624,19 +544,16 @@ export class ConePrimitive extends SolidPrimitive {
     this.type   = 'cone';
     this.radius = params.radius !== undefined ? params.radius : 1;
     this.height = params.height !== undefined ? params.height : 2;
-    this.posX   = params.posX   !== undefined ? params.posX   : 0;
-    this.posY   = params.posY   !== undefined ? params.posY   : 0;
-    this.posZ   = params.posZ   !== undefined ? params.posZ   : 0;
     this._params = { ...params };
 
     logger.info(`Created ConePrimitive id:${this.id} r:${this.radius} h:${this.height}`);
   }
 
   computeSDF(point) {
-    // Translate to cone-local space — base at origin, apex at (0, height, 0)
-    const px = point.x - this.posX;
-    const py = point.y - this.posY;
-    const pz = (point.z || 0) - this.posZ;
+    // Cone-local space — base at origin, apex at (0, height, 0)
+    const px = point.x;
+    const py = point.y;
+    const pz = point.z || 0;
 
     // A = base center (0,0,0), B = apex (0, height, 0)
     // ra = base radius, rb = apex radius = 0
@@ -673,45 +590,33 @@ export class ConePrimitive extends SolidPrimitive {
   }
 
   createObject() {
-    const geo  = new THREE.ConeGeometry(this.radius, this.height, 24);
-    const mesh = new THREE.Mesh(geo, this._wireMaterial());
-
-    // THREE.ConeGeometry apex points along +Y by default.
-    // The SDF has the base at the primitive's position and apex at +Y.
-    // For X and Z axes we rotate the proxy to match the SDF orientation.
-    const axis = this._params?.axis ?? 'Y';
-
-    if (axis === 'Y') {
-      // Default: base at posY, apex at posY + height.
-      // THREE.ConeGeometry is centred at its midpoint so offset by height/2.
-      mesh.position.set(this.posX, this.posY + this.height / 2, this.posZ);
-    } else if (axis === 'X') {
-      // Cone points along +X: rotate 90° around Z, offset along X.
-      mesh.rotation.z = -Math.PI / 2;
-      mesh.position.set(this.posX + this.height / 2, this.posY, this.posZ);
-    } else if (axis === 'Z') {
-      // Cone points along +Z: rotate 90° around X, offset along Z.
-      mesh.rotation.x = Math.PI / 2;
-      mesh.position.set(this.posX, this.posY, this.posZ + this.height / 2);
-    }
-
-    return mesh;
+    const geo = new THREE.ConeGeometry(this.radius, this.height, 24);
+    // Bake the base/apex offset directly into the geometry's vertex data
+    // (not mesh.position) so it survives SceneManager._applyNodeTransformToMesh,
+    // which resets the MESH transform to identity before applying the node's
+    // own transform. A vertex-baked offset is immune to that reset — it's
+    // part of the local shape data now, exactly matching how the SDF math
+    // in NodeEvaluator/GLSLEvaluator already treats the cone (base at local
+    // origin, apex at local +height).
+    geo.translate(0, this.height / 2, 0);
+    return new THREE.Mesh(geo, this._wireMaterial());
   }
 
   updateParameters(params = {}) {
     if (params.radius !== undefined) this.radius = params.radius;
     if (params.height !== undefined) this.height = params.height;
-    if (params.posX   !== undefined) this.posX   = params.posX;
-    if (params.posY   !== undefined) this.posY   = params.posY;
-    if (params.posZ   !== undefined) this.posZ   = params.posZ;
     if (params.color  !== undefined) this.color  = params.color;
-    // Keep _params in sync so createObject() reads the latest axis value
-    if (params.axis   !== undefined) {
-      if (!this._params) this._params = {};
-      this._params.axis = params.axis;
-    }
     logger.info(`Updated ConePrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const r = this.radius, h = this.height;
+    const pts = [{ x:0, y:0, z:0 }, { x:0, y:h, z:0 }]; // base center, apex
+    [0, Math.PI/2, Math.PI, 3*Math.PI/2].forEach(a => {
+      pts.push({ x:r*Math.cos(a), y:0, z:r*Math.sin(a) });
+    });
+    return pts;
   }
 
   clone() {

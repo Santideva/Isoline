@@ -13,9 +13,32 @@ export const identityMapping = d => d;
  * @param {number[]} polyCoeffs - Array of coefficients.
  * @returns {Function} A function that maps a raw distance.
  */
-export function createPolynomialMapping(polyCoeffs) {
+export function createPolynomialMapping(polyCoeffs, band = Infinity) {
   return function(d, t = 0, depth = 0) {
-    return polyCoeffs.reduce((acc, coeff, i) => acc + coeff * Math.pow(d, i), 0);
+    // Windowed/additive — mirrors createSinusoidalMapping's fix (see that
+    // function's comment for the full derivation). Confining the
+    // polynomial's DEVIATION FROM IDENTITY (raw - d) to a compact band
+    // around d=0 guarantees f(d) === d exactly outside that band,
+    // regardless of how extreme c2/c3 are — eliminating both unbounded
+    // growth AND the sign-flip risk described above.
+    //
+    // band = Infinity (default) reproduces the ORIGINAL unwindowed
+    // behaviour exactly (the window is always 1 for any finite d) — this
+    // preserves every existing non-node caller unchanged (e.g. the legacy
+    // "line" shape's polyCoeffs effect, TrianglePrimitive's corner-
+    // rounding path). Only polynomialMapper NODES pass an explicit finite
+    // band (see NodeEvaluator.js / GLSLEvaluator.js), where the risk of
+    // an unbounded/sign-flipping polynomial actually applies (3D solids
+    // + ray march).
+    const raw = polyCoeffs.reduce((acc, coeff, i) => acc + coeff * Math.pow(d, i), 0);
+    if (!isFinite(band)) return raw;
+    const perturbation = raw - d;
+    const ad = Math.abs(d);
+    const safeBand = Math.max(band, 1e-4);
+    if (ad >= safeBand) return d;
+    const x = ad / safeBand;
+    const w = 1 - x * x * (3 - 2 * x);
+    return d + w * perturbation;
   };
 }
 
@@ -59,9 +82,27 @@ export function createLogarithmicMapping(a = 1, b = 1, c = 1, e = 0) {
  * @param {number} e - Vertical shift.
  * @returns {Function} A function that maps a raw distance.
  */
-export function createSinusoidalMapping(a = 1, b = 1, c = 0, e = 0) {
+export function createSinusoidalMapping(a = 1, b = 1, c = 0, e = 0, band = Infinity) {
   return function(d, t = 0, depth = 0) {
-    return a * Math.sin(b * d + c) + e;
+    // Windowed/additive, NOT a full replacement of d. A plain
+    // a*sin(b*d+c)+e REPLACEMENT has infinitely many zero-crossings,
+    // spaced 2*pi/b apart, at ALL distances — including far from the
+    // true surface. Applied to a 3D solid, ray marching correctly finds
+    // whichever crossing is nearest, which is very often NOT the true
+    // surface but a spurious "shell" floating some distance away —
+    // visually a giant, wrong blob, or (if that shell recedes past the
+    // renderer's max distance as an animated phase shifts) nothing at
+    // all. Confining the perturbation to a compact band around d=0
+    // guarantees f(d) === d exactly outside that band, so no spurious
+    // crossing can ever exist there.
+    const ad = Math.abs(d);
+    const safeBand = Math.max(band, 1e-4);
+    if (ad >= safeBand) return d;
+    const x = ad / safeBand;
+    const smooth = x * x * (3 - 2 * x); // smoothstep(0,1,x)
+    const w = 1 - smooth;
+    const perturb = a * Math.sin(b * d + c) + e;
+    return d + w * perturb;
   };
 }
 
@@ -75,7 +116,13 @@ export function createSinusoidalMapping(a = 1, b = 1, c = 0, e = 0) {
  */
 export function createPowerMapping(a = 1, b = 2, c = 0) {
   return function(d, t = 0, depth = 0) {
-    return a * Math.pow(d, b) + c;
+    // Signed power: preserves the sign of d, which for an SDF carries the
+    // essential inside/outside meaning. The previous plain Math.pow(d, b)
+    // silently destroyed that distinction for any even b (including the
+    // default b=2) — Math.pow(-1, 2) === Math.pow(1, 2) === 1, mapping
+    // "inside" and mirrored "outside" points to the identical value.
+    const sign = d < 0 ? -1 : 1;
+    return sign * a * Math.pow(Math.abs(d), b) + c;
   };
 }
 

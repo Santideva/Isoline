@@ -152,8 +152,6 @@ export class TrianglePrimitive extends DerivativePrimitive {
     this.type           = 'triangle';
     this.family         = 'curve';
     this.size           = params.size           || 1;
-    this.rotation       = params.rotation       || 0;
-    this.position       = params.position       || { x: 0, y: 0 };
     this.cornerRounding = params.cornerRounding || 0;
     this.verticesInput  = params.vertices       || null;
     this.edgeSmoothness = params.edgeSmoothness || [0, 0, 0];
@@ -168,7 +166,9 @@ export class TrianglePrimitive extends DerivativePrimitive {
     let vertices = (this.verticesInput && Array.isArray(this.verticesInput) && this.verticesInput.length === 3)
       ? this.verticesInput
       : this._createEquilateralVertices();
-    vertices = this._transformVertices(vertices);
+    // No _transformVertices() call — vertices stay in origin-centered local
+    // space. Placement is handled by the node's own transform, applied
+    // externally by SceneManager/NodeEvaluator, not baked in here.
 
     for (let i = 0; i < 3; i++) {
       const vertexA = new Vertex({ position: vertices[i],          color: this.color });
@@ -202,16 +202,7 @@ export class TrianglePrimitive extends DerivativePrimitive {
     ];
   }
 
-  _transformVertices(vertices) {
-    const cos = Math.cos(this.rotation);
-    const sin = Math.sin(this.rotation);
-    return vertices.map(v => ({
-      x: v.x * cos - v.y * sin + this.position.x,
-      y: v.x * sin + v.y * cos + this.position.y
-    }));
-  }
-
-  _applyCornerRounding() {
+    _applyCornerRounding() {
     for (let i = 0; i < this.shapes.length; i++) {
       const shape         = this.shapes[i];
       const currentMapper = shape.distanceMapper || identityMapping;
@@ -225,8 +216,6 @@ export class TrianglePrimitive extends DerivativePrimitive {
 
   updateParameters(params = {}) {
     if (params.size           !== undefined) this.size           = params.size;
-    if (params.rotation       !== undefined) this.rotation       = params.rotation;
-    if (params.position       !== undefined) this.position       = params.position;
     if (params.edgeSmoothness !== undefined) this.edgeSmoothness = params.edgeSmoothness;
     if (params.cornerRounding !== undefined) this.cornerRounding = params.cornerRounding;
     if (params.blendSmoothness !== undefined) this.blendSmoothness = params.blendSmoothness;
@@ -234,6 +223,11 @@ export class TrianglePrimitive extends DerivativePrimitive {
     if (params.vertices       !== undefined) this.verticesInput  = params.vertices;
     this._initializeTriangle();
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const verts = this._createEquilateralVertices();
+    return [{ x:0, y:0, z:0 }, ...verts.map(v => ({ x:v.x, y:v.y, z:0 }))];
   }
 
   clone() {
@@ -281,7 +275,6 @@ export class ArcPrimitive extends DerivativePrimitive {
     this.startAngle     = params.startAngle !== undefined ? params.startAngle : 0;
     this.endAngle       = params.endAngle   !== undefined ? params.endAngle   : Math.PI;
     this.segments       = params.segments   !== undefined ? params.segments   : 8;
-    this.position       = params.position   || { x: 0, y: 0 };
     this.thickness      = params.thickness  || 0;
     this.distanceMapper = params.distanceMapper || identityMapping;
     this._params        = { ...params };
@@ -297,9 +290,8 @@ export class ArcPrimitive extends DerivativePrimitive {
   // ── Exact analytic SDF ──────────────────────────────────────────────────
 
   computeSDF(point, callStack = [], time = 0, depth = 0) {
-    // Translate point into arc-local space (arc center at origin)
-    const px = point.x - this.position.x;
-    const py = point.y - this.position.y;
+    const px = point.x;
+    const py = point.y;
 
     // Angle of the query point
     let phi = Math.atan2(py, px);
@@ -351,8 +343,8 @@ export class ArcPrimitive extends DerivativePrimitive {
     for (let i = 0; i <= this.segments; i++) {
       const angle = this.startAngle + i * angleStep;
       points.push(new THREE.Vector3(
-        this.position.x + this.radius * Math.cos(angle),
-        this.position.y + this.radius * Math.sin(angle),
+        this.radius * Math.cos(angle),
+        this.radius * Math.sin(angle),
         0
       ));
     }
@@ -376,7 +368,6 @@ export class ArcPrimitive extends DerivativePrimitive {
     if (params.startAngle !== undefined) this.startAngle = params.startAngle;
     if (params.endAngle   !== undefined) this.endAngle   = params.endAngle;
     if (params.segments   !== undefined) this.segments   = params.segments;
-    if (params.position   !== undefined) this.position   = params.position;
     if (params.thickness  !== undefined) {
       this.thickness = params.thickness;
       // Update the distance mapper to reflect new thickness
@@ -396,6 +387,20 @@ export class ArcPrimitive extends DerivativePrimitive {
 
     logger.info(`Updated ArcPrimitive ${this.id}`);
     return this;
+  }
+
+  getLocalSnapPoints() {
+    const sx = this.radius * Math.cos(this.startAngle);
+    const sy = this.radius * Math.sin(this.startAngle);
+    const ex = this.radius * Math.cos(this.endAngle);
+    const ey = this.radius * Math.sin(this.endAngle);
+    const mid = (this.startAngle + this.endAngle) / 2;
+    const mx = this.radius * Math.cos(mid);
+    const my = this.radius * Math.sin(mid);
+    return [
+      { x:0, y:0, z:0 },
+      { x:sx, y:sy, z:0 }, { x:ex, y:ey, z:0 }, { x:mx, y:my, z:0 },
+    ];
   }
 
   clone() {

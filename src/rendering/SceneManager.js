@@ -19,7 +19,9 @@ import { SDFRenderer }      from "./SDFRenderer.js";
 import { RayMarchRenderer } from "./RayMarchRenderer.js";
 import { marchingCubes }    from "../utils/marchingCubes.js";
 import { trianglesToSTL, downloadSTL } from "../utils/stlExport.js";
-import { computeWorldBounds2D, computeWorldBounds3D } from "../utils/transform3D.js";
+import { computeWorldBounds2D, computeWorldBounds3D, applyForwardTransform3D } from "../utils/transform3D.js";
+import { computeMeanCurvature3D, raymarchToSurface, fibonacciSphereSamples, epsilonForScale, computeLocalFrame, snapToNearestSurface, computePrincipalCurvatures3D } from "../utils/differentialGeometry.js";
+import { OrbitGenerators, sphericalToDir } from "./orbitGenerators.js";
 
 
 export class SceneManager {
@@ -37,6 +39,26 @@ export class SceneManager {
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     mountElement.appendChild(this.renderer.domElement);
+
+    // ── Gizmo overlay (Phase 5d) ──────────────────────────────────────────
+    // A plain 2D canvas drawn on top of whichever render canvas is active.
+    // Replaces the old THREE.js-scene-based pivot gizmo, which only ever
+    // rendered in Marching Squares mode (the Three.js scene is hidden via
+    // opacity:0 in GLSL/Ray March mode, taking anything living inside it —
+    // including the gizmo — invisible along with it). Since this overlay
+    // is drawn fresh every frame by projecting world points through the
+    // CURRENT camera, using plain 2D canvas draw calls rather than Three.js
+    // scene objects, it works identically regardless of render mode.
+    this._gizmoOverlay = document.createElement('canvas');
+    this._gizmoOverlay.style.cssText = `
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 50;
+    `;
+    mountElement.appendChild(this._gizmoOverlay);
+    this._gizmoNodeId       = null; // node currently showing a pivot gizmo, or null
+    this._snapHighlightWorld = null; // {x,y,z} world point of an active snap highlight, or null
+    this._embedRegionNodeId = null; // embedNode currently showing its anchor+region ring, or null
+    this._resizeGizmoOverlay();
 
     // Attach OrbitControls to the CONTAINER, not to renderer.domElement.
     // This is critical: in ray march mode the ray march canvas sits on top
@@ -75,6 +97,24 @@ export class SceneManager {
         // warning will fire again if the graph becomes empty a second time.
         this._warnedNoGLSLSource     = false;
         this._warnedNoRayMarchSource = false;
+
+        // ── Ambi-Anamorph orbit camera (V1) ─────────────────────────────────
+        this._orbitActive       = false;
+        this._orbitGeneratorKey = 'circular';
+        this._orbitParams       = { speed: 0.3 };
+        this._orbitStartTime    = 0;
+        this._curvatureInterestMap = null; // computed on demand, not per-frame
+        this._boundingSphereCache = null;
+        this._boundingSphereCacheCounter = 0;
+
+        // Stop the orbit the moment the user manually drags — mirrors
+        // OrbitControls.autoRotate's free "any drag interrupts" behavior,
+        // which we lose by driving camera.position directly instead of
+        // through autoRotate (autoRotate can only do fixed-axis circular
+        // motion, so it can't express spiral/Lissajous/curvature-guided).
+        this.controls.addEventListener('start', () => {
+          if (this._orbitActive) this.stopOrbit();
+        });
 
         // ── Resize ────────────────────────────────────────────────────────────
         window.addEventListener("resize", () => this._onResize());
@@ -396,6 +436,7 @@ export class SceneManager {
         return this.addPrimitive("line");
     }
 
+    this._applyNodeTransformToMesh(entry.instance.id, entry.object);
     this.activePrimitives.push(entry);
     this._addToScene(entry);
     return entry;
@@ -485,9 +526,9 @@ export class SceneManager {
     } else if (typeof entry.instance.createLineObject === 'function') {
       entry.object = entry.instance.createLineObject(0);
     }
+    this._applyNodeTransformToMesh(shapeId, entry.object);
     this._addToScene(entry);
   }
-
   /**
    * Refresh all line primitives' geometry (called from the animation loop
    * and from visual-update callbacks).
@@ -577,7 +618,9 @@ export class SceneManager {
       this.updateLineGeometry(currentTime);
     }
 
+    this._updateOrbit();
     this.controls.update();
+    this._drawGizmoOverlay();
 
     if (this.renderMode === 'glsl') {
       // ── GLSL mode: only re-render when something actually changed ───────
@@ -597,7 +640,7 @@ export class SceneManager {
       const camMoved = camKey !== this._lastGLSLCamKey;
       if (camMoved) this._lastGLSLCamKey = camKey;
 
-      if (camMoved || this._glslDirty || this._sceneHasAnimatedNoise()) {
+      if (camMoved || this._glslDirty || this._sceneHasAnimatedNodes()) {
         this._glslDirty = false;
         this._renderGLSL();
       }
@@ -616,7 +659,7 @@ export class SceneManager {
       const camMoved = camKey !== this._lastRMCamKey;
       if (camMoved) this._lastRMCamKey = camKey;
 
-      if (camMoved || this._rayMarchDirty || this._sceneHasAnimatedNoise()) {
+      if (camMoved || this._rayMarchDirty || this._sceneHasAnimatedNodes()) {
         this._rayMarchDirty = false;
         this._renderRayMarch();
       }
@@ -638,11 +681,17 @@ export class SceneManager {
    * Cached for one frame (checked once per loop iteration, not per render
    * call) to avoid re-walking the graph on every animation frame.
    */
-  _sceneHasAnimatedNoise() {
-    // Cache the result for 30 frames to avoid graph-walking overhead
-    // at 60fps. Graph structure only changes when nodes are added/removed,
-    // which also sets _rayMarchDirty/_glslDirty anyway — so 30-frame
-    // staleness is inconsequential.
+  /**
+   * Renamed from _sceneHasAnimatedNoise (see call sites below). Generalized
+   * to check ANY node's 'animated' param rather than only noiseDisplaceNode
+   * — this was the actual root cause of morph/sinusoidal animations
+   * appearing to freeze: the render loop only kept re-rendering (absent
+   * camera movement) when this check returned true, and it never looked
+   * at morphBlend or sinusoidalMapper's own 'animated' flags. A generic
+   * check is also future-proof against any node added later that gains
+   * its own 'animated' param.
+   */
+  _sceneHasAnimatedNodes() {
     if (this._animatedNoiseFrame !== undefined &&
         this._animatedNoiseCounter < 30) {
       this._animatedNoiseCounter++;
@@ -653,9 +702,7 @@ export class SceneManager {
     const graph = this.glslEvaluator?.graph ?? stateStore.nodeGraph;
     let found = false;
     graph.nodes.forEach(n => {
-      if (n.type === 'noiseDisplaceNode' && n.params?.animated === 'yes') {
-        found = true;
-      }
+      if (n.params?.animated === 'yes') found = true;
     });
     this._animatedNoiseCached = found;
     this._animatedNoiseFrame  = true;
@@ -679,6 +726,952 @@ export class SceneManager {
     if (!entry.object) return;
     this.scene.remove(entry.object);
     if (entry.instance) entry.instance.rendered = false;
+  }
+
+  /**
+   * Apply a node's transform (posX/Y/Z, pivotX/Y/Z, rotateX/Y/Z, scale) to
+   * its Three.js preview mesh, so the wireframe proxy shown in the
+   * viewport always matches where the SDF actually places the shape.
+   *
+   * Mirrors the exact same forward composition used by the SDF math
+   * (NodeEvaluator._applyNodeTransform / GLSLEvaluator's per-node wrapper):
+   *   world = T(pos) · T(pivot) · R·S · T(-pivot) · local
+   *
+   * Silently does nothing if there's no matching graph node (e.g. this is
+   * called on a fully-composed render-result mesh from renderSDF(), which
+   * is already fully resolved in world space by the SDF sampling and must
+   * NOT be transformed again).
+   *
+   * @param {number} nodeId
+   * @param {THREE.Object3D} object3D
+   */
+  _applyNodeTransformToMesh(nodeId, object3D) {
+    if (!object3D) return;
+    const node = stateStore.nodeGraph.nodes.get(nodeId);
+    const t = node?.transform;
+    if (!t) return;
+
+    object3D.position.set(0, 0, 0);
+    object3D.quaternion.identity();
+    object3D.scale.set(1, 1, 1);
+    object3D.updateMatrix();
+
+    const pivot    = new THREE.Vector3(t.pivotX ?? 0, t.pivotY ?? 0, t.pivotZ ?? 0);
+    const euler    = new THREE.Euler(t.rotateX ?? 0, t.rotateY ?? 0, t.rotateZ ?? 0, 'XYZ');
+    const quat     = new THREE.Quaternion().setFromEuler(euler);
+    const scaleVal = t.scale ?? 1;
+    const pos      = new THREE.Vector3(t.posX ?? 0, t.posY ?? 0, t.posZ ?? 0);
+
+    const negPivot = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+    const rs       = new THREE.Matrix4().compose(
+      new THREE.Vector3(), quat, new THREE.Vector3(scaleVal, scaleVal, scaleVal)
+    );
+    const toPivot  = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
+    const toPos    = new THREE.Matrix4().makeTranslation(pos.x, pos.y, pos.z);
+
+    const full = new THREE.Matrix4()
+      .multiply(toPos)
+      .multiply(toPivot)
+      .multiply(rs)
+      .multiply(negPivot);
+
+    object3D.applyMatrix4(full);
+  }
+
+  /**
+   * Show a marker at a node's pivot WORLD position, plus a dashed
+   * connector line to the shape's local-origin's CURRENT world position.
+   * Together these make the effect of pivot comprehensible even though
+   * pivot alone (no rotation/scale) produces no shape movement:
+   *   - the marker shows WHERE the fixed point is
+   *   - the connector line shows the lever-arm relationship, and visibly
+   *     swings/stretches as rotation/scale sliders move, making the
+   *     "rotate around this point" effect legible as you drag.
+   *
+   * Pivot marker world position: position + pivot (see transform3D.js
+   * header derivation — this is the one local point the transform holds
+   * fixed under rotation/scale).
+   * Connector endpoint: applyForwardTransform3D({x:0,y:0,z:0}, t) — the
+   * shape's own local origin mapped forward into world space, which DOES
+   * move under rotation/scale, unlike the pivot point itself.
+   */
+  showPivotGizmo(nodeId) {
+    this._gizmoNodeId = nodeId;
+    this._drawGizmoOverlay();
+  }
+
+  hidePivotGizmo() {
+    this._gizmoNodeId = null;
+    this._drawGizmoOverlay();
+  }
+
+  /**
+   * Draw the pivot gizmo (marker + dashed connector) and any active snap
+   * highlight onto the 2D overlay canvas, by projecting their world-space
+   * points through the CURRENT camera. Called every animation frame
+   * (cheap — plain 2D canvas draws, no shader/scene involvement) so it
+   * stays correct as the camera orbits, regardless of which render mode
+   * (marchingSquares / glsl / rayMarch) is currently active.
+   */
+  _drawGizmoOverlay() {
+    const canvas = this._gizmoOverlay;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Same staleness concern as pickNodeAtScreenPosition/findNearestSnapPoint —
+    // ensure matrices are current before projecting.
+    this.camera.updateMatrixWorld(true);
+
+    const project = (worldPt) => {
+      const v = new THREE.Vector3(worldPt.x, worldPt.y, worldPt.z).project(this.camera);
+      if (v.z > 1 || v.z < -1) return null; // behind camera
+      return { x: (v.x * 0.5 + 0.5) * canvas.width, y: (-v.y * 0.5 + 0.5) * canvas.height };
+    };
+
+    if (this._gizmoNodeId !== null) {
+      const node = stateStore.nodeGraph.nodes.get(this._gizmoNodeId);
+      const t = node?.transform;
+      if (t) {
+        const pivotWorld  = { x: (t.posX??0)+(t.pivotX??0), y: (t.posY??0)+(t.pivotY??0), z: (t.posZ??0)+(t.pivotZ??0) };
+        const originWorld = applyForwardTransform3D({ x: 0, y: 0, z: 0 }, t);
+        const pScreen = project(pivotWorld);
+        const oScreen = project(originWorld);
+
+        if (pScreen && oScreen) {
+          ctx.setLineDash([6, 4]);
+          ctx.strokeStyle = 'rgba(127,119,221,0.85)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(pScreen.x, pScreen.y);
+          ctx.lineTo(oScreen.x, oScreen.y);
+          ctx.stroke();
+        }
+        if (pScreen) {
+          ctx.setLineDash([]);
+          ctx.fillStyle = 'rgba(127,119,221,0.95)';
+          ctx.beginPath();
+          ctx.arc(pScreen.x, pScreen.y, 6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    if (this._snapHighlightWorld) {
+      const s = project(this._snapHighlightWorld);
+      if (s) {
+        ctx.fillStyle = 'rgba(255,204,51,0.95)';
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, 7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    if (this._embedRegionNodeId !== null) {
+      this._drawEmbedRegionOverlay(ctx, project);
+    }
+  }
+
+  showEmbedRegion(nodeId) {
+    this._embedRegionNodeId = nodeId;
+    this._drawGizmoOverlay();
+  }
+
+  hideEmbedRegion() {
+    this._embedRegionNodeId = null;
+    this._drawGizmoOverlay();
+  }
+
+  /**
+   * Draw a translucent ring at an embedNode's (self-corrected) anchor,
+   * sized to regionSize, oriented in the host's local tangent plane at
+   * that point — the actual visual answer to "what area is selected".
+   * Recomputed fresh every call (every animation frame while shown) so it
+   * live-updates as anchor/regionSize sliders move or the host is edited.
+   *
+   * Deliberately reuses whatever's already cached in this.evaluator
+   * rather than calling invalidate() — this is a UI aid, not a render
+   * path, and forcing a full cache invalidation every frame here would
+   * needlessly cost every OTHER render path that shares the same evaluator.
+   */
+  _drawEmbedRegionOverlay(ctx, project) {
+    const node = stateStore.nodeGraph.nodes.get(this._embedRegionNodeId);
+    if (!node || node.type !== 'embedNode') return;
+    const hostEdge = stateStore.nodeGraph.getIncomingEdge(node.id, 'hostSdf');
+    if (!hostEdge) return;
+
+    this.evaluator.graph = stateStore.nodeGraph;
+    let hostResult;
+    try { hostResult = this.evaluator.evaluate(hostEdge.fromNode); } catch (e) { return; }
+    const hostFn = hostResult?.sdf || hostResult?.result;
+    if (typeof hostFn !== 'function') return;
+
+    const p = node.params;
+
+    // Same self-correction and frame-building the actual embedNode math
+    // uses (NodeEvaluator.js / GLSLEvaluator.js) — reused directly from
+    // differentialGeometry.js rather than an inline gradient closure and
+    // hand-rolled Gram-Schmidt, so this overlay can never silently drift
+    // from what the shape is actually sampled against.
+    const rawAnchor = { x: p.anchorX ?? 0, y: p.anchorY ?? 0, z: p.anchorZ ?? 0 };
+    const anchor = snapToNearestSurface(hostFn, rawAnchor, 4);
+
+    const frame = computeLocalFrame(hostFn, anchor);
+    if (!frame) return; // degenerate gradient at this anchor — nothing stable to draw
+
+    const n = frame.normal;
+    const tx = frame.tangent.x,   ty = frame.tangent.y,   tz = frame.tangent.z;
+    const bx = frame.bitangent.x, by = frame.bitangent.y, bz = frame.bitangent.z;
+
+    // Principal curvatures/directions — Tier 2, the one deliberate
+    // consumer of the full eigensolve in this codebase: a human reading
+    // this overlay wants an oriented "this direction is more/less curved"
+    // line, not a raw quadratic form. embedNode's own sag math never
+    // needs this — it stays on Tier 1 (computeShapeOperator2x2).
+    const curv = computePrincipalCurvatures3D(hostFn, anchor);
+
+    const radius = p.regionSize ?? 1.0;
+    const RING_SEGMENTS = 24;
+    const screenPts = [];
+    for (let i = 0; i <= RING_SEGMENTS; i++) {
+      const a = (i / RING_SEGMENTS) * Math.PI * 2;
+      const wx = anchor.x + radius * (Math.cos(a)*tx + Math.sin(a)*bx);
+      const wy = anchor.y + radius * (Math.cos(a)*ty + Math.sin(a)*by);
+      const wz = anchor.z + radius * (Math.cos(a)*tz + Math.sin(a)*bz);
+      screenPts.push(project({ x: wx, y: wy, z: wz }));
+    }
+
+    if (screenPts.every(pt => pt === null)) return; // entirely off-camera
+
+    ctx.beginPath();
+    let started = false;
+    screenPts.forEach(pt => {
+      if (!pt) return;
+      if (!started) { ctx.moveTo(pt.x, pt.y); started = true; }
+      else ctx.lineTo(pt.x, pt.y);
+    });
+    ctx.strokeStyle = 'rgba(80,220,220,0.9)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(80,220,220,0.12)';
+    ctx.fill();
+
+    const anchorScreen = project(anchor);
+    if (anchorScreen) {
+      ctx.fillStyle = 'rgba(80,220,220,0.95)';
+      ctx.beginPath();
+      ctx.arc(anchorScreen.x, anchorScreen.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Local-axis gizmo — the direct answer to "why is my guest shape's
+    // rotation unpredictable relative to the camera": the guest's own
+    // Transform (position/rotation) applies to coordinates already
+    // expressed in THIS local frame, not world space. Red/green = along
+    // the surface (tangent/bitangent); blue = into/out of the surface
+    // (normal) — a guest's default Rz=0 orientation puts its own "up"
+    // axis along green, not blue, so most guests need SOME rotation to
+    // point outward rather than lying flat.
+    if (anchorScreen) {
+      const axisLen = Math.max(radius * 0.6, 0.15);
+      const drawAxis = (dx, dy, dz, color, label) => {
+        const tip = project({
+          x: anchor.x + dx * axisLen,
+          y: anchor.y + dy * axisLen,
+          z: anchor.z + dz * axisLen,
+        });
+        if (!tip) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(anchorScreen.x, anchorScreen.y);
+        ctx.lineTo(tip.x, tip.y);
+        ctx.stroke();
+        ctx.fillStyle = color;
+        ctx.font = '11px sans-serif';
+        ctx.fillText(label, tip.x + 3, tip.y - 3);
+      };
+      drawAxis(tx, ty, tz,     'rgba(255,90,90,0.95)',   'X');
+      drawAxis(bx, by, bz,     'rgba(90,255,120,0.95)',  'Y');
+      drawAxis(n.x, n.y, n.z,  'rgba(90,150,255,0.95)',  'Z (normal)');
+
+      // Principal-curvature indicator — DISTINCT from the T0/B0 sampling
+      // axes above (dir1/dir2 generally are NOT aligned with tangent/
+      // bitangent — they only coincide when T0/B0 happen to already be
+      // principal-aligned). Two dashed lines, one per principal
+      // direction, each scaled by |k1|/|k2| so a strongly-curved
+      // direction (e.g. circumferentially around a cylinder) visibly
+      // reads longer than a flat one (e.g. along the cylinder's axis,
+      // where k2≈0 collapses that line away) — this is the actual
+      // "show anisotropy" addition, kept visually separate from the
+      // sampling-basis gizmo above so the two are never confused for
+      // each other.
+      if (curv) {
+        const maxK = Math.max(Math.abs(curv.k1), Math.abs(curv.k2), 1e-6);
+        const drawPrincipal = (dir, k, color, label) => {
+          const len = axisLen * 0.9 * (Math.abs(k) / maxK);
+          if (len < 1e-4) return; // umbilic/flat direction — nothing meaningful to draw
+          const tip1 = project({ x: anchor.x + dir.x*len, y: anchor.y + dir.y*len, z: anchor.z + dir.z*len });
+          const tip2 = project({ x: anchor.x - dir.x*len, y: anchor.y - dir.y*len, z: anchor.z - dir.z*len });
+          if (!tip1 || !tip2) return;
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(tip1.x, tip1.y);
+          ctx.lineTo(tip2.x, tip2.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = color;
+          ctx.font = '10px sans-serif';
+          ctx.fillText(`${label} ${k.toFixed(2)}`, tip1.x + 3, tip1.y + 10);
+        };
+        drawPrincipal(curv.dir1, curv.k1, 'rgba(255,200,60,0.9)', 'k1');
+        drawPrincipal(curv.dir2, curv.k2, 'rgba(230,120,255,0.9)', 'k2');
+      }
+
+      // Depth indicator — small markers at ±depth along the normal,
+      // giving a rough sense of the emboss height / engrave depth. Not a
+      // precise boundary (the true gate follows the host's actual
+      // surface, which can curve — see the embedNode fix comment), just
+      // an at-a-glance scale reference.
+      const depthVal = p.depth ?? 0.35;
+      [1, -1].forEach(sign => {
+        const tip = project({
+          x: anchor.x + n.x * depthVal * sign,
+          y: anchor.y + n.y * depthVal * sign,
+          z: anchor.z + n.z * depthVal * sign,
+        });
+        if (!tip) return;
+        ctx.strokeStyle = 'rgba(255,220,80,0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(tip.x, tip.y, 4, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+    }
+  }
+
+  showSnapHighlight(worldPos) {
+    this._snapHighlightWorld = { x: worldPos.x, y: worldPos.y, z: worldPos.z };
+    this._drawGizmoOverlay();
+  }
+
+  hideSnapHighlight() {
+    this._snapHighlightWorld = null;
+    this._drawGizmoOverlay();
+  }
+
+  /** Local-space landmark points for a node, with a safe fallback (origin
+   *  only) for node types that don't define getLocalSnapPoints() —
+   *  primarily blend/transform nodes, which have no explicit shape of
+   *  their own but still have a meaningful transform anchor to snap to. */
+  _getNodeLocalSnapPoints(nodeId) {
+    const shape = stateStore.getShape(nodeId);
+    if (shape && typeof shape.getLocalSnapPoints === 'function') {
+      return shape.getLocalSnapPoints();
+    }
+    return [{ x: 0, y: 0, z: 0 }];
+  }
+
+  /**
+   * Build the world-space snap candidate pool for a drag operation.
+   * @param {'position'|'pivot'} mode
+   * @param {number} draggedNodeId
+   */
+  _collectSnapCandidates(mode, draggedNodeId) {
+    const graph = stateStore.nodeGraph;
+    const candidates = [];
+
+    graph.nodes.forEach((node, id) => {
+      if (node.type === 'outputNode') return;
+      const isSelf = id === draggedNodeId;
+      // Position snap excludes the dragged node's own points — snapping a
+      // shape's position to its own corner is meaningless, since the
+      // shape moves together with its own position.
+      if (mode === 'position' && isSelf) return;
+
+      const localPts = this._getNodeLocalSnapPoints(id);
+      localPts.forEach(lp => {
+        const w = applyForwardTransform3D(lp, node.transform || {});
+        candidates.push({
+          world: new THREE.Vector3(w.x, w.y, w.z),
+          local: isSelf ? lp : null,
+          sourceNodeId: id,
+          isSelf,
+        });
+      });
+    });
+
+    return candidates;
+  }
+
+  /**
+   * Find the screen-nearest snap candidate to a cursor position, within a
+   * pixel threshold. Returns null if nothing qualifies.
+   */
+  findNearestSnapPoint(clientX, clientY, mode, draggedNodeId, thresholdPx = 24) {
+    // Same staleness issue as pickNodeAtScreenPosition — see its comment.
+    this.camera.updateMatrixWorld(true);
+
+    const candidates = this._collectSnapCandidates(mode, draggedNodeId);
+    if (candidates.length === 0) return null;
+
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    let best = null;
+    let bestDist = thresholdPx;
+
+    candidates.forEach(c => {
+      const ndc = c.world.clone().project(this.camera);
+      if (ndc.z > 1 || ndc.z < -1) return; // behind camera / clipped
+      const sx = (ndc.x * 0.5 + 0.5) * rect.width  + rect.left;
+      const sy = (-ndc.y * 0.5 + 0.5) * rect.height + rect.top;
+      const dist = Math.hypot(sx - clientX, sy - clientY);
+      if (dist < bestDist) { bestDist = dist; best = c; }
+    });
+
+    return best;
+  }
+
+  /** Gold marker shown at a candidate snap point during a drag, distinct
+   *  in color from the (purple) pivot gizmo so the two are never confused. */
+  showSnapHighlight(worldPos) {
+    if (!this._snapHighlight) {
+      const geo = new THREE.SphereGeometry(0.1, 12, 8);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffcc33, depthTest: false, transparent: true, opacity: 0.95,
+      });
+      this._snapHighlight = new THREE.Mesh(geo, mat);
+      this._snapHighlight.renderOrder = 1000;
+      this.scene.add(this._snapHighlight);
+    }
+    this._snapHighlight.position.copy(worldPos);
+    this._snapHighlight.visible = true;
+  }
+
+  hideSnapHighlight() {
+    if (this._snapHighlight) this._snapHighlight.visible = false;
+  }
+
+  /**
+   * Click-to-select picking: given a screen-space click position, find
+   * which node's geometry is actually visible at that pixel.
+   *
+   * Approach (CPU-side, works identically across all three render modes
+   * since it never touches the GPU):
+   *   1. Build a world-space ray from the camera through the clicked pixel.
+   *   2. Sphere-trace that ray against the fully combined scene SDF
+   *      (evaluator.getRootSDF()) to find the world-space hit point —
+   *      exactly what's visibly rendered at that pixel, regardless of
+   *      which render mode is currently displaying it.
+   *   3. Evaluate every top-level node's OWN (already transform-wrapped)
+   *      SDF at that hit point, and pick whichever node reports the value
+   *      closest to zero — i.e. whichever node's surface actually passes
+   *      through that point.
+   *
+   * IMPORTANT — which node this selects: for a linear chain
+   * (primitive → transform → transform → output), only the LAST node
+   * before output has a value near zero at the point actually visible in
+   * the viewport — every upstream node's own SDF describes an earlier,
+   * different intermediate shape. So this method selects the TAIL node of
+   * whatever chain produced the visible surface, not necessarily the
+   * originating primitive — this mirrors how viewport picking already
+   * works in Houdini (clicking selects what's on display, not an
+   * arbitrary upstream generator) and is intentional, not a limitation.
+   *
+   * Works for both 2D and 3D geometry: 2D primitives' SDFs ignore the Z
+   * coordinate entirely, so sphere-tracing still converges correctly on
+   * (x,y) regardless of which Z the ray happens to be at when it converges.
+   *
+   * @param {number} clientX  Mouse event clientX
+   * @param {number} clientY  Mouse event clientY
+   * @returns {number|null}   The picked node's id, or null if nothing was hit
+   */
+   pickNodeAtScreenPosition(clientX, clientY) {
+    // Camera.matrixWorld/matrixWorldInverse only get recomputed during
+    // renderer.render(scene, camera)'s traversal, which only happens in
+    // marchingSquares mode (see _loop()) — in GLSL/Ray March mode that
+    // call is skipped, so these matrices go stale the moment OrbitControls
+    // moves the camera. Raycasting/projecting with stale matrices produces
+    // wrong results except by coincidence (e.g. dead-center clicks lining
+    // up with whatever the camera's last-rendered orientation happened to
+    // be). Force a refresh here so picking works correctly in all modes.
+    this.camera.updateMatrixWorld(true);
+
+    const dom  = this.renderer.domElement;
+    const rect = dom.getBoundingClientRect();
+    const ndcX =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+    const ndcY = -((clientY - rect.top)  / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+    const ro = raycaster.ray.origin;
+    const rd = raycaster.ray.direction;
+
+    this.evaluator.graph = stateStore.nodeGraph;
+    this.evaluator.invalidate();
+    const sdf = this.evaluator.getRootSDF();
+    if (!sdf) return null;
+
+    // ── Step 1: sphere-trace to find the world-space hit point ───────────
+    const MAX_STEPS = 256;
+    const MAX_DIST  = 100;
+    const EPS       = 0.001;
+    let t = 0.01;
+    let hitPoint = null;
+
+    for (let i = 0; i < MAX_STEPS; i++) {
+      const p = { x: ro.x + rd.x * t, y: ro.y + rd.y * t, z: ro.z + rd.z * t };
+      let d;
+      try { d = sdf(p); } catch (e) { break; }
+      if (!isFinite(d)) break;
+      if (d < EPS) { hitPoint = p; break; }
+      t += d;
+      if (t > MAX_DIST) break;
+    }
+
+    if (!hitPoint) return null; // clicked empty space
+
+    // ── Step 2: find which top-level node's own SDF is closest to zero ───
+    const graph = stateStore.nodeGraph;
+    let bestId  = null;
+    let bestAbs = Infinity;
+
+    graph.nodes.forEach((node, id) => {
+      if (node.type === 'outputNode') return;
+      let result;
+      try {
+        result = this.evaluator.evaluate(id);
+      } catch (e) {
+        return; // node evaluation failed (e.g. missing required input) — skip
+      }
+      const fn = result?.sdf || result?.result;
+      if (typeof fn !== 'function') return; // mapper/time/oscillator nodes — not pickable
+
+      let v;
+      try { v = fn(hitPoint); } catch (e) { return; }
+      const av = Math.abs(v);
+      if (av < bestAbs) { bestAbs = av; bestId = id; }
+    });
+
+    return bestId;
+  }
+
+  /**
+   * Estimate a node's own approximate "radius" (half-extent) by sphere-
+   * tracing outward from its own transform position along ten directions,
+   * using ONLY that node's own (already transform-wrapped) SDF — never
+   * the combined scene. Used by Morph Auto-Fit to compare two shapes'
+   * sizes before proposing a compensating scale.
+   *
+   * Coarse by design: good enough to roughly equalize two shapes'
+   * apparent size, not a precise bounding-volume computation.
+   */
+  estimateNodeRadius(nodeId) {
+    // Array-aware dispatch: a Repeat or finite-extent Tiling node's
+    // nearest-surface sphere-trace only ever finds the EDGE OF ONE COPY,
+    // not the array's true outer extent — the acknowledged limitation
+    // from Auto-Fit's first version. For these two types, compute the
+    // extent analytically from the array's own params instead.
+    const arrayNode = stateStore.nodeGraph.nodes.get(nodeId);
+    const isArrayNode = arrayNode && (
+      arrayNode.type === 'repeatNode' ||
+      (arrayNode.type === 'tilingNode' && arrayNode.params?.extent === 'finite')
+    );
+    if (isArrayNode) return this._estimateArrayRadius(nodeId, arrayNode);
+
+    this.evaluator.graph = stateStore.nodeGraph;
+    this.evaluator.invalidate();
+    let result;
+    try { result = this.evaluator.evaluate(nodeId); } catch (e) { return 1; }
+    const fn = result?.sdf || result?.result;
+    if (typeof fn !== 'function') return 1;
+
+    const node = stateStore.nodeGraph.nodes.get(nodeId);
+    const center = {
+      x: node?.transform?.posX ?? 0,
+      y: node?.transform?.posY ?? 0,
+      z: node?.transform?.posZ ?? 0,
+    };
+
+    const DIRS = [
+      [1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],
+      [0.577,0.577,0.577],[-0.577,0.577,0.577],
+      [0.577,-0.577,0.577],[0.577,0.577,-0.577],
+    ];
+    const MAX_DIST = 20, STEP = 0.05;
+    const radii = [];
+
+    DIRS.forEach(([dx, dy, dz]) => {
+      let t = 0, lastSign = null;
+      while (t < MAX_DIST) {
+        const p = { x: center.x + dx*t, y: center.y + dy*t, z: center.z + dz*t };
+        let d;
+        try { d = fn(p); } catch (e) { break; }
+        if (!isFinite(d)) break;
+        const sign = d < 0 ? -1 : 1;
+        if (lastSign !== null && sign !== lastSign) { radii.push(t); return; }
+        lastSign = sign;
+        t += STEP;
+      }
+    });
+
+    if (radii.length === 0) return 1;
+    return radii.reduce((a,b) => a+b, 0) / radii.length;
+  }
+
+  /**
+   * Array-extent radius for Repeat / finite Tiling nodes — the analytic
+   * counterpart to the generic sphere-trace above, which cannot see past
+   * the nearest individual copy. Computes each axis's half-span from
+   * (count-1)/2 * spacing, takes the largest axis, then adds the radius
+   * of the underlying LEAF shape (recursing into whatever feeds this
+   * array node's 'sdf' input via the same estimateNodeRadius — correctly
+   * falling through to the generic sphere-trace for an ordinary
+   * primitive, or recursing again if arrays are chained).
+   *
+   * This is a bounding-sphere APPROXIMATION (assumes the leaf's own
+   * radius is roughly uniform in every direction and centered near its
+   * own transform origin) — adequate for Auto-Fit's purpose (comfortably
+   * fitting an array inside a region), not a tight/exact bound.
+   */
+  _estimateArrayRadius(nodeId, node) {
+    const p = node.params;
+    const cX = Math.max(1, Math.round(p.countX ?? 3));
+    const cY = Math.max(1, Math.round(p.countY ?? 3));
+    const cZ = Math.max(1, Math.round(p.countZ ?? 1));
+    const sX = p.spacingX ?? p.periodX ?? 3;
+    const sY = p.spacingY ?? p.periodY ?? 3;
+    const sZ = p.spacingZ ?? p.periodZ ?? 3;
+
+    const halfSpanX = ((cX - 1) / 2) * sX;
+    const halfSpanY = ((cY - 1) / 2) * sY;
+    const halfSpanZ = ((cZ - 1) / 2) * sZ;
+    const maxHalfSpan = Math.max(halfSpanX, halfSpanY, halfSpanZ, 0);
+
+    const edge = stateStore.nodeGraph.getIncomingEdge(nodeId, 'sdf');
+    const leafRadius = edge ? this.estimateNodeRadius(edge.fromNode) : 1;
+
+    return maxHalfSpan + leafRadius;
+  }
+
+/**
+   * Compute a bounding sphere (center + radius) covering all evaluable
+   * geometry nodes in the graph — the foundational math both `frameAll()`
+   * and the orbit-camera system's framing distance depend on. Cached for
+   * 30 frames (same pattern as _sceneHasAnimatedNodes) since it involves
+   * an estimateNodeRadius() call per node.
+   */
+  computeSceneBoundingSphere() {
+    if (this._boundingSphereCache && this._boundingSphereCacheCounter < 30) {
+      this._boundingSphereCacheCounter++;
+      return this._boundingSphereCache;
+    }
+    this._boundingSphereCacheCounter = 0;
+
+    this.evaluator.graph = stateStore.nodeGraph;
+    this.evaluator.invalidate();
+    const graph = stateStore.nodeGraph;
+
+    let minX=Infinity, minY=Infinity, minZ=Infinity;
+    let maxX=-Infinity, maxY=-Infinity, maxZ=-Infinity;
+    let found = false;
+
+    graph.nodes.forEach((node, id) => {
+      if (node.type === 'outputNode') return;
+      let result;
+      try { result = this.evaluator.evaluate(id); } catch (e) { return; }
+      const fn = result?.sdf || result?.result;
+      if (typeof fn !== 'function') return; // mapper/time/oscillator — no spatial extent
+
+      const r  = this.estimateNodeRadius(id);
+      const cx = node.transform?.posX ?? 0;
+      const cy = node.transform?.posY ?? 0;
+      const cz = node.transform?.posZ ?? 0;
+      minX = Math.min(minX, cx-r); minY = Math.min(minY, cy-r); minZ = Math.min(minZ, cz-r);
+      maxX = Math.max(maxX, cx+r); maxY = Math.max(maxY, cy+r); maxZ = Math.max(maxZ, cz+r);
+      found = true;
+    });
+
+    const result = !found
+      ? { center: { x:0, y:0, z:0 }, radius: 2 }
+      : {
+          center: { x:(minX+maxX)/2, y:(minY+maxY)/2, z:(minZ+maxZ)/2 },
+          radius: Math.max(Math.sqrt((maxX-minX)**2 + (maxY-minY)**2 + (maxZ-minZ)**2) / 2, 0.5),
+        };
+
+    this._boundingSphereCache = result;
+    return result;
+  }
+
+  /**
+   * Distance from a bounding-sphere center at which the WHOLE sphere just
+   * fits within the camera's vertical FOV, plus a small padding factor so
+   * geometry doesn't touch the viewport edge exactly.
+   */
+  _framingDistance(radius) {
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    return (radius / Math.sin(fovRad / 2)) * 1.15;
+  }
+
+  /**
+   * Reframe the camera to comfortably show all geometry, preserving the
+   * CURRENT viewing angle (just pushes the camera back/forward and
+   * recenters, rather than resetting to a canonical view). Animates over
+   * ~350ms rather than snapping instantly.
+   */
+  frameAll(animate = true) {
+    const { center, radius } = this.computeSceneBoundingSphere();
+    const distance = this._framingDistance(radius);
+
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+    if (dir.lengthSq() < 1e-6) dir.set(0.6, 0.7, 1.0).normalize(); // degenerate fallback
+
+    const newTarget = new THREE.Vector3(center.x, center.y, center.z);
+    const newPos     = newTarget.clone().add(dir.multiplyScalar(distance));
+
+    if (!animate) {
+      this.camera.position.copy(newPos);
+      this.controls.target.copy(newTarget);
+      this.controls.update();
+      return;
+    }
+
+    const startPos    = this.camera.position.clone();
+    const startTarget = this.controls.target.clone();
+    const startTime   = performance.now();
+    const DURATION_MS = 350;
+
+    const step = () => {
+      const elapsed = performance.now() - startTime;
+      const raw = Math.min(1, elapsed / DURATION_MS);
+      const eased = raw * raw * (3 - 2 * raw); // smoothstep
+      this.camera.position.lerpVectors(startPos, newPos, eased);
+      this.controls.target.lerpVectors(startTarget, newTarget, eased);
+      this.controls.update();
+      if (raw < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  /**
+   * Sample ~sampleCount evenly-distributed directions around the scene's
+   * bounding sphere, ray-march inward to find each direction's actual
+   * surface hit, and score that point's mean curvature — producing a
+   * curvature "interest map" the curvatureGuided orbit generator biases
+   * toward. NOT recomputed per-frame (19 SDF evals × sampleCount is real
+   * cost) — only when curvature-guided mode is activated or explicitly
+   * refreshed via the UI's "Recompute Interest Map" button.
+   */
+  /**
+   * Build a min-combined SDF directly from every evaluable top-level node,
+   * bypassing the Output-node/edge-wiring requirement getRootSDF() has.
+   * Used as a fallback for curvature sampling so it works even before the
+   * user has ever clicked Render (a real, previously-unhandled case: e.g.
+   * pressing R for curvature-guided orbit immediately after adding
+   * primitives). Less precise than getRootSDF() for non-union graphs
+   * (it doesn't respect intersection/difference operations between
+   * top-level nodes — each node's OWN surface is included independently),
+   * but adequate for viewpoint SCORING rather than exact geometry.
+   */
+  _combinedEvaluableSDF() {
+    const graph = stateStore.nodeGraph;
+    const fns = [];
+    graph.nodes.forEach((node, id) => {
+      if (node.type === 'outputNode') return;
+      let result;
+      try { result = this.evaluator.evaluate(id); } catch (e) { return; }
+      const fn = result?.sdf || result?.result;
+      if (typeof fn === 'function') fns.push(fn);
+    });
+    if (fns.length === 0) return null;
+    if (fns.length === 1) return fns[0];
+    return (pt) => {
+      let d = Infinity;
+      for (const fn of fns) d = Math.min(d, fn(pt));
+      return d;
+    };
+  }
+
+  computeCurvatureInterestMap(sampleCount = 32) {
+    const { center, radius } = this.computeSceneBoundingSphere();
+    this.evaluator.graph = stateStore.nodeGraph;
+    this.evaluator.invalidate();
+    // Prefer the fully-wired root SDF (respects the actual blend
+    // operations between nodes); fall back to a simple per-node union
+    // when no Output node is wired yet — see _combinedEvaluableSDF's
+    // doc comment for the tradeoff this fallback makes.
+    let sdf = this.evaluator.getRootSDF();
+    if (!sdf) sdf = this._combinedEvaluableSDF();
+    if (!sdf) return [];
+
+    // Scale-relative epsilon, derived from the scene's own bounding-sphere
+    // radius rather than a fixed constant — a fixed 0.001 would behave
+    // very differently for a radius-1 scene vs. a radius-10000 one.
+    const eps = epsilonForScale(radius);
+
+    const directions = fibonacciSphereSamples(sampleCount);
+    const map = [];
+
+    directions.forEach(dir => {
+      const origin = {
+        x: center.x - dir.x * radius * 1.8,
+        y: center.y - dir.y * radius * 1.8,
+        z: center.z - dir.z * radius * 1.8,
+      };
+      const hit = raymarchToSurface(sdf, origin, dir, radius * 4, eps);
+      if (!hit) return;
+      const curvature = computeMeanCurvature3D(sdf, hit, eps);
+      map.push({ dir, score: Math.abs(curvature) });
+    });
+
+    // Normalize scores to [0,1] so curvatureStrength behaves consistently
+    // regardless of the scene's absolute curvature magnitude.
+    const maxScore = map.reduce((m, s) => Math.max(m, s.score), 0) || 1;
+    map.forEach(s => { s.score = s.score / maxScore; });
+
+    this._curvatureInterestMap = map;
+    return map;
+  }
+
+  /**
+   * Start the pluggable orbit driver. Replaces OrbitControls.autoRotate
+   * (which only does fixed-axis circular motion) — drives camera.position/
+   * controls.target directly each frame using the selected generator.
+   * @param {string} generatorKey  One of OrbitGenerators' keys
+   * @param {object} params        Passed through to the generator
+   */
+  startOrbit(generatorKey = 'circular', params = {}) {
+    if (generatorKey === 'curvatureGuided' && !this._curvatureInterestMap) {
+      this.computeCurvatureInterestMap();
+    }
+    this._orbitGeneratorKey = generatorKey;
+    this._orbitParams       = params;
+    this._orbitStartTime    = performance.now();
+    this._orbitActive       = true;
+  }
+
+  stopOrbit() {
+    this._orbitActive = false;
+  }
+
+  isOrbitActive() {
+    return this._orbitActive;
+  }
+
+  /** Called once per animation frame from _loop() when orbit is active. */
+  _updateOrbit() {
+    if (!this._orbitActive) return;
+    const generator = OrbitGenerators[this._orbitGeneratorKey] || OrbitGenerators.circular;
+    const t = (performance.now() - this._orbitStartTime) / 1000;
+
+    const { theta, phi } = generator.generate(t, this._orbitParams, this._curvatureInterestMap);
+    const dir = sphericalToDir(theta, phi);
+
+    const { center, radius } = this.computeSceneBoundingSphere();
+    const distance = this._framingDistance(radius);
+
+    this.camera.position.set(
+      center.x + dir.x * distance,
+      center.y + dir.y * distance,
+      center.z + dir.z * distance
+    );
+    this.controls.target.set(center.x, center.y, center.z);
+    // NOTE: controls.update() is still called once per frame by the
+    // existing _loop() body right after this — not duplicated here.
+  }
+
+  /**
+   * Sphere-trace against ONE SPECIFIC node's own SDF (not the whole
+   * combined scene) — used by embedNode's anchor-picking mode so a click
+   * always anchors to the intended host, even if other geometry overlaps
+   * it in the current view.
+   */
+  pickSurfacePointOnNode(nodeId, clientX, clientY) {
+    this.camera.updateMatrixWorld(true);
+    const dom  = this.renderer.domElement;
+    const rect = dom.getBoundingClientRect();
+    const ndcX =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+    const ndcY = -((clientY - rect.top)  / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+    const ro = raycaster.ray.origin;
+    const rd = raycaster.ray.direction;
+
+    this.evaluator.graph = stateStore.nodeGraph;
+    this.evaluator.invalidate();
+    let result;
+    try { result = this.evaluator.evaluate(nodeId); } catch (e) { return null; }
+    const fn = result?.sdf || result?.result;
+    if (typeof fn !== 'function') return null;
+
+    const MAX_STEPS = 256, MAX_DIST = 100, EPS = 0.0005;
+    let t = 0.01;
+    for (let i = 0; i < MAX_STEPS; i++) {
+      const p = { x: ro.x + rd.x * t, y: ro.y + rd.y * t, z: ro.z + rd.z * t };
+      let d;
+      try { d = fn(p); } catch (e) { break; }
+      if (!isFinite(d)) break;
+      if (d < EPS) return p;
+      t += d;
+      if (t > MAX_DIST) break;
+    }
+    return null;
+  }
+
+  /**
+   * Briefly glow a node's mesh so the user is never confused about which
+   * shape is the "host" while anchor-picking mode is armed. Falls back
+   * gracefully for line-based primitives (Circle, RegularPolygon etc.,
+   * which use THREE.LineBasicMaterial with no emissive channel) by
+   * flashing their color instead.
+   * @param {number} nodeId
+   * @param {number} durationMs  Pass a very large value to hold the glow
+   *   indefinitely (e.g. while a pick mode is armed); call
+   *   clearHighlight(nodeId) to end it early.
+   */
+  highlightNode(nodeId, durationMs = 1200) {
+    const entry = this.activePrimitives.find(p => p.instance.id === nodeId);
+    if (!entry?.object) return;
+    this.clearHighlight(nodeId);
+
+    const affected = [];
+    const applyGlow = (mat) => {
+      if (!mat) return;
+      if (mat.emissive) {
+        affected.push({ mat, kind: 'emissive', orig: mat.emissive.clone() });
+        mat.emissive.setHex(0xffee66);
+      } else if (mat.color) {
+        affected.push({ mat, kind: 'color', orig: mat.color.clone() });
+        mat.color.setHex(0xffee66);
+      }
+    };
+
+    entry.object.traverse
+      ? entry.object.traverse(child => applyGlow(child.material))
+      : applyGlow(entry.object.material);
+
+    this._highlightState = this._highlightState || new Map();
+    this._highlightState.set(nodeId, affected);
+
+    if (durationMs < 1e8) {
+      clearTimeout(this._highlightTimers?.get(nodeId));
+      this._highlightTimers = this._highlightTimers || new Map();
+      this._highlightTimers.set(nodeId, setTimeout(() => this.clearHighlight(nodeId), durationMs));
+    }
+  }
+
+  clearHighlight(nodeId) {
+    const affected = this._highlightState?.get(nodeId);
+    if (affected) {
+      affected.forEach(({ mat, kind, orig }) => {
+        if (kind === 'emissive') mat.emissive.copy(orig);
+        else mat.color.copy(orig);
+      });
+      this._highlightState.delete(nodeId);
+    }
+    clearTimeout(this._highlightTimers?.get(nodeId));
   }
 
   _buildSchurObject(schur, method, sdfOverride = null, bounds2D = null, bounds3D = null, resolution = 150) {
@@ -775,8 +1768,9 @@ export class SceneManager {
       if (!BOUNDED_GEOM.has(node.type)) return;
 
       const p  = node.params;
-      const cx = p.posX ?? 0;
-      const cy = p.posY ?? 0;
+      const t  = node.transform || {};
+      const cx = t.posX ?? 0;
+      const cy = t.posY ?? 0;
 
       // Estimate the rough half-extent of this primitive.
       // We take the most generous estimate from all known size parameters
@@ -932,6 +1926,13 @@ export class SceneManager {
     this.cameraManager.updateAspect(window.innerWidth, window.innerHeight);
     this.sdfRenderer.resize(window.innerWidth, window.innerHeight);
     this.rayMarchRenderer.resize(window.innerWidth, window.innerHeight);
+    this._resizeGizmoOverlay();
+  }
+
+  _resizeGizmoOverlay() {
+    if (!this._gizmoOverlay) return;
+    this._gizmoOverlay.width  = window.innerWidth;
+    this._gizmoOverlay.height = window.innerHeight;
   }
 
   /**
@@ -1310,7 +2311,27 @@ _adaptRenderScale() {
     const hasDifference = source.includes('rDifference(') ||
       (source.includes('schurBlend') && source.includes('"difference"'));
 
-    const hasWarp = !hasDifference && (
+    // Any non-identity DistanceMapper (sinusoidal/polynomial/exponential/
+    // logarithmic/power) can turn a proper distance field into something
+    // with no relationship to actual distance-to-surface — sinusoidal in
+    // particular introduces periodic zero-crossings unrelated to true
+    // proximity, which breaks sphere tracing's safe-step assumption and
+    // can cause the ray marcher to skip straight through geometry,
+    // producing total invisibility. identityMapper is deliberately
+    // excluded — it's a pure no-op and never needs conservative stepping.
+    // sinusoidalMapper and polynomialMapper are now RIGOROUSLY handled via
+    // Lipschitz-bound normalization in GLSLEvaluator._wrapWithNodeTransform
+    // — their output is already a safe, correct distance value, so they no
+    // longer need this heuristic fallback. Only the three mappers with no
+    // honest global bound (exponential/logarithmic/power — see
+    // GLSLEvaluator._computeMapperLipschitz) still need forced small steps.
+    const hasRiskyMapper = (
+      source.includes('exponentialMapper') ||
+      source.includes('logarithmicMapper') ||
+      source.includes('powerMapper')
+    );
+
+    const hasWarp = !hasDifference && !hasRiskyMapper && (
       source.includes('twistNode')        ||
       source.includes('bendNode')         ||
       source.includes('noiseDisplaceNode')||
@@ -1319,7 +2340,7 @@ _adaptRenderScale() {
     );
 
     let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
-    if (hasDifference) {
+    if (hasDifference || hasRiskyMapper) {
       targetMaxSteps  = 256;
       targetStepScale = 0.25;
       targetEpsilon   = 0.0001;
@@ -1705,6 +2726,7 @@ _adaptRenderScale() {
 
     // Create Three.js mesh proxy
     object = prim.createObject();
+    this._applyNodeTransformToMesh(id, object);
 
     return { instance: prim, type, object };
   }

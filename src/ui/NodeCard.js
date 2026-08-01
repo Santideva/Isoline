@@ -43,6 +43,15 @@ const CARD_W     = 220;
 const PORT_R     = 6;    // port dot radius in px
 const PORT_D     = PORT_R * 2;
 
+// Grid/angle snap increments for the Transform section.
+const SNAP_POS_INCREMENT   = 0.25;        // transform position, world units
+const SNAP_ROT_INCREMENT   = Math.PI / 12; // transform rotation, 15 degrees
+const SNAP_PARAM_INCREMENT = 0.1;         // shape params (radius, height, rounding…)
+                                           // — deliberately much finer than
+                                           // position snap: the goal here is
+                                           // helping the user land on precise
+                                           // sizes, not enforcing a coarse grid.
+
 export class NodeCard {
   /**
    * @param {object}   node            NodeInstance from NodeGraph
@@ -52,19 +61,49 @@ export class NodeCard {
    * @param {Function} onPortMouseUp   (nodeId, portName, dir) → void
    * @param {Function} onDragEnd       (nodeId, x, y) → void
    */
-  constructor(node, nodeGraph, onParamChange, onPortMouseDown, onPortMouseUp, onDragEnd, onRequestPreview, undoManager = null) {
-    this.node             = node;
-    this.nodeGraph        = nodeGraph;
-    this.onParamChange    = onParamChange;
-    this.onPortMouseDown  = onPortMouseDown;
-    this.onPortMouseUp    = onPortMouseUp;
-    this.onDragEnd        = onDragEnd;
-    this.onRequestPreview = onRequestPreview || null;
-    this._undo            = undoManager;
+  constructor(node, nodeGraph, onParamChange, onPortMouseDown, onPortMouseUp, onDragEnd, onRequestPreview, undoManager = null, onTransformChange = null, onTransformSectionToggle = null, onAnchorPick = null, onAutoFitMorph = null, onAutoFitEmbedGuest = null) {
+    this.node              = node;
+    this.nodeGraph         = nodeGraph;
+    this.onParamChange     = onParamChange;
+    this.onPortMouseDown   = onPortMouseDown;
+    this.onPortMouseUp     = onPortMouseUp;
+    this.onDragEnd         = onDragEnd;
+    this.onRequestPreview  = onRequestPreview || null;
+    this._undo             = undoManager;
+    this.onTransformChange = onTransformChange || null;
+    // Arms the viewport for "click a surface point to place this embedNode's
+    // anchor" mode. Called with (this.node.id) — NodeCanvas resolves the
+    // host node from the graph edge itself.
+    this.onAnchorPick      = onAnchorPick || null;
+    // Triggers Morph Auto-Fit for a morphBlend node — scales/centers its
+    // two source shapes to roughly match. Called with (this.node.id).
+    this.onAutoFitMorph    = onAutoFitMorph || null;
+    // Auto-Fit Guest to Region — see NodeCanvas._autoFitEmbedGuest.
+    this.onAutoFitEmbedGuest = onAutoFitEmbedGuest || null;
+    // Fired with (nodeId, isOpen) whenever the Transform section itself is
+    // expanded/collapsed — distinct from card selection. This is the actual
+    // "user wants to see/edit placement" signal; selecting a card to drag
+    // it around the graph canvas should NOT trigger this.
+    this.onTransformSectionToggle = onTransformSectionToggle || null;
 
     this._portEls       = new Map();
     this._previewCanvas = null;
     this._previewTimer  = null;
+
+    // Collapse state — persists only for this card's lifetime (not saved
+    // across reloads). Both default closed to keep cards compact; the
+    // Transform section is available on every node type regardless of
+    // whether the node's own params happen to include a position field.
+    this._transformOpen = false;
+    this._pivotOpen      = false;
+
+    // Grid/angle snap — per-card toggle, ON by default (architects/game
+    // designers benefit from predictable increments out of the box; users
+    // doing freeform organic placement can turn it off per-card). Position
+    // sliders round to SNAP_POS_INCREMENT and rotation sliders round to
+    // SNAP_ROT_INCREMENT while dragging. Scale is intentionally NOT
+    // snapped (no natural "grid" for a multiplicative value).
+    this._snapEnabled = true;
 
     this.el = this._build();
     this._attachDrag();
@@ -146,10 +185,20 @@ export class NodeCard {
     `;
 
     card.appendChild(this._buildHeader(spec, category));
+
+    const specialActions = this._buildSpecialActions();
+    if (specialActions) card.appendChild(specialActions);
+
     card.appendChild(this._buildBody(spec));
 
     const preview = this._buildPreview(spec);
     if (preview) card.appendChild(preview);
+
+    // Transform section — present on EVERY node type, regardless of
+    // whether the node has any params of its own. This is deliberate:
+    // placement is now a universal capability, not something only
+    // certain node types support.
+    card.appendChild(this._buildTransformSection());
 
     return card;
   }
@@ -200,6 +249,92 @@ export class NodeCard {
     return header;
   }
 
+  /**
+   * Node-type-specific action buttons that don't fit the generic param/
+   * port model — currently: embedNode's "pick anchor on surface" and
+   * morphBlend's "auto-fit shapes". Returns null (nothing appended) for
+   * every other node type.
+   */
+  _buildSpecialActions() {
+    const _actionBtn = (text, title, onClick) => {
+      const btn = document.createElement('button');
+      btn.textContent = text;
+      btn.title = title;
+      btn.style.cssText = `
+        width: 100%;
+        background: rgba(127,119,221,0.18);
+        border: 1px solid rgba(127,119,221,0.5);
+        border-radius: 4px;
+        color: rgba(220,215,255,0.95);
+        font-size: 11px;
+        padding: 5px 8px;
+        cursor: pointer;
+        margin-bottom: 4px;
+      `;
+      btn.addEventListener('mouseenter', () => btn.style.background = 'rgba(127,119,221,0.3)');
+      btn.addEventListener('mouseleave', () => btn.style.background = 'rgba(127,119,221,0.18)');
+      btn.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+      return btn;
+    };
+
+    if (this.node.type === 'embedNode' && (this.onAnchorPick || this.onAutoFitEmbedGuest)) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'padding: 6px 10px 0;';
+
+      // Persistent warning until the anchor has actually been placed at
+      // least once via Pick Anchor — the default (0,0,0) sits at the
+      // host's origin, which is a degenerate/unstable point on any
+      // symmetric shape (sphere, cylinder, capsule centered at origin).
+      // Session-only (this._node._anchorPicked is not a serialized param),
+      // so it correctly re-appears after a reload as a gentle reminder
+      // rather than silently trusting a value nobody actually chose.
+      if (!this.node._anchorPicked) {
+        const warn = document.createElement('div');
+        warn.textContent = '⚠ Using default anchor (host origin) — pick a real surface point below.';
+        warn.style.cssText = `
+          font-size: 10px;
+          color: rgba(255,190,120,0.95);
+          background: rgba(255,150,60,0.12);
+          border: 1px solid rgba(255,150,60,0.35);
+          border-radius: 4px;
+          padding: 4px 6px;
+          margin-bottom: 6px;
+          line-height: 1.4;
+        `;
+        wrap.appendChild(warn);
+      }
+
+      if (this.onAnchorPick) {
+        wrap.appendChild(_actionBtn(
+          '🎯 Pick Anchor on Surface',
+          'Click a point on the host shape in the viewport to place the decoration there.',
+          () => this.onAnchorPick(this.node.id)
+        ));
+      }
+      if (this.onAutoFitEmbedGuest) {
+        wrap.appendChild(_actionBtn(
+          '🧩 Auto-Fit Guest to Region',
+          'Automatically position, scale, and (for Repeat/Tiling guests) space the second shape to fit the region\'s footprint and depth — removes the need to manually wrestle its Transform into place.',
+          () => this.onAutoFitEmbedGuest(this.node.id)
+        ));
+      }
+      return wrap;
+    }
+
+    if (this.node.type === 'morphBlend' && this.onAutoFitMorph) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'padding: 6px 10px 0;';
+      wrap.appendChild(_actionBtn(
+        '⨯ Auto-Fit Shapes',
+        'Automatically scale and center both source shapes so the morph looks balanced.',
+        () => this.onAutoFitMorph(this.node.id)
+      ));
+      return wrap;
+    }
+
+    return null;
+  }
+
   _buildPreview(spec) {
     if (!spec) return null;
 
@@ -248,11 +383,12 @@ export class NodeCard {
         this._attachPreviewDrag(canvas);
       }
 
-      // Only add rotation handle for types that have a rotation param
-      const ROTATABLE = new Set(['triangle','arc','regularPolygon','circle']);
-      if (ROTATABLE.has(this.node.type)) {
-        wrapper.appendChild(this._buildRotationHandle());
-      }
+      // The per-card rotation dial that used to live here has been removed.
+      // It read/wrote node.params.rotation, which no longer exists on any
+      // primitive type (rotation is now universally handled by the
+      // Transform section's Rz slider) — the dial had been silently
+      // non-functional for triangle/arc/regularPolygon since that field
+      // was removed, and circle never had a rotation param at all.
 
       return wrapper;
     }
@@ -394,8 +530,8 @@ export class NodeCard {
       let fn;
       switch (this.node.type) {
         case 'identityMapper':    fn = DM.identityMapping; break;
-        case 'polynomialMapper':  fn = DM.createPolynomialMapping([p.c0??0, p.c1??1, p.c2??0, p.c3??0]); break;
-        case 'sinusoidalMapper':  fn = DM.createSinusoidalMapping(p.a??1, p.b??1, p.c??0, p.e??0); break;
+        case 'polynomialMapper':  fn = DM.createPolynomialMapping([p.c0??0, p.c1??1, p.c2??0, p.c3??0], p.band??1.0); break;
+        case 'sinusoidalMapper':  fn = DM.createSinusoidalMapping(p.a??1, p.b??1, p.c??0, p.e??0, p.band??1.0); break;
         case 'exponentialMapper': fn = DM.createExponentialMapping(p.a??1, p.b??1, p.c??0); break;
         case 'logarithmicMapper': fn = DM.createLogarithmicMapping(p.a??1, p.b??1, p.c??1, p.e??0); break;
         case 'powerMapper':       fn = DM.createPowerMapping(p.a??1, p.b??2, p.c??0); break;
@@ -431,8 +567,12 @@ export class NodeCard {
       isDragging  = true;
       startX      = e.clientX;
       startY      = e.clientY;
-      startPosX   = this.node.params.posX || 0;
-      startPosY   = this.node.params.posY || 0;
+      // Position now lives on transform, not params (see the transform
+      // overhaul) — this drag was previously writing to a params.posX/posY
+      // field that no longer exists on any primitive type, so it was
+      // silently a no-op. Fixed to go through transform instead.
+      startPosX   = this.node.transform?.posX ?? 0;
+      startPosY   = this.node.transform?.posY ?? 0;
       canvas.style.cursor = 'grabbing';
     });
 
@@ -443,17 +583,16 @@ export class NodeCard {
       const newX  = startPosX + dx;
       const newY  = startPosY + dy;
 
-      // Update node params so slider stays in sync
-      this.nodeGraph.updateNodeParam(this.node.id, 'posX', newX);
-      this.nodeGraph.updateNodeParam(this.node.id, 'posY', newY);
+      this.nodeGraph.updateNodeTransform(this.node.id, 'posX', newX);
+      this.nodeGraph.updateNodeTransform(this.node.id, 'posY', newY);
 
-      // Update slider display values
-      this.updateParam('posX', newX);
-      this.updateParam('posY', newY);
+      this.updateTransformParam('posX', newX);
+      this.updateTransformParam('posY', newY);
 
-      // Fire the param change callback (triggers shape.updateParameters + recompose)
-      this.onParamChange(this.node.id, 'posX', newX);
-      this.onParamChange(this.node.id, 'posY', newY);
+      if (this.onTransformChange) {
+        this.onTransformChange(this.node.id, 'posX', newX);
+        this.onTransformChange(this.node.id, 'posY', newY);
+      }
 
       // Refresh SDF preview
       if (this.onRequestPreview) {
@@ -741,11 +880,16 @@ export class NodeCard {
     slider.dataset.param = paramSpec.name;
     slider.min        = paramSpec.min  ?? 0;
     slider.max        = paramSpec.max  ?? 10;
-    slider.step       = paramSpec.step ?? 0.01;
+    // Deliberately 'any', NOT paramSpec.step. Native range-input step
+    // quantization runs independently of our own snap logic below and can
+    // silently conflict with it (e.g. NodeSpec's step:1 for 'sides'/'folds'
+    // vs our SNAP_PARAM_INCREMENT of 0.1 — whichever constrains the
+    // draggable positions more coarsely wins visually, which is confusing
+    // and inconsistent across browsers). With step='any' our JS below is
+    // the single, unambiguous source of truth for quantization.
+    slider.step       = 'any';
     slider.value      = currentValue;
     slider.style.cssText = 'flex:1; min-width:0; height:14px; accent-color: #378ADD;';
-    // Mirror the hint onto the slider itself so the tooltip fires on hover
-    // regardless of whether the user hovers the label or the track.
     if (paramSpec.hint) slider.title = paramSpec.hint;
 
     const display = document.createElement('span');
@@ -755,13 +899,27 @@ export class NodeCard {
       : currentValue;
     display.style.cssText = 'font-size:10px; opacity:0.8; min-width:32px; text-align:right; font-variant-numeric:tabular-nums;';
 
-    // Snapshot once at the start of each drag gesture, not on every tick.
     slider.addEventListener('mousedown', () => {
       if (this._undo) this._undo.snapshot();
     });
 
     slider.addEventListener('input', () => {
-      const v = parseFloat(slider.value);
+      let v = parseFloat(slider.value);
+      if (this._snapEnabled) {
+        // BUGFIX: previously always snapped to SNAP_PARAM_INCREMENT (0.1)
+        // regardless of the param's OWN declared step — so whole-number
+        // counts (countX, sides, folds, iterations, segments — all
+        // declared step:1 in NodeSpec) silently became fractional (e.g.
+        // "7.80" copies) while dragging. Now: if the param's own step is
+        // a whole number >= 1, snap to THAT instead of the generic
+        // fractional increment.
+        const ownStep = paramSpec.step;
+        const useOwnStep = typeof ownStep === 'number' && ownStep >= 1 && Number.isInteger(ownStep);
+        const increment = useOwnStep ? ownStep : SNAP_PARAM_INCREMENT;
+        v = Math.round(v / increment) * increment;
+        v = parseFloat(v.toFixed(4));
+        slider.value = v;
+      }
       display.textContent = v.toFixed(2);
       this._handleParamChange(paramSpec.name, v);
     });
@@ -769,6 +927,269 @@ export class NodeCard {
     wrapper.appendChild(slider);
     wrapper.appendChild(display);
     return wrapper;
+  }
+
+  // ── Transform section ─────────────────────────────────────────────────────
+  //
+  // Every node — primitive, blend, or transform op — carries a `transform`
+  // block (posX/Y/Z, pivotX/Y/Z, rotateX/Y/Z, scale) applied universally by
+  // NodeEvaluator/GLSLEvaluator regardless of node type. This section is the
+  // one place in the UI that edits it, replacing the old scattered/
+  // inconsistent per-primitive position sliders.
+
+  _buildTransformSection() {
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = `
+      border-top: 1px solid rgba(255,255,255,0.08);
+      margin-top: 4px;
+    `;
+
+    // ── Header (click to expand/collapse) ─────────────────────────────────
+    const header = document.createElement('div');
+    header.style.cssText = `
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      font-weight: 500;
+      color: rgba(220,220,230,0.85);
+    `;
+    const arrow = document.createElement('span');
+    arrow.textContent = this._transformOpen ? '▾' : '▸';
+    arrow.style.cssText = 'font-size:10px; opacity:0.6; width:10px; display:inline-block;';
+    const title = document.createElement('span');
+    title.textContent = 'Transform';
+
+    // ── Snap toggle ─────────────────────────────────────────────────────────
+    // When on, position sliders round to SNAP_POS_INCREMENT and rotation
+    // sliders round to SNAP_ROT_INCREMENT as the user drags. Purely a
+    // per-card UI convenience — does not alter node.transform's precision
+    // beyond what the user actually drags to.
+    const snapBtn = document.createElement('button');
+    snapBtn.textContent = '⊞ Snap';
+    snapBtn.title = 'Snap position to 0.25 units and rotation to 15° increments while dragging.';
+    const _snapStyle = (on) => `
+      background: ${on ? 'rgba(127,119,221,0.35)' : 'rgba(255,255,255,0.06)'};
+      border: 1px solid ${on ? 'rgba(127,119,221,0.7)' : 'rgba(255,255,255,0.14)'};
+      border-radius: 3px;
+      color: ${on ? 'rgba(220,215,255,0.95)' : 'rgba(255,255,255,0.5)'};
+      font-size: 10px;
+      padding: 2px 6px;
+      cursor: pointer;
+      margin-left: auto;
+    `;
+    snapBtn.style.cssText = _snapStyle(this._snapEnabled);
+    snapBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._snapEnabled = !this._snapEnabled;
+      snapBtn.style.cssText = _snapStyle(this._snapEnabled);
+    });
+
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = 'Reset';
+    resetBtn.title = 'Reset position, rotation, scale, and pivot to defaults';
+    resetBtn.style.cssText = `
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 3px;
+      color: rgba(255,255,255,0.5);
+      font-size: 10px;
+      padding: 2px 6px;
+      cursor: pointer;
+    `;
+    resetBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (this._undo) this._undo.snapshot();
+      const IDENTITY = {
+        posX:0, posY:0, posZ:0, pivotX:0, pivotY:0, pivotZ:0,
+        rotateX:0, rotateY:0, rotateZ:0, scale:1,
+      };
+      Object.entries(IDENTITY).forEach(([field, value]) => {
+        this._handleTransformChange(field, value);
+      });
+      // Rebuild the section in place so all sliders reflect the reset values
+      const fresh = this._buildTransformSection();
+      wrapper.replaceWith(fresh);
+    });
+
+    header.appendChild(arrow);
+    header.appendChild(title);
+    header.appendChild(snapBtn);
+    header.appendChild(resetBtn);
+    wrapper.appendChild(header);
+
+    // ── Content (rows), only built/shown when open ─────────────────────────
+    const content = document.createElement('div');
+    content.style.cssText = `
+      padding: 0 10px 8px;
+      display: ${this._transformOpen ? 'block' : 'none'};
+    `;
+
+    const t = this.node.transform || {
+      posX:0, posY:0, posZ:0, pivotX:0, pivotY:0, pivotZ:0,
+      rotateX:0, rotateY:0, rotateZ:0, scale:1,
+    };
+
+    // Position — snap kind 'position'
+    content.appendChild(this._buildTransformRow('X', 'posX', t.posX, -10, 10, 0.01,
+      'Move this shape along X.', 'position'));
+    content.appendChild(this._buildTransformRow('Y', 'posY', t.posY, -10, 10, 0.01,
+      'Move this shape along Y.', 'position'));
+    content.appendChild(this._buildTransformRow('Z', 'posZ', t.posZ, -10, 10, 0.01,
+      'Move this shape along Z. Only visible effect in 3D render modes.', 'position'));
+
+    // Rotation — snap kind 'rotation'
+    content.appendChild(this._buildTransformRow('Rx', 'rotateX', t.rotateX, 0, 6.28, 0.01,
+      'Rotate around X (pitch). Only visible effect in 3D render modes.', 'rotation'));
+    content.appendChild(this._buildTransformRow('Ry', 'rotateY', t.rotateY, 0, 6.28, 0.01,
+      'Rotate around Y (yaw). Only visible effect in 3D render modes.', 'rotation'));
+    content.appendChild(this._buildTransformRow('Rz', 'rotateZ', t.rotateZ, 0, 6.28, 0.01,
+      'Rotate around Z (roll).', 'rotation'));
+
+    // Scale — snap kind 'none' (no natural grid for a multiplicative value)
+    content.appendChild(this._buildTransformRow('Scale', 'scale', t.scale, 0.01, 10, 0.01,
+      'Uniform scale. Non-uniform (stretch) scale is not supported — it would break the distance-field math.', 'none'));
+
+    // ── Pivot — nested "Advanced" collapse ──────────────────────────────────
+    // Tucked away because the default pivot (0,0,0) already gives the
+    // expected "rotate the shape around its own center" behavior for the
+    // vast majority of use cases, since every primitive is origin-centered.
+    // Pivot only matters when you deliberately want to rotate/scale around
+    // a point OTHER than the shape's own center (e.g. an orbit or hinge
+    // effect on a single node) — an advanced, less common technique.
+    const advToggle = document.createElement('div');
+    advToggle.className = 'nc-advanced-only';
+    advToggle.style.cssText = `
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 0 2px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 11px;
+      color: rgba(255,255,255,0.5);
+      border-top: 1px solid rgba(255,255,255,0.06);
+      margin-top: 4px;
+    `;
+    const advArrow = document.createElement('span');
+    advArrow.textContent = this._pivotOpen ? '▾' : '▸';
+    advArrow.style.cssText = 'font-size:9px; width:9px; display:inline-block;';
+    const advLabel = document.createElement('span');
+    advLabel.textContent = 'Advanced: Pivot';
+    advLabel.title = 'Rotate/scale around a point other than this shape\'s own center. Leave at (0,0,0) for normal "rotate in place" behavior.';
+    advToggle.appendChild(advArrow);
+    advToggle.appendChild(advLabel);
+    content.appendChild(advToggle);
+
+    const advContent = document.createElement('div');
+    advContent.className = 'nc-advanced-only';
+    advContent.style.cssText = `display: ${this._pivotOpen ? 'block' : 'none'}; margin-top: 4px;`;
+    advContent.appendChild(this._buildTransformRow('Pivot X', 'pivotX', t.pivotX, -10, 10, 0.01,
+      'Pivot point X, relative to this shape\'s own center.', 'position'));
+    advContent.appendChild(this._buildTransformRow('Pivot Y', 'pivotY', t.pivotY, -10, 10, 0.01,
+      'Pivot point Y.', 'position'));
+    advContent.appendChild(this._buildTransformRow('Pivot Z', 'pivotZ', t.pivotZ, -10, 10, 0.01,
+      'Pivot point Z.', 'position'));
+    content.appendChild(advContent);
+
+    advToggle.addEventListener('click', () => {
+      this._pivotOpen = !this._pivotOpen;
+      advArrow.textContent = this._pivotOpen ? '▾' : '▸';
+      advContent.style.display = this._pivotOpen ? 'block' : 'none';
+    });
+
+    wrapper.appendChild(content);
+
+    header.addEventListener('click', () => {
+      this._transformOpen = !this._transformOpen;
+      arrow.textContent = this._transformOpen ? '▾' : '▸';
+      content.style.display = this._transformOpen ? 'block' : 'none';
+      if (this.onTransformSectionToggle) {
+        this.onTransformSectionToggle(this.node.id, this._transformOpen);
+      }
+    });
+
+    return wrapper;
+  }
+
+  /**
+   * Build one labelled slider+numeric-readout row for a transform field.
+   * Structurally identical to the param slider builder, but writes via
+   * updateNodeTransform instead of updateNodeParam.
+   *
+   * @param {string} snapKind  'position' | 'rotation' | 'none' — which snap
+   *   increment (if snap is enabled on this card) applies to this field.
+   *   Scale uses 'none' since there's no natural grid for a multiplicative
+   *   value.
+   */
+  _buildTransformRow(label, field, currentValue, min, max, step, hint, snapKind = 'none') {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:6px;';
+
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.title = hint;
+    lbl.style.cssText = 'font-size:12px; opacity:0.75; min-width:50px; flex-shrink:0; cursor:help;';
+    row.appendChild(lbl);
+
+    const wrapperEl = document.createElement('div');
+    wrapperEl.style.cssText = 'display:flex; align-items:center; gap:4px; flex:1; min-width:0;';
+
+    const slider = document.createElement('input');
+    slider.type  = 'range';
+    slider.dataset.transformField = field;
+    slider.min   = min;
+    slider.max   = max;
+    slider.step  = step;
+    slider.value = currentValue ?? (field === 'scale' ? 1 : 0);
+    slider.title = hint;
+    slider.style.cssText = 'flex:1; min-width:0; height:14px; accent-color: #7F77DD;'; // purple — matches TRANSFORM port colour
+
+    const display = document.createElement('span');
+    display.dataset.transformDisplay = field;
+    display.textContent = Number(slider.value).toFixed(2);
+    display.style.cssText = 'font-size:10px; opacity:0.8; min-width:36px; text-align:right; font-variant-numeric:tabular-nums;';
+
+    slider.addEventListener('mousedown', () => {
+      if (this._undo) this._undo.snapshot();
+    });
+    slider.addEventListener('input', () => {
+      let v = parseFloat(slider.value);
+      if (this._snapEnabled && snapKind !== 'none') {
+        const increment = snapKind === 'rotation' ? SNAP_ROT_INCREMENT : SNAP_POS_INCREMENT;
+        v = Math.round(v / increment) * increment;
+        // Reflect the snapped value back onto the slider itself, not just
+        // the display — otherwise the handle position and the printed
+        // number would visibly disagree while dragging.
+        slider.value = v;
+      }
+      display.textContent = v.toFixed(2);
+      this._handleTransformChange(field, v);
+    });
+
+    wrapperEl.appendChild(slider);
+    wrapperEl.appendChild(display);
+    row.appendChild(wrapperEl);
+    return row;
+  }
+
+  /**
+   * Update a single transform slider/readout from an external change
+   * (e.g. viewport drag), mirroring updateParam()'s role for params.
+   */
+  updateTransformParam(field, value) {
+    const input = this.el.querySelector(`[data-transform-field="${field}"]`);
+    if (input) input.value = value;
+    const display = this.el.querySelector(`[data-transform-display="${field}"]`);
+    if (display) display.textContent = Number(value).toFixed(2);
+  }
+
+  _handleTransformChange(field, value) {
+    this.nodeGraph.updateNodeTransform(this.node.id, field, value);
+    if (this.onTransformChange) this.onTransformChange(this.node.id, field, value);
   }
 
   _handleParamChange(paramName, value) {
