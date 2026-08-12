@@ -50,6 +50,7 @@
     import { PRESETS } from '../presets/presets.js';
     import * as THREE from 'three';
     import { NODE_TYPES } from '../graph/NodeSpec.js';
+    import { maskHasContent } from '../utils/surfaceMask.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
@@ -142,6 +143,17 @@ function _isConvexPolygon(vertices) {
         // under the cursor.
         this._anchorPickMode = null; // { embedNodeId, hostNodeId } | null
         this._embedRegionVisibleFor = null; // nodeId currently showing its ring, or null
+
+        // Universal surface-paint state (see NodeCard's "Surface Region"
+        // section — present on every SDF-producing node card, not just
+        // embedNode). Brush (drag) and Flood (single click) are mutually
+        // exclusive, single-active-target modes — arming one disarms the
+        // other and any active anchor-pick.
+        this._paintBrushMode = null;    // nodeId | null — brush drag armed for this node
+        this._paintFloodMode = null;    // nodeId | null — flood-click armed for this node
+        this._paintStrokeBuffer = null; // raw {x,y,z,nx,ny,nz,w} samples accumulated during the active brush drag
+        this._paintDragAttached = false;
+        this._paintClickAttached = false;
 
         // Auto-orbit speed — degrees per second (internal OrbitControls units).
         // Range exposed to user: 0.5 (very slow, cinematic) to 10.0 (fast).
@@ -1942,7 +1954,11 @@ function _isConvexPolygon(vertices) {
                 this._armAnchorPicking(nodeId, hostEdge?.fromNode);
             },
             (nodeId) => this._autoFitMorph(nodeId),
-            (nodeId) => this._autoFitEmbedGuest(nodeId)
+            (nodeId) => this._autoFitEmbedGuest(nodeId),
+            (nodeId) => this._armPaintBrush(nodeId),
+            (nodeId) => this._armPaintFlood(nodeId),
+            (nodeId) => this._clearPaintMask(nodeId),
+            (nodeId, field, value) => this._onMaskParamChange(nodeId, field, value)
         );
 
         // Select on header click
@@ -2433,6 +2449,15 @@ function _isConvexPolygon(vertices) {
     }
 
     _handleViewportClick(e) {
+        // Flood-select AND brush-paint modes both take priority over
+        // normal selection — a click/dab while either is armed paints or
+        // floods, it never selects a node. Brush mode needs this guard
+        // too: a single click with near-zero movement (a quick "dab"
+        // rather than a drag) still passes _attachViewportPicking's
+        // click/time thresholds, so without this it would ALSO select
+        // whatever node sits under the cursor.
+        if (this._paintFloodMode || this._paintBrushMode) return;
+
         // Anchor-picking mode takes priority over normal selection — a
         // click while armed places the anchor, it never selects a node.
         if (this._anchorPickMode) {
@@ -2644,10 +2669,15 @@ function _isConvexPolygon(vertices) {
 
         if (!node) return;
 
-        // Any param change may affect the generated GLSL (e.g. axis, operation,
-        // smoothness). Always invalidate the shader cache so it recompiles next frame.
-        this.sceneManager._lastGLSLSource     = null;
-        this.sceneManager._lastRayMarchSource = null;
+        // Deliberately NOT nulling _lastGLSLSource/_lastRayMarchSource here.
+        // SceneManager's own generate()-then-diff-against-last-compiled check
+        // (`source !== this._lastRayMarchSource`) already recompiles only
+        // when the generated GLSL TEXT actually differs. Many params here
+        // are uniform-backed (embedNode's depth/edgeSoftness/seamSmoothness/
+        // regionSize) — their new value is re-uploaded every render call
+        // regardless of recompilation. Nulling defeated that check (null
+        // never equals a string) and forced a full GPU recompile on every
+        // slider tick — that was the compile-storm during ordinary drags.
 
         // ── Concave polygon guard ─────────────────────────────────────────────────
         // The Conv. Polygon (polytope) SDF is only valid for convex shapes.
@@ -2834,6 +2864,216 @@ function _isConvexPolygon(vertices) {
     }
 
     /**
+     * Arm/disarm brush-paint mode for a node — drag directly on that
+     * node's own rendered surface in the viewport to paint a region.
+     * Geodesic refinement (surfaceGraph.js) runs once when the drag ends;
+     * see _attachPaintDrag.
+     */
+    _armPaintBrush(nodeId) {
+        if (this._paintBrushMode === nodeId) {
+            this.sceneManager.clearHighlight(nodeId);
+            this.sceneManager.hidePaintPreview();
+            this._paintBrushMode = null;
+            this._showToast('Paint mode off.', 1200);
+            return;
+        }
+        // Paint/Flood only make sense in Ray March — switch there
+        // automatically instead of blocking with a toast. Mirrors the
+        // mode-switch button's own sequence (_toggleRenderMode).
+        if (this.sceneManager.renderMode !== 'rayMarch') {
+            this._ensureOutputWired();
+            this.sceneManager.setRenderMode('rayMarch');
+            this.sceneManager.rayMarchRenderer?.show();
+            this._renderModeBtn.textContent = '▣ Marching Squares';
+            this.sceneManager._renderRayMarch();
+        }
+        // Only one of {anchor-pick, brush, flood} may be armed at a time.
+        this._anchorPickMode = null;
+        this._paintFloodMode = null;
+        this._paintBrushMode = nodeId;
+        this.sceneManager.highlightNode(nodeId, 1e9);
+        this.sceneManager.showPaintPreview(nodeId);
+        if (!this._paintDragAttached) { this._attachPaintDrag(); this._paintDragAttached = true; }
+        this._showToast('Drag on the glowing shape to paint a region. Click the button again to stop.', 4500);
+    }
+
+    /**
+     * Arm/disarm flood-select mode for a node — a SINGLE CLICK on the
+     * surface floods outward from that point while curvature stays
+     * similar (see surfaceGraph.curvatureFlood). Deliberately a different
+     * gesture from brush painting, not another falloff option on it.
+     */
+    _armPaintFlood(nodeId) {
+        if (this._paintFloodMode === nodeId) {
+            this.sceneManager.clearHighlight(nodeId);
+            this.sceneManager.hidePaintPreview();
+            this._paintFloodMode = null;
+            this._showToast('Flood select off.', 1200);
+            return;
+        }
+       // Same auto-switch as _armPaintBrush — see that method's comment.
+        if (this.sceneManager.renderMode !== 'rayMarch') {
+            this._ensureOutputWired();
+            this.sceneManager.setRenderMode('rayMarch');
+            this.sceneManager.rayMarchRenderer?.show();
+            this._renderModeBtn.textContent = '▣ Marching Squares';
+            this.sceneManager._renderRayMarch();
+        }
+        this._anchorPickMode = null;
+        this._paintBrushMode = null;
+        this._paintFloodMode = nodeId;
+        this.sceneManager.highlightNode(nodeId, 1e9);
+        this.sceneManager.showPaintPreview(nodeId);
+        if (!this._paintClickAttached) { this._attachPaintFloodClick(); this._paintClickAttached = true; }
+        this._showToast('Click a point on the glowing shape to flood-select similar curvature. Click the button again to cancel.', 5000);
+    }
+
+    _clearPaintMask(nodeId) {
+        this._undo.snapshot();
+        const graph = this.stateStore.nodeGraph;
+        graph.updateNodeMask(nodeId, 'samples', []);
+        graph.updateNodeMask(nodeId, 'enabled', false);
+        this.sceneManager._lastGLSLSource     = null;
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager.evaluator.invalidate();
+        this._rebuildCards();
+        this._renderInPlace();
+    }
+
+    _onMaskParamChange(nodeId, field, value) {
+        this.stateStore.nodeGraph.updateNodeMask(nodeId, field, value);
+        // See _onParamChange's comment — falloffRadius/normalThreshold are
+        // both uniform-backed (maskRadius/maskNThresh); curvatureThreshold
+        // isn't read by the shader at all (bake-time only). None of these
+        // need a forced recompile.
+        this.sceneManager.evaluator.invalidate();
+        clearTimeout(this._recomposeTimer);
+        this._recomposeTimer = setTimeout(() => this._renderInPlace(), 150);
+    }
+
+    /**
+     * Continuous paint-brush drag capture. Modeled on _attachViewportDrag:
+     * disables OrbitControls for the drag, snapshots undo once at
+     * mousedown, and separates the cheap per-event write (raw Euclidean
+     * sample, live visual feedback) from the expensive one-shot geodesic
+     * bake that runs on mouseup (SceneManager.bakeGeodesicMaskForNode) —
+     * see surfaceGraph.js's cost-model header for why that split is what
+     * keeps this performant.
+     */
+    _attachPaintDrag() {
+        const container = this.sceneManager._mountEl;
+        if (!container) return;
+        let isPainting = false;
+
+        const liveSample = (clientX, clientY) => {
+            if (!this._paintBrushMode) return;
+            const nodeId = this._paintBrushMode;
+            const sample = this.sceneManager.paintSampleAtScreenPosition(nodeId, clientX, clientY);
+            if (!sample) return;
+            this._paintStrokeBuffer.push(sample);
+
+            // Live feedback during the drag uses the raw Euclidean samples
+            // directly (cheap — no graph build) so painting feels
+            // immediate; the geodesic refinement replaces this on release.
+            const graph = this.stateStore.nodeGraph;
+            graph.updateNodeMask(nodeId, 'mode', 'euclidean');
+            graph.updateNodeMask(nodeId, 'samples', [...this._paintStrokeBuffer]);
+            graph.updateNodeMask(nodeId, 'enabled', true);
+
+            // Mask sample DATA is a GLSL uniform ARRAY (see
+            // GLSLEvaluator._maskFieldGLSL), not baked into the shader
+            // source text — a new stroke sample does not need a recompile
+            // on every mousemove. The one genuine exception (the VERY
+            // FIRST sample of a stroke, which newly adds the mask
+            // function's declaration) is still caught correctly by the
+            // diff check. This was previously the single largest source of
+            // freezing while painting — every mousemove forced a full
+            // recompile.
+            this.sceneManager.evaluator.invalidate();
+            this.sceneManager.showPaintPreview(nodeId);
+
+            clearTimeout(this._recomposeTimer);
+            this._recomposeTimer = setTimeout(() => this._renderInPlace(), 90);
+        };
+
+        container.addEventListener('mousedown', (e) => {
+            if (!this._paintBrushMode || e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.sceneManager.controls.enabled = false;
+            this._undo.snapshot();
+
+            const node = this.stateStore.nodeGraph.nodes.get(this._paintBrushMode);
+            const existingMode = node?.mask?.mode;
+            // Starting a NEW drag on a node that already has a baked
+            // geodesic/flood region replaces it rather than appending raw
+            // Euclidean samples on top of already-refined ones — mixing
+            // sample kinds in one array would make the next bake's source
+            // seed set incoherent. Continuing to paint in the SAME
+            // session (several drags before ever releasing into a bake)
+            // still appends, since existingMode stays 'euclidean' until
+            // the first mouseup bakes it.
+            this._paintStrokeBuffer = (existingMode === 'euclidean' && Array.isArray(node?.mask?.samples))
+              ? [...node.mask.samples]
+              : [];
+
+            isPainting = true;
+            liveSample(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isPainting) return;
+            liveSample(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (!isPainting) return;
+            isPainting = false;
+            this.sceneManager.controls.enabled = true;
+
+            const nodeId = this._paintBrushMode;
+            clearTimeout(this._recomposeTimer);
+            if (nodeId != null && this._paintStrokeBuffer?.length > 0) {
+                const ok = this.sceneManager.bakeGeodesicMaskForNode(nodeId, this._paintStrokeBuffer);
+                if (!ok) {
+                    this._showToast('Could not refine the painted region — keeping the quick preview instead.', 3000);
+                }
+                this.sceneManager._lastGLSLSource     = null;
+                this.sceneManager._lastRayMarchSource = null;
+                this.sceneManager.evaluator.invalidate();
+                this._rebuildCards();
+            }
+            this._renderInPlace();
+        });
+    }
+
+    /** Single-click flood-select capture. */
+    _attachPaintFloodClick() {
+        const container = this.sceneManager._mountEl;
+        if (!container) return;
+
+        container.addEventListener('mouseup', (e) => {
+            if (!this._paintFloodMode || e.button !== 0) return;
+            const nodeId = this._paintFloodMode;
+
+            this._undo.snapshot();
+            const ok = this.sceneManager.bakeCurvatureFloodMaskForNode(nodeId, e.clientX, e.clientY);
+            if (!ok) {
+                this._showToast('No surface found there — click directly on the glowing shape.', 3000);
+                return;
+            }
+
+            this.sceneManager._lastGLSLSource     = null;
+            this.sceneManager._lastRayMarchSource = null;
+            this.sceneManager.evaluator.invalidate();
+            this._rebuildCards();
+            this.sceneManager.showPaintPreview(nodeId);
+            this._renderInPlace();
+            this._showToast('Region flood-selected by curvature similarity. Click "Flood Select" again to select a different area.', 3000);
+        });
+    }
+
+    /**
      * Auto-Fit: samples both of a morphBlend node's source shapes'
      * approximate radius, scales each (relative to its current scale, not
      * overwriting deliberate choices) so both read as roughly the same
@@ -2912,8 +3152,18 @@ function _isConvexPolygon(vertices) {
         const embedNode   = graph.nodes.get(embedNodeId);
         if (!guestNode || !embedNode) return;
 
-        const regionSize = embedNode.params.regionSize ?? 1.0;
-        const depth       = embedNode.params.depth ?? 0.35;
+        // When maskSource='paintedRegion', the disc's regionSize param is
+        // largely vestigial (see NodeEvaluator's embedNode case) — the
+        // painted region's own falloffRadius is the actual footprint the
+        // guest needs to fit within, so Auto-Fit reads THAT instead when
+        // painting is active.
+        const hostEdge = graph.getIncomingEdge(embedNodeId, 'hostSdf');
+        const hostNode = hostEdge ? graph.nodes.get(hostEdge.fromNode) : null;
+        const usingPaintedRegion = maskHasContent(hostNode?.mask);
+        const regionSize = usingPaintedRegion
+          ? Math.max(hostNode.mask.falloffRadius ?? 0.4, 1e-4)
+          : (embedNode.params.regionSize ?? 1.0);
+        const depth = embedNode.params.depth ?? 0.35;
 
         this._undo.snapshot();
 
@@ -4091,6 +4341,26 @@ function _isConvexPolygon(vertices) {
     }
 
     _onGraphChange(event) {
+        // High-frequency during a paint drag (fired on every mousemove via
+        // updateNodeMask). The paint-drag code already manages its own
+        // preview redraw and debounced re-render directly, so skip the
+        // otherwise-needless edge-redraw/status-label/dropdown work below
+        // for this event specifically.
+        if (event === 'maskChanged') return;
+
+        // Same reasoning, for a PRE-EXISTING and much higher-frequency
+        // case: transformChanged fires on every mousemove of ANY position/
+        // rotation/scale drag (slider or viewport Alt-drag). _drawEdges()
+        // redraws bezier connections between PORT positions, which are
+        // driven by node.uiPos (where the card sits on the 2D graph
+        // canvas) — entirely unrelated to node.transform (where the shape
+        // sits in 3D). A transform-only change can never move a card's
+        // on-screen port position, so redrawing edges, refreshing the
+        // status label, and re-walking the whole graph in
+        // _updateDropdownAvailability() on every single mousemove of a
+        // transform drag was pure waste even before painting existed.
+        if (event === 'transformChanged') return;
+
         if (event === 'nodeAdded' || event === 'nodeRemoved' ||
             event === 'edgeAdded' || event === 'edgeRemoved') {
         this._rebuildCards();
@@ -4308,19 +4578,14 @@ function _isConvexPolygon(vertices) {
      */
     _ensureOutputWired() {
         const graph = this.stateStore.nodeGraph;
-
-        // Step 1: ensure the output node exists
         const outNode = this.sceneManager._ensureOutputNode();
 
-        // Step 2: apply any pending output params the user configured before
-        // the output node was created
         if (this._pendingOutputParams) {
             Object.entries(this._pendingOutputParams).forEach(([k, v]) => {
                 graph.updateNodeParam(outNode.id, k, v);
             });
         }
 
-        // Step 3 & 4: find dangling tails and wire them to the output node
         const GEOM_TYPES = new Set([
             'lineSegment', 'triangle', 'arc', 'circle', 'regularPolygon', 'polytope',
             'sphere', 'box', 'cylinder', 'capsule', 'torus', 'cone', 'plane',
@@ -4334,37 +4599,67 @@ function _isConvexPolygon(vertices) {
             'schurBlend', 'rBlend', 'morphBlend', 'embedNode',
             'rUnion', 'rIntersection', 'rDifference',
         ]);
+        const outPortOf = (type) => {
+            if (GEOM_TYPES.has(type))      return 'sdf';
+            if (TRANSFORM_TYPES.has(type)) return 'result';
+            if (BLEND_TYPES.has(type))     return 'result';
+            return null;
+        };
+
+        // ── BUGFIX: prune STALE auto-wired direct-to-output edges ────────
+        // A node auto-wired straight to Output because it was once a
+        // dangling tail (e.g. a bare sphere rendered before anything was
+        // wired to it) can LATER gain a real downstream consumer — e.g.
+        // wiring that same sphere into a blend node's sdfA. Left in place,
+        // the stale edge silently unions the original primitive back into
+        // the final scene alongside whatever now actually consumes it:
+        // sphereA, sphereB, AND (sphereA−sphereB) unioned together render
+        // identically to sphereA∪sphereB (the difference is a strict
+        // subset of A) — i.e. "both input spheres still fully visible"
+        // after wiring an R-Blend(difference) between them.
+        //
+        // Only edges THIS function created (tagged autoWired=true below)
+        // are ever removed here — a deliberate edge the user drag-
+        // connected directly to Output is never touched, even if its
+        // source also fans out elsewhere. autoWired does NOT survive
+        // serialize()/deserialize() (NodeGraph.serialize whitelists
+        // fields) — an auto-wire edge that predates a save/reload is
+        // treated as permanent afterward, which is the safe direction
+        // to err in.
+        const currentIncoming = graph.getAllIncomingEdges(outNode.id, 'sdf') || [];
+        currentIncoming.forEach(edge => {
+            if (!edge.autoWired) return;
+            const srcNode = graph.nodes.get(edge.fromNode);
+            if (!srcNode) return;
+            const srcPort = outPortOf(srcNode.type);
+            if (!srcPort) return;
+            const srcOutgoing = graph.getOutgoingEdges(edge.fromNode, srcPort) || [];
+            const hasNonOutputConsumer = srcOutgoing.some(e => e.toNode !== outNode.id);
+            if (hasNonOutputConsumer) {
+                try { graph.removeEdge(edge.id); } catch(_) {}
+            }
+        });
 
         graph.nodes.forEach((node, id) => {
             if (node.type === 'outputNode') return;
-
-            // Determine the output port name for this node type
-            let outPort = null;
-            if (GEOM_TYPES.has(node.type))      outPort = 'sdf';
-            if (TRANSFORM_TYPES.has(node.type)) outPort = 'result';
-            if (BLEND_TYPES.has(node.type))     outPort = 'result';
+            const outPort = outPortOf(node.type);
             if (!outPort) return;
 
-            // If this output port already has outgoing edges, this node is
-            // mid-chain — it feeds into something else and is not a tail
             const outgoing = graph.getOutgoingEdges(id, outPort) || [];
             if (outgoing.length > 0) return;
 
-            // If this node is already directly wired to the output node,
-            // skip it to avoid duplicate edge errors
             const alreadyToOutput = (graph.getAllIncomingEdges(outNode.id, 'sdf') || [])
                 .some(e => e.fromNode === id);
             if (alreadyToOutput) return;
 
-            // Wire this dangling tail to the output node
             try {
-                graph.addEdge(id, outPort, outNode.id, 'sdf');
+                const newEdge = graph.addEdge(id, outPort, outNode.id, 'sdf');
+                if (newEdge) newEdge.autoWired = true;
             } catch(_) {
                 // Edge already exists or graph validation rejected it — safe to ignore
             }
         });
 
-        // Step 5: invalidate all caches so the next render reads the new wiring
         this.sceneManager._lastGLSLSource     = null;
         this.sceneManager._lastRayMarchSource = null;
         this.sceneManager.evaluator.invalidate();

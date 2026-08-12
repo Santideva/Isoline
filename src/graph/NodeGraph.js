@@ -2,6 +2,7 @@
 import { NODE_TYPES } from './NodeSpec.js';
 import { nextId, advanceIdCounter } from '../utils/idGenerator.js';
 import { createIdentityTransform } from '../utils/transform3D.js';
+import { createEmptyMask } from '../utils/surfaceMask.js';
 
 /**
  * NodeGraph is the ground-truth data model for the entire scene.
@@ -56,7 +57,7 @@ export class NodeGraph {
    *   pivotX/Y/Z, rotateX/Y/Z, scale). Defaults to identity. Every node gets
    *   a transform regardless of type — it is not part of NodeSpec params.
    */
-  addNode(type, params = {}, uiPos = { x: 0, y: 0 }, forceId = null, transform = null) {
+  addNode(type, params = {}, uiPos = { x: 0, y: 0 }, forceId = null, transform = null, mask = null) {
     const spec = NODE_TYPES[type];
     if (!spec) throw new Error(`Unknown node type: ${type}`);
 
@@ -69,6 +70,13 @@ export class NodeGraph {
       params:    { ...defaultParams, ...params },
       uiPos:     { ...uiPos },
       transform: { ...createIdentityTransform(), ...(transform || {}) },
+      // Universal painted-surface-region block — every node gets one,
+      // parallel to `transform`. Empty/unpainted by default and costs
+      // nothing until the user actually paints on this node (see
+      // surfaceMask.js and NodeCard.js's "Surface Region" section). New
+      // trailing optional param — every existing addNode() call site
+      // (4-arg form) is unaffected; it simply gets a fresh empty mask.
+      mask:      { ...createEmptyMask(), ...(mask || {}) },
     };
 
     this.nodes.set(node.id, node);
@@ -114,6 +122,24 @@ export class NodeGraph {
     if (!node.transform) node.transform = createIdentityTransform();
     node.transform[field] = value;
     this._notify('transformChanged', { nodeId, field, value });
+    return true;
+  }
+
+  /**
+   * Update a single field of a node's mask block (falloffRadius, mode,
+   * enabled, samples — a wholesale replacement after a bake step is the
+   * common case for 'samples'), mirroring updateNodeTransform exactly.
+   * @param {number} nodeId
+   * @param {string} field  Any key of the mask object: 'samples', 'mode',
+   *   'enabled', 'falloffRadius', 'normalThreshold', 'curvatureThreshold'.
+   * @param {*} value
+   */
+  updateNodeMask(nodeId, field, value) {
+    const node = this.nodes.get(nodeId);
+    if (!node) return false;
+    if (!node.mask) node.mask = createEmptyMask();
+    node.mask[field] = value;
+    this._notify('maskChanged', { nodeId, field, value });
     return true;
   }
 
@@ -261,6 +287,8 @@ export class NodeGraph {
     data.nodes.forEach(n => {
       // Migration: old serialised nodes may not have a transform block.
       if (!n.transform) n.transform = createIdentityTransform();
+      // Migration: old serialised nodes may not have a mask block.
+      if (!n.mask) n.mask = createEmptyMask();
       graph.nodes.set(n.id, n);
     });
     data.edges.forEach(e => graph.edges.set(e.id, e));
@@ -288,6 +316,11 @@ export class NodeGraph {
         params:    { ...node.params },
         uiPos:     { ...node.uiPos },
         transform: { ...(node.transform || createIdentityTransform()) },
+        // Mask samples can be meaningful data for a long, detailed stroke
+        // (up to MAX_MASK_SAMPLES entries, each a handful of floats) —
+        // still trivial next to typical scene JSON, and painted regions
+        // are exactly the kind of work Save/Export must preserve.
+        mask:      { ...(node.mask || createEmptyMask()), samples: [...(node.mask?.samples || [])] },
       });
     });
 
@@ -334,6 +367,10 @@ export class NodeGraph {
         // scheme and is intentionally NOT auto-migrated into transform —
         // see the persistence.js migration shim in Phase 4 for that).
         transform: n.transform ? { ...n.transform } : createIdentityTransform(),
+        // Migration: scenes saved before the surface-paint feature have no
+        // mask block. Default to empty (unpainted) — identical rendering
+        // to before this feature existed.
+        mask:      n.mask ? { ...createEmptyMask(), ...n.mask } : createEmptyMask(),
       });
     }
 

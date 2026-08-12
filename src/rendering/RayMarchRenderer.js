@@ -69,6 +69,12 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._epsilon   = 0.001;
     // Step scale: reduce below 1.0 for non-Lipschitz SDFs (rDifference etc.)
     this._stepScale = 0.9;
+
+    // AO/soft-shadow sampling detail scale — see SceneManager.
+    // _computeEmbedDetailScale for what drives this. 1.0 = the shader's
+    // original fixed tuning; lower values shrink AO/shadow sampling
+    // distances proportionally for scenes with a shallow embedNode cavity.
+    this._detailScale = 1.0;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -78,7 +84,7 @@ export class RayMarchRenderer extends WebGLRenderer {
    * @param {Map<string,number>} uniforms  Dynamic uniforms from GLSLEvaluator
    * @param {number}             time      Seconds since start
    */
-  render(uniforms = new Map(), time = 0) {
+  render(uniforms = new Map(), time = 0, vecUniforms = new Map(), intUniforms = new Map()) {
     if (!this._ready) return;
 
     this._beginFrame();
@@ -109,6 +115,8 @@ export class RayMarchRenderer extends WebGLRenderer {
     // Step scale: 0.4 for rDifference/schurBlend(difference) scenes whose
     // SDF gradient can be well below 1.0; 0.9 for all other SDFs.
     this._u1f('uStepScale', this._stepScale ?? 0.9);
+    // AO/soft-shadow sampling detail scale — see setDetailScale.
+    this._u1f('uAODetailScale', this._detailScale ?? 1.0);
 
     // Point lights — always upload all 4 slots
     const plc = Math.min(this._pointLights.length, 4);
@@ -122,6 +130,11 @@ export class RayMarchRenderer extends WebGLRenderer {
 
     // Dynamic uniforms from GLSLEvaluator (time-varying params)
     uniforms.forEach((v, name) => this._u1f(name, v));
+    vecUniforms.forEach((entry, name) => {
+      if (entry.size === 3) this._u3fv(name, entry.data);
+      else this._u1fv(name, entry.data);
+    });
+    intUniforms.forEach((v, name) => this._u1i(name, v));
 
     this._drawQuad();
   }
@@ -212,6 +225,16 @@ export class RayMarchRenderer extends WebGLRenderer {
     this._maxDist  = maxDist;
   }
 
+  /**
+   * Set the AO/soft-shadow sampling detail scale — a plain uniform
+   * upload, no recompile. Clamped so it can only ever shrink sampling
+   * distances (never grow them beyond the shader's original tuning).
+   * @param {number} scale  0.15–1.0
+   */
+  setDetailScale(scale = 1.0) {
+    this._detailScale = Math.max(0.15, Math.min(1.0, scale));
+  }
+
   resize(w, h) {
     super.resize(w, h);
     if (this._ready) this.render(new Map(), 0);
@@ -265,6 +288,7 @@ uniform float uFresnelInt;
 uniform float uMaxDist;
 uniform float uEpsilon;
 uniform float uStepScale;
+uniform float uAODetailScale;
 
 // Point lights (up to 4)
 uniform vec3  uPointLightPos[4];
@@ -310,7 +334,7 @@ float ambientOcclusion(vec3 p, vec3 n) {
   float occ = 0.0;
   float w   = 1.0;
   for (int i = 1; i <= 6; i++) {
-    float d  = float(i) * 0.12;
+    float d  = float(i) * 0.12 * uAODetailScale;
     occ     += w * (d - sceneSDF(p + n * d));
     w       *= 0.55;
   }
@@ -385,7 +409,7 @@ void main() {
   float diff   = max(dot(normal, uLightDir), 0.0);
   vec3  halfV  = normalize(uLightDir + viewDir);
   float spec   = pow(max(dot(normal, halfV), 0.0), specExp) * uSpecularInt;
-  float shadow = softShadow(p + normal * 0.002, uLightDir, 0.01, 6.0, 12.0);
+  float shadow = softShadow(p + normal * 0.002 * uAODetailScale, uLightDir, 0.01 * uAODetailScale, 6.0, 12.0);
   float ao     = ambientOcclusion(p, normal);
 
   vec3 col = uMatColor * (uAmbient * ao
@@ -406,7 +430,7 @@ void main() {
     float atten    = 1.0 / (1.0 + distL * distL /
                     (uPointLightRadius[i] * uPointLightRadius[i]));
     float diffL    = max(dot(normal, dirL), 0.0);
-    float shadowL  = softShadow(p + normal * 0.002, dirL, 0.01, distL, 8.0);
+        float shadowL  = softShadow(p + normal * 0.002 * uAODetailScale, dirL, 0.01 * uAODetailScale, distL, 8.0);
 
     vec3  halfL    = normalize(dirL + viewDir);
     float specL    = pow(max(dot(normal, halfL), 0.0), specExp) * uSpecularInt * 0.6;

@@ -24,14 +24,64 @@ import {
   invertAffine,
   isInvertible,
 } from '../utils/affine.js';
-import { applyInverseTransform3D, isIdentityTransform } from '../utils/transform3D.js';
-import { computeLocalFrame, snapToNearestSurface, computeShapeOperator2x2 } from '../utils/differentialGeometry.js'
+import { buildAdaptiveFrameField, evaluateBlendedFrame, defaultFrameBandwidth } from '../utils/frameField.js';
+import { applyInverseTransform3D, applyForwardTransform3D, isIdentityTransform } from '../utils/transform3D.js';
+import { evaluateMaskAt, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
 import { ComplexShape2D } from '../Geometry/ComplexShape2d.js';
 import { TrianglePrimitive, ArcPrimitive } from '../Primitives/primaryDerivativePrimitives.js';
 import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from '../Primitives/regionPrimitives.js';
 import { SpherePrimitive, BoxPrimitive, CylinderPrimitive,
          CapsulePrimitive, TorusPrimitive,
          ConePrimitive, InfinitePlanePrimitive } from '../Primitives/solidPrimitives.js';
+
+/**
+ * Rotate a direction vector (no translation/pivot) FORWARD — host local
+ * space -> host parent space.
+ */
+function _forwardRotateDirection(dir, t) {
+  const rx = t.rotateX ?? 0, ry = t.rotateY ?? 0, rz = t.rotateZ ?? 0;
+  let x = dir.x, y = dir.y, z = dir.z;
+  if (rx !== 0) {
+    const c = Math.cos(rx), s = Math.sin(rx);
+    const ny = y*c - z*s, nz = y*s + z*c;
+    y = ny; z = nz;
+  }
+  if (ry !== 0) {
+    const c = Math.cos(ry), s = Math.sin(ry);
+    const nx = x*c + z*s, nz = -x*s + z*c;
+    x = nx; z = nz;
+  }
+  if (rz !== 0) {
+    const c = Math.cos(rz), s = Math.sin(rz);
+    const nx = x*c - y*s, ny = x*s + y*c;
+    x = nx; y = ny;
+  }
+  return { x, y, z };
+}
+
+/**
+ * Convert one embed frame (from deriveEmbedFramesFromMask — positions/
+ * directions in the HOST NODE'S OWN LOCAL, pre-transform space) into the
+ * host's PARENT space — the space hostSDF/p actually operate in.
+ */
+function _transformFrameToHostParentSpace(frame, hostTransform) {
+  const scale = hostTransform.scale ?? 1;
+  const safeScale = Math.abs(scale) > 1e-6 ? scale : 1e-6;
+  const c0 = applyForwardTransform3D(frame.c0, hostTransform);
+  const N  = _forwardRotateDirection(frame.N, hostTransform);
+  const T  = _forwardRotateDirection(frame.T, hostTransform);
+  const B = {
+    x: N.y*T.z - N.z*T.y,
+    y: N.z*T.x - N.x*T.z,
+    z: N.x*T.y - N.y*T.x,
+  };
+  return {
+    c0, N, T, B,
+    Sxx: frame.Sxx / safeScale,
+    Sxy: frame.Sxy / safeScale,
+    Syy: frame.Syy / safeScale,
+  };
+}
 
 /**
  * NodeEvaluator takes a NodeGraph and a query point, walks the graph
@@ -110,6 +160,14 @@ export class NodeEvaluator {
     // transform node all work identically, with zero per-node-type wiring.
     const mapperFn = this._resolveMapper(node, 'mapper');
 
+    // Universal painted-region gate for that mapper (see surfaceMask.js).
+    // A node's OWN mask — painted directly on this node's own card, never
+    // wired — confines the mapper's visible effect to the painted area.
+    // No mask painted = hasMask is false = byte-identical to pre-existing
+    // behavior, so every scene saved before this feature renders unchanged.
+    const mask = node.mask;
+    const hasMask = mapperFn && maskHasContent(mask);
+
     const t = node.transform;
     const identity = isIdentityTransform(t);
 
@@ -123,7 +181,18 @@ export class NodeEvaluator {
       // mapper's ripple/warp amplitude scales proportionally when the
       // shape is scaled up via the Transform section, rather than staying
       // a fixed absolute size regardless of shape size.
-      if (mapperFn) d = mapperFn(d, time, 0);
+      if (mapperFn) {
+        const mapped = mapperFn(d, time, 0);
+        if (hasMask) {
+          // Query the mask in LOCAL space — matching where the mapper
+          // itself is evaluated, consistent with the "applied to the
+          // local, pre-scale distance value" convention immediately above.
+          const w = evaluateMaskAt(mask, local);
+          d = d + (mapped - d) * w; // blend unmapped → mapped by paint weight
+        } else {
+          d = mapped;
+        }
+      }
       return d * scale;
     };
 
@@ -342,11 +411,21 @@ export class NodeEvaluator {
         const sdfA = this._resolveSDF(node, 'sdfA');
         const sdfB = this._resolveSDF(node, 'sdfB');
         if (!sdfA || !sdfB) return { result: () => Infinity };
-        const { operation, smoothness } = node.params;
+        const { operation, smoothness, maskFrom } = node.params;
+        const gateMask = maskFrom === 'sdfB' ? this._resolveMaskForPort(node, 'sdfB')
+                        : maskFrom === 'sdfA' ? this._resolveMaskForPort(node, 'sdfA')
+                        : null;
+        const useMask = maskHasContent(gateMask);
         const sdfFn = (pt, cs = [], t = 0) => {
-          if (operation === 'intersection') return weightedRIntersection(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
-          if (operation === 'difference')   return weightedRDifference(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
-          return weightedRUnion(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
+          const a = sdfA(pt, cs, t), b = sdfB(pt, cs, t);
+          let blended;
+          if (operation === 'intersection') blended = weightedRIntersection(a, b, smoothness);
+          else if (operation === 'difference') blended = weightedRDifference(a, b, smoothness);
+          else blended = weightedRUnion(a, b, smoothness);
+          if (!useMask) return blended;
+          const base = maskFrom === 'sdfB' ? b : a; // unpainted area = the referenced branch, unaffected by the other
+          const w = evaluateMaskAt(gateMask, pt);
+          return base + (blended - base) * w;
         };
         return { result: sdfFn };
       }
@@ -354,27 +433,57 @@ export class NodeEvaluator {
       case 'rUnion': {
         const sdfA = this._resolveSDF(node, 'sdfA');
         const sdfB = this._resolveSDF(node, 'sdfB');
-        const { smoothness } = node.params;
-        const sdfFn = (pt, cs = [], t = 0) =>
-          weightedRUnion(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
+        const { smoothness, maskFrom } = node.params;
+        const gateMask = maskFrom === 'sdfB' ? this._resolveMaskForPort(node, 'sdfB')
+                        : maskFrom === 'sdfA' ? this._resolveMaskForPort(node, 'sdfA')
+                        : null;
+        const useMask = maskHasContent(gateMask);
+        const sdfFn = (pt, cs = [], t = 0) => {
+          const a = sdfA(pt, cs, t), b = sdfB(pt, cs, t);
+          const blended = weightedRUnion(a, b, smoothness);
+          if (!useMask) return blended;
+          const base = maskFrom === 'sdfB' ? b : a;
+          const w = evaluateMaskAt(gateMask, pt);
+          return base + (blended - base) * w;
+        };
         return { result: sdfFn };
       }
 
       case 'rIntersection': {
         const sdfA = this._resolveSDF(node, 'sdfA');
         const sdfB = this._resolveSDF(node, 'sdfB');
-        const { smoothness } = node.params;
-        const sdfFn = (pt, cs = [], t = 0) =>
-          weightedRIntersection(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
+        const { smoothness, maskFrom } = node.params;
+        const gateMask = maskFrom === 'sdfB' ? this._resolveMaskForPort(node, 'sdfB')
+                        : maskFrom === 'sdfA' ? this._resolveMaskForPort(node, 'sdfA')
+                        : null;
+        const useMask = maskHasContent(gateMask);
+        const sdfFn = (pt, cs = [], t = 0) => {
+          const a = sdfA(pt, cs, t), b = sdfB(pt, cs, t);
+          const blended = weightedRIntersection(a, b, smoothness);
+          if (!useMask) return blended;
+          const base = maskFrom === 'sdfB' ? b : a;
+          const w = evaluateMaskAt(gateMask, pt);
+          return base + (blended - base) * w;
+        };
         return { result: sdfFn };
       }
 
       case 'rDifference': {
         const sdfA = this._resolveSDF(node, 'sdfA');
         const sdfB = this._resolveSDF(node, 'sdfB');
-        const { smoothness } = node.params;
-        const sdfFn = (pt, cs = [], t = 0) =>
-          weightedRDifference(sdfA(pt, cs, t), sdfB(pt, cs, t), smoothness);
+        const { smoothness, maskFrom } = node.params;
+        const gateMask = maskFrom === 'sdfB' ? this._resolveMaskForPort(node, 'sdfB')
+                        : maskFrom === 'sdfA' ? this._resolveMaskForPort(node, 'sdfA')
+                        : null;
+        const useMask = maskHasContent(gateMask);
+        const sdfFn = (pt, cs = [], t = 0) => {
+          const a = sdfA(pt, cs, t), b = sdfB(pt, cs, t);
+          const blended = weightedRDifference(a, b, smoothness);
+          if (!useMask) return blended;
+          const base = maskFrom === 'sdfB' ? b : a;
+          const w = evaluateMaskAt(gateMask, pt);
+          return base + (blended - base) * w;
+        };
         return { result: sdfFn };
       }
 
@@ -428,7 +537,7 @@ export class NodeEvaluator {
         const sdfA = this._resolveSDF(node, 'sdfA');
         const sdfB = this._resolveSDF(node, 'sdfB');
         if (!sdfA || !sdfB) return { result: () => Infinity };
-        const { animated, speed } = node.params;
+        const { animated, speed, maskFrom } = node.params;
         let t = node.params.t ?? 0.5;
         if (animated === 'yes') {
           // Oscillate smoothly between 0 and 1, ignoring the manual slider
@@ -436,8 +545,20 @@ export class NodeEvaluator {
           // 'animated' flag overriding its static behavior.
           t = (Math.sin(this._time * (speed ?? 0.8)) + 1) / 2;
         }
-        const sdfFn = (pt, cs = [], time = 0) =>
-          (1 - t) * sdfA(pt, cs, time) + t * sdfB(pt, cs, time);
+        const gateMask = maskFrom === 'sdfB' ? this._resolveMaskForPort(node, 'sdfB')
+                        : maskFrom === 'sdfA' ? this._resolveMaskForPort(node, 'sdfA')
+                        : null;
+        const useMask = maskHasContent(gateMask);
+        const sdfFn = (pt, cs = [], time = 0) => {
+          const a = sdfA(pt, cs, time), b = sdfB(pt, cs, time);
+          const morphed = (1 - t) * a + t * b;
+          if (!useMask) return morphed;
+          // Outside the painted region: pure A (or B) — the morph only
+          // shows through where painted.
+          const base = maskFrom === 'sdfB' ? b : a;
+          const w = evaluateMaskAt(gateMask, pt);
+          return base + (morphed - base) * w;
+        };
         return { result: sdfFn };
       }
 
@@ -446,15 +567,6 @@ export class NodeEvaluator {
         const guestSDF = this._resolveSDF(node, 'guestSdf');
         if (!hostSDF || !guestSDF) return { result: () => Infinity };
 
-        // ── Per-cell embedding against a tiling host ────────────────────────
-        // A single fixed-world anchor is ambiguous against an infinite/
-        // finite tiling host — "one anchor" doesn't say which repeated
-        // cell it belongs to. Fix: if the host is directly a tilingNode,
-        // fold the query point into that SAME tiling's local cell space
-        // before running the ordinary single-anchor embed logic below —
-        // the anchor then means "this position within ANY cell", so the
-        // decoration appears identically on every tile. Reuses
-        // tilingNode's own fold math verbatim rather than duplicating it.
         const hostEdgeForTiling = this.graph.getIncomingEdge(node.id, 'hostSdf');
         const hostNodeForTiling = hostEdgeForTiling ? this.graph.nodes.get(hostEdgeForTiling.fromNode) : null;
         const hostIsTiling = hostNodeForTiling && hostNodeForTiling.type === 'tilingNode';
@@ -462,150 +574,113 @@ export class NodeEvaluator {
           ? this._buildTilingFoldFn(hostNodeForTiling)
           : null;
 
-        const { operation, anchorX, anchorY, anchorZ, regionSize, depth } = node.params;
+        const hostMask = hostNodeForTiling ? hostNodeForTiling.mask : null;
+        const useMask = maskHasContent(hostMask);
+
+        const { operation, anchorX, anchorY, anchorZ, regionSize, depth, edgeSoftness, seamSmoothness } = node.params;
         const rawAnchor = { x: anchorX ?? 0, y: anchorY ?? 0, z: anchorZ ?? 0 };
 
-        // BUGFIX (crash): GLSLEvaluator._computeEmbedFrame ALWAYS wrapped
-        // this exact frame-building step in try/catch with a fallback —
-        // this CPU counterpart never had the equivalent guard, which is
-        // exactly why GLSL mode silently absorbed an edge case (most
-        // plausibly: an anchor at or near a shape's symmetric center-axis
-        // — the default (0,0,0) — where the gradient direction can be
-        // numerically unstable/ambiguous) while CPU mode threw. Now
-        // matches GLSL's defensive behavior exactly.
-        let c0, frame0;
-        try {
-          c0 = snapToNearestSurface(hostSDF, rawAnchor, 4);
-          frame0 = computeLocalFrame(hostSDF, c0);
-        } catch (e) {
-          c0 = rawAnchor;
-          frame0 = null;
+        // Plain (unweighted) centroid-based footprint of the mask's OWN
+        // samples, measured in the host's LOCAL space (matching how
+        // mask samples are stored), converted to the host's PARENT
+        // space (where tangentialR/rs are actually compared below) via
+        // the host's own uniform scale.
+        let maskFootprintRadius = 0;
+        if (useMask) {
+          let mcx = 0, mcy = 0, mcz = 0;
+          hostMask.samples.forEach(s => { mcx += s.x; mcy += s.y; mcz += s.z; });
+          const sN = hostMask.samples.length || 1;
+          mcx /= sN; mcy /= sN; mcz /= sN;
+          let maxDist = 0;
+          hostMask.samples.forEach(s => {
+            const dx = s.x - mcx, dy = s.y - mcy, dz = s.z - mcz;
+            const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            if (d > maxDist) maxDist = d;
+          });
+          const domePad = computeMaskDomeRadius(hostMask.samples, hostMask.falloffRadius);
+          const hostScale = Math.abs(hostNodeForTiling?.transform?.scale ?? 1);
+          maskFootprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
         }
 
-        // ── Curvature-corrected local frame (principled, not tuned) ─────────
-        // For a host with ISOTROPIC curvature H at the anchor (verified
-        // exactly for a sphere: H = div(p/|p|) = 2/R, and the tangent-
-        // plane-relative SDF at tangential radius r is r²/(2R) =
-        // 0.5·(2/R)·r² = 0.5·H·r² — matches this formula exactly), a
-        // second-order Taylor expansion predicts how far the TRUE surface
-        // departs from the fixed flat tangent frame at any tangential
-        // radius r: sag ≈ 0.5·H·r². This is computed ONCE at the anchor
-        // (cheap) and applied per-query below to correct localZ before
-        // the guest is sampled — a real, derived correction, not a tuned
-        // scaling constant. Remaining limitation (still deferred, V2):
-        // this assumes ISOTROPIC curvature (same in every tangential
-        // direction, like a sphere) — hosts with direction-dependent
-        // principal curvatures (a cylinder, a saddle-shaped blend seam)
-        // will be over/under-corrected in the low/high-curvature
-        // direction respectively. Fixing that needs either the full
-        // second-fundamental-form (principal curvatures + directions) or
-        // multiple curvature samples across the patch — a genuinely
-        // bigger, still-deferred task.
-       // Frame fallback FIRST — computeShapeOperator2x2 needs a valid
-        // tangent/bitangent to project the Hessian into, so the identity
-        // fallback must exist before it's called, not after.
-        if (!frame0) {
-          frame0 = {
-            normal: { x: 0, y: 1, z: 0 },
-            tangent: { x: 1, y: 0, z: 0 },
-            bitangent: { x: 0, y: 0, z: 1 },
-          };
+        // Multi-frame adaptive field — several curvature-adaptive
+        // frames spread across the WHOLE painted/flooded footprint
+        // (see deriveEmbedFramesFromMask), converted from the host's
+        // LOCAL space into the host's PARENT space whenever the host
+        // has a non-identity transform.
+        let frames;
+        if (useMask) {
+          let rawFrames = deriveEmbedFramesFromMask(hostMask, 6);
+          if (rawFrames.length === 0) {
+            rawFrames = [{
+              c0: rawAnchor, T: {x:1,y:0,z:0}, B: {x:0,y:0,z:1}, N: {x:0,y:1,z:0},
+              Sxx: 0, Sxy: 0, Syy: 0,
+            }];
+          }
+          const hostTransform = hostNodeForTiling?.transform;
+          frames = (hostTransform && !isIdentityTransform(hostTransform))
+            ? rawFrames.map(f => _transformFrameToHostParentSpace(f, hostTransform))
+            : rawFrames;
+        } else {
+          try {
+            frames = buildAdaptiveFrameField(hostSDF, rawAnchor, regionSize ?? 1.0);
+          } catch (e) {
+            frames = [{
+              c0: rawAnchor, T: {x:1,y:0,z:0}, B: {x:0,y:0,z:1}, N: {x:0,y:1,z:0},
+              Sxx: 0, Sxy: 0, Syy: 0,
+            }];
+          }
         }
 
-        // ── Anisotropic curvature correction (Tier 1 — no eigensolve) ────
-        // Sxx/Sxy/Syy is the shape operator projected into THIS SAME
-        // (tangent, bitangent) basis already built above for guest
-        // sampling — reusing frame0 here is what guarantees the sag
-        // correction and the guest-sampling coordinates can never drift
-        // out of basis alignment with each other, by construction.
-        // sag(localX,localY) = 0.5*(Sxx*localX² + 2*Sxy*localX*localY +
-        // Syy*localY²) is the direction-aware generalization of the old
-        // isotropic 0.5*H*r² — Euler's formula for normal curvature in an
-        // arbitrary tangential direction, expressed as a quadratic form
-        // rather than cos²θ/sin²θ, so no angle/atan2 is ever computed.
-        // Reduces to the old formula exactly when Sxx=Syy=H, Sxy=0 (the
-        // isotropic case — any sphere point).
-        let Sxx = 0, Sxy = 0, Syy = 0;
-        try {
-          ({ Sxx, Sxy, Syy } = computeShapeOperator2x2(hostSDF, c0, frame0));
-        } catch (e) { Sxx = 0; Sxy = 0; Syy = 0; }
+        // rs — the SINGLE radius used for BOTH the tangentialR
+        // bail-out AND the wT/innerR feather shape in sdfFn below (a
+        // previous version used two different variables here, which
+        // disagreed and produced a hard/discontinuous edge).
+        //
+        // For 'curvatureFlood' mode, the node's own regionSize slider
+        // (otherwise inert once painted) is repurposed as a SCALE
+        // MULTIPLIER on the flooded footprint: 1.0 = exactly the
+        // flooded extent, smaller = shrink the guest's confinement
+        // inside it.
+        let rs;
+        if (useMask) {
+          const userScale = hostMask.mode === 'curvatureFlood'
+            ? Math.max(regionSize ?? 1.0, 0.05)
+            : 1;
+          rs = Math.max(maskFootprintRadius * userScale, 1e-4);
+        } else {
+          rs = regionSize ?? 1.0;
+        }
 
-        const n0  = frame0.normal;
-        const t0x = frame0.tangent.x,   t0y = frame0.tangent.y,   t0z = frame0.tangent.z;
-        const b0x = frame0.bitangent.x, b0y = frame0.bitangent.y, b0z = frame0.bitangent.z;
+        const bandwidth = useMask
+          ? defaultFrameBandwidth(Math.max(maskFootprintRadius, 1e-4), frames.length)
+          : defaultFrameBandwidth(rs, frames.length);
 
         const sdfFn = (pt, cs = [], t = 0) => {
           const rawP = { x: pt.x, y: pt.y, z: pt.z || 0 };
-          // If the host is a tiling node, fold the query point into its
-          // local cell space FIRST — the anchor/gate math below then
-          // operates identically inside every repeated cell.
           const p = tilingFoldForEmbed ? tilingFoldForEmbed(rawP) : rawP;
           const dHost = hostSDF(p, cs, t);
 
-          const dx = p.x - c0.x, dy = p.y - c0.y, dz = p.z - c0.z;
-          const localX = dx*t0x + dy*t0y + dz*t0z;
-          const localY = dx*b0x + dy*b0y + dz*b0z;
-          const localZ = dx*n0.x + dy*n0.y + dz*n0.z;
+          const { localX, localY, localZ } = evaluateBlendedFrame(frames, p, bandwidth);
 
-          // BUGFIX: gate previously only bounded TANGENTIAL distance
-          // (localX/localY), never localZ (distance along the surface
-          // normal). That made the affected region an INFINITE ROD —
-          // extending forever through the host along the normal in both
-          // directions — rather than a bounded neighborhood. Any point on
-          // a DIFFERENT part of the host (e.g. the opposite face of a box)
-          // that happened to share similar tangential coordinates with the
-          // anchor was incorrectly gated "in" and combined with the guest —
-          // this is exactly what produced mirrored/duplicate copies of the
-          // guest showing up on far faces when combined with Repeat. Now
-          // bounded in all three local axes — a true sphere, not a rod.
-          // BUGFIX (floating disconnected fragments): the old gate bounded
-          // ONLY distance from the anchor point (a sphere/rod in world
-          // space, since T0/B0/N0 form an orthonormal frame — that gate
-          // was mathematically equal to |p - anchor|). A sphere gate has
-          // NO knowledge of where the host's REAL surface is — it can
-          // extend well past the host's actual boundary (e.g. near an
-          // edge/corner, or whenever regionSize exceeds the host's local
-          // half-extent), and inside that overflow zone, Emboss's union
-          // will mark guest material "solid" regardless of whether we're
-          // anywhere near the true surface — producing exactly the
-          // floating, disconnected fragments seen in testing.
-          //
-          // Fixed by gating on TWO independent, physically meaningful
-          // things instead: (1) tangentialR — how wide a footprint on the
-          // surface is affected (regionSize), and (2) |dHost| itself —
-          // how far from the TRUE host surface (correctly handling edges/
-          // corners, since it reads the host's real SDF, not an
-          // approximation) the effect may reach (depth). Requiring
-          // |dHost| < depth means any point genuinely far from the real
-          // surface — including tangential overflow near a corner — is
-          // excluded, no matter how large regionSize is.
           const tangentialR2 = localX*localX + localY*localY;
           const tangentialR  = Math.sqrt(tangentialR2);
           const absDHost     = Math.abs(dHost);
 
-          // Gate uses the EXACT dHost directly — no need to compensate the
-          // gate itself, since dHost already correctly reflects the true
-          // surface regardless of curvature. Only the guest's SAMPLING
-          // coordinate (localZ, below) needs the curvature correction.
-          if (tangentialR >= regionSize || absDHost >= depth) return dHost;
+          if (tangentialR >= rs || absDHost >= depth) return dHost;
 
-          // Anisotropic Euler-formula sag as a quadratic form in
-          // (localX, localY) — see the derivation comment above.
-          const sag = 0.5 * (Sxx*localX*localX + 2*Sxy*localX*localY + Syy*localY*localY);
-          const correctedLocalZ = localZ - sag;
-
-          const dGuest = guestSDF({ x: localX, y: localY, z: correctedLocalZ }, cs, t);
+          const dGuest = guestSDF({ x: localX, y: localY, z: localZ }, cs, t);
+          const seamSm = seamSmoothness ?? 0;
           const embedded = operation === 'engrave'
-            ? weightedRDifference(dHost, dGuest, 0)
-            : weightedRUnion(dHost, dGuest, 0);
+            ? weightedRDifference(dHost, dGuest, seamSm)
+            : weightedRUnion(dHost, dGuest, seamSm);
 
-          const FALLOFF_FRACTION = 0.25;
-          const innerR = regionSize * (1 - FALLOFF_FRACTION);
+          const FALLOFF_FRACTION = Math.min(Math.max(edgeSoftness ?? 0.25, 0), 0.9);
+          const innerR = rs * (1 - FALLOFF_FRACTION);
           const innerD = depth * (1 - FALLOFF_FRACTION);
 
           let wT = 1;
           if (tangentialR > innerR) {
-            const x = (tangentialR - innerR) / (regionSize - innerR);
+            const x = (tangentialR - innerR) / (rs - innerR);
             wT = 1 - (x * x * (3 - 2 * x));
           }
           let wD = 1;
@@ -613,7 +688,17 @@ export class NodeEvaluator {
             const x = (absDHost - innerD) / (depth - innerD);
             wD = 1 - (x * x * (3 - 2 * x));
           }
-          const w = wT * wD;
+          let w = wT * wD;
+
+          // Paint modes: the painted stroke's own silhouette IS the
+          // decoration's shape. Flood mode keeps the wT*wD radial gate
+          // above (unchanged) so the GUEST's own silhouette shows
+          // through, confined to the flood's size/position rather than
+          // the flood's own irregular outline.
+          if (useMask && hostMask.mode !== 'curvatureFlood') {
+            w = evaluateMaskAt(hostMask, p);
+          }
+
           return embedded * w + dHost * (1 - w);
         };
 
@@ -1037,7 +1122,7 @@ export class NodeEvaluator {
       case 'noiseDisplaceNode': {
         const baseSDF  = this._resolveSDF(node, 'sdf');
         if (!baseSDF) return { result: () => Infinity };
-        const { amplitude, frequency, animated, speed } = node.params;
+        const { amplitude, frequency, animated, speed, useMaskFromInput } = node.params;
         const amp  = amplitude ?? 0.3;
         const freq = frequency ?? 3.0;
         // Simple hash-based noise — no dependency, pure math
@@ -1065,6 +1150,16 @@ export class NodeEvaluator {
                + h001*(1-ux)*(1-uy)*uz     + h101*ux*(1-uy)*uz
                + h011*(1-ux)*uy*uz         + h111*ux*uy*uz;
         };
+
+        // Confine the bumpiness to a painted region on the input shape's
+        // OWN card — mirrors embedNode's host-mask resolution, but this
+        // node has only one input port, so there's no maskFrom choice,
+        // just a yes/no toggle.
+        const inputEdge = this.graph.getIncomingEdge(node.id, 'sdf');
+        const inputNode = inputEdge ? this.graph.nodes.get(inputEdge.fromNode) : null;
+        const gateMask = (useMaskFromInput === 'yes' && inputNode) ? inputNode.mask : null;
+        const useMask = maskHasContent(gateMask);
+
         return {
           result: (pt, cs = [], t = 0) => {
             const timeOffset = animated === 'yes' ? t * (speed ?? 0.4) : 0;
@@ -1073,7 +1168,11 @@ export class NodeEvaluator {
               pt.y * freq,
               (pt.z || 0) * freq
             );
-            return baseSDF(pt, cs, t) + (n * 2 - 1) * amp;
+            const baseVal = baseSDF(pt, cs, t);
+            const displaced = baseVal + (n * 2 - 1) * amp;
+            if (!useMask) return displaced;
+            const w = evaluateMaskAt(gateMask, pt);
+            return baseVal + (displaced - baseVal) * w; // = noise strength scaled by paint weight
           }
         };
       }
@@ -1177,6 +1276,19 @@ export class NodeEvaluator {
 
     const result = this.evaluate(edge.fromNode);
     return result?.mapper || null;
+  }
+
+  /**
+   * Resolve the mask belonging to whichever node feeds a given input
+   * port — used by boolean-blend/morph nodes' maskFrom param and
+   * noiseDisplaceNode's useMaskFromInput param. Mirrors how embedNode
+   * resolves its host's mask, generalized to an arbitrary named port.
+   */
+  _resolveMaskForPort(node, portName) {
+    const edge = this.graph.getIncomingEdge(node.id, portName);
+    if (!edge) return null;
+    const srcNode = this.graph.nodes.get(edge.fromNode);
+    return srcNode ? srcNode.mask : null;
   }
 
   /**

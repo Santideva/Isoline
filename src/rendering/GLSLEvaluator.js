@@ -34,10 +34,33 @@
 // All JS numbers go through _f(v) which guarantees a GLSL float literal
 // (always has a decimal point, non-finite values become 1e10).
 // ─────────────────────────────────────────────────────────────────────────────
-
-import { isIdentityTransform } from '../utils/transform3D.js';
+import { isIdentityTransform, applyForwardTransform3D } from '../utils/transform3D.js';
+import { decimateSamples, MAX_MASK_SAMPLES, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
 import { NodeEvaluator } from '../graph/NodeEvaluator.js';
-import { computeLocalFrame, snapToNearestSurface, computeShapeOperator2x2 } from '../utils/differentialGeometry.js';
+import { buildAdaptiveFrameField, evaluateBlendedFrame, defaultFrameBandwidth } from '../utils/frameField.js';
+
+
+function _forwardRotateDirectionGLSL(dir, t) {
+  const rx = t.rotateX ?? 0, ry = t.rotateY ?? 0, rz = t.rotateZ ?? 0;
+  let x = dir.x, y = dir.y, z = dir.z;
+  if (rx !== 0) { const c = Math.cos(rx), s = Math.sin(rx); const ny = y*c - z*s, nz = y*s + z*c; y = ny; z = nz; }
+  if (ry !== 0) { const c = Math.cos(ry), s = Math.sin(ry); const nx = x*c + z*s, nz = -x*s + z*c; x = nx; z = nz; }
+  if (rz !== 0) { const c = Math.cos(rz), s = Math.sin(rz); const nx = x*c - y*s, ny = x*s + y*c; x = nx; y = ny; }
+  return { x, y, z };
+}
+
+function _transformFrameToHostParentSpaceGLSL(frame, hostTransform) {
+  const scale = hostTransform.scale ?? 1;
+  const safeScale = Math.abs(scale) > 1e-6 ? scale : 1e-6;
+  const c0 = applyForwardTransform3D(frame.c0, hostTransform);
+  const N  = _forwardRotateDirectionGLSL(frame.N, hostTransform);
+  const T  = _forwardRotateDirectionGLSL(frame.T, hostTransform);
+  const B = {
+    x: N.y*T.z - N.z*T.y, y: N.z*T.x - N.x*T.z, z: N.x*T.y - N.y*T.x,
+  };
+  return { c0, N, T, B, Sxx: frame.Sxx / safeScale, Sxy: frame.Sxy / safeScale, Syy: frame.Syy / safeScale };
+}
+
 // Node types that produce a 3D SDF (float fn(vec3 p))
 const SOLID_TYPES = new Set([
 
@@ -75,7 +98,20 @@ export class GLSLEvaluator {
   constructor(graph) {
     this.graph    = graph;
     this.uniforms = new Map();
+    // Array-valued uniforms — separate from `uniforms` (always
+    // float-valued) because they need a different upload call
+    // (gl.uniform3fv/1fv vs gl.uniform1f) and a different GLSL
+    // declaration (`uniform vec3 name[N]` vs `uniform float name`). See
+    // _maskFieldGLSL for what populates these.
+    this.vecUniforms = new Map(); // name → { data: Float32Array, size: 3|1 }
+    this.intUniforms  = new Map(); // name → integer value
     this._time    = 0;
+    // Persists ACROSS generate() calls (unlike _maskFnCache/_maskFnDecls,
+    // which are correctly per-call) — the whole point is to avoid
+    // rebuilding embedNode's expensive frame field every animation frame
+    // when nothing relevant has changed. Keyed by embedNode id, not host
+    // id, so two embeds sharing one host never thrash each other's entry.
+    this._embedFrameCache = new Map();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -89,7 +125,14 @@ export class GLSLEvaluator {
    */
   generate(time = 0, mode = 'auto') {
     this.uniforms.clear();
+    this.vecUniforms.clear();
+    this.intUniforms.clear();
     this._time = time;
+    this._maskFnCache = new Map();
+    this._maskFnDecls = [];
+    // Names of uniforms emitted THIS call — declared once, up front, in
+    // the assembled source below. Reset per call like _maskFnDecls.
+    this._uniformDecls = new Set();
 
     // Resolve effective mode
     if (mode === 'auto') {
@@ -102,12 +145,12 @@ export class GLSLEvaluator {
       if (node.type === 'outputNode') outputNode = node;
     });
     if (!outputNode) {
-      return { source: '', uniforms: this.uniforms, rootFn: null };
+      return { source: '', uniforms: this.uniforms, vecUniforms: this.vecUniforms, intUniforms: this.intUniforms, rootFn: null };
     }
 
     const allIncoming = this.graph.getAllIncomingEdges(outputNode.id, 'sdf');
     if (allIncoming.length === 0) {
-      return { source: '', uniforms: this.uniforms, rootFn: null };
+      return { source: '', uniforms: this.uniforms, vecUniforms: this.vecUniforms, intUniforms: this.intUniforms, rootFn: null };
     }
     // Use first edge for backward-compat; multi-source handled in sceneSDF below
     const incoming = allIncoming[0];
@@ -115,11 +158,19 @@ export class GLSLEvaluator {
     // Topological sort
     const order = this._topologicalSort();
 
-    // Generate one function per node
+    // Only generate GLSL for nodes actually reachable from the output —
+    // see _computeReachableNodes's header for why. Without this, adding a
+    // freshly-created, unlinked node to the canvas still forced a full
+    // shader recompile purely because the concatenated source string grew
+    // by one dead-code function block.
+    const reachable = this._computeReachableNodes(outputNode);
+
+    // Generate one function per REACHABLE node
     const functions = [];
     for (const nodeId of order) {
       const node = this.graph.nodes.get(nodeId);
       if (!node || node.type === 'outputNode') continue;
+      if (!reachable.has(nodeId)) continue;
       const glsl = this._generateNode(node, mode);
       if (glsl) functions.push(glsl);
     }
@@ -216,8 +267,28 @@ float sceneSDF(vec2 p) {
 
     sceneSDFStr += '\n' + placementWrapper;
 
-    const source = [this._preamble(), ...functions, sceneSDFStr].join('\n\n');
-    return { source, uniforms: this.uniforms, rootFn };
+    // Defensive consistency check: every mask function name handed out by
+    // _maskFieldGLSL() during this generate() call must have a matching
+    // declaration queued in _maskFnDecls, or the shader will compile-fail
+    // with a cryptic "no matching overloaded function found" at the CALL
+    // site rather than pointing at the real problem (a missing
+    // declaration). Surfaces that mismatch immediately and loudly instead
+    // of silently producing a broken shader.
+    this._maskFnCache.forEach((fnName) => {
+      const hasDecl = this._maskFnDecls.some(d => d.includes(`float ${fnName}(`));
+      if (!hasDecl) {
+        console.error(
+          `GLSLEvaluator: mask function "${fnName}" was referenced but never ` +
+          `declared — the generated shader will fail to compile. This means ` +
+          `_maskFnDecls is not being included in the final source assembly, ` +
+          `or _maskFieldGLSL's push() is not running for this node.`
+        );
+      }
+    });
+
+    const uniformDeclBlock = [...this._uniformDecls].map(n => `uniform float ${n};`).join('\n');
+    const source = [this._preamble(), uniformDeclBlock, ...this._maskFnDecls, ...functions, sceneSDFStr].join('\n\n');
+    return { source, uniforms: this.uniforms, vecUniforms: this.vecUniforms, intUniforms: this.intUniforms, rootFn };
   }
 
   // ── Mode detection ────────────────────────────────────────────────────────
@@ -318,6 +389,12 @@ float rIntersection(float a, float b, float s) {
 float rDifference(float a, float b, float s) {
   // max(a, −b): positive outside A−B, negative inside crescent.
   return rIntersection(a, -b, s);
+}
+float smoothMax(float a, float b, float s) {
+  // -smoothMin(-a,-b) — the max-side counterpart to rUnion's smooth min,
+  // used to blend overlapping mask domes into a continuous ridge instead
+  // of a chain of visibly separate petals (see mask_N below).
+  return -rUnion(-a, -b, s);
 }
 
 // ── Shared noise helpers ────────────────────────────────────────────────────
@@ -594,74 +671,199 @@ float ${fn}(float d) { return d; }`;
     const guestNode = edgeG ? this.graph.nodes.get(edgeG.fromNode) : null;
     if ((hostNode && !this._nodeOutputIs3D(hostNode)) ||
         (guestNode && !this._nodeOutputIs3D(guestNode))) {
-      console.warn(
-        `embedNode ${node.id}: host and guest must both be 3D solids in V1. ` +
-        `2D shapes are not yet supported for embedding.`
-      );
+      console.warn(`embedNode ${node.id}: host and guest must both be 3D solids in V1.`);
       return this._fallback3D(fn, node.id, 'embedNode requires 3D host and guest');
     }
 
-    const op = p.operation ?? 'emboss';
-    const rs = this._f(p.regionSize ?? 1.0);
-    const depthVal = this._f(p.depth ?? 0.35);
+    const useMaskFrames = !!(hostNode && maskHasContent(hostNode.mask));
+    // Paint modes use the mask field as the decoration's shape; flood
+    // mode keeps the default radial gate so the guest's own silhouette
+    // shows through — see NodeEvaluator.js's matching embedNode comment.
+    const useMaskAsShape = !!(hostNode && hostNode.mask && hostNode.mask.mode !== 'curvatureFlood');
+    const embedMaskFnName = (useMaskFrames && useMaskAsShape) ? this._maskFieldGLSL(hostNode) : null;
 
-    // Per-cell embedding against a tiling host — see NodeEvaluator.js's
-    // matching comment for the full rationale. Only handles the DIRECT
-    // host-is-a-tilingNode case, not tiling-through-an-intermediate-node.
+    const op = p.operation ?? 'emboss';
+    const depthVal = this._uniformFloat(node, 'embedDepth', p.depth ?? 0.35);
+    const edgeSoftnessVal = Math.min(Math.max(p.edgeSoftness ?? 0.25, 0), 0.9);
+    const innerFracVal = this._uniformFloat(node, 'embedInnerFrac', 1 - edgeSoftnessVal);
+    const seamSm = this._uniformFloat(node, 'embedSeamSm', p.seamSmoothness ?? 0);
+
     const hostIsTiling = hostNode && hostNode.type === 'tilingNode';
     const tilingFoldGLSL = hostIsTiling ? this._buildTilingFoldGLSL(hostNode) : null;
 
-    const frame = this._computeEmbedFrame(edgeH.fromNode, {
-      x: p.anchorX ?? 0, y: p.anchorY ?? 0, z: p.anchorZ ?? 0,
-    });
-    const c0Str = this._f3(frame.c0);
-    const T0Str = this._f3(frame.T);
-    const B0Str = this._f3(frame.B);
-    const N0Str = this._f3(frame.N);
-    // Anisotropic sag correction — Tier 1 only (Sxx/Sxy/Syy), no
-    // eigensolve. See NodeEvaluator.js's matching embedNode case and
-    // differentialGeometry.js's computeShapeOperator2x2 for the full
-    // derivation. NOTE: this is also the first version where curvature
-    // correction actually reaches the shader — _computeEmbedFrame
-    // previously computed `curvature` but never returned it, so this
-    // constant was always baked as 0 (see that function's fix comment).
-    const SxxStr = this._f(frame.Sxx ?? 0);
-    const SxyStr = this._f(frame.Sxy ?? 0);
-    const SyyStr = this._f(frame.Syy ?? 0);
+    let maskFootprintRadius = 0;
+    if (useMaskFrames) {
+      let mcx = 0, mcy = 0, mcz = 0;
+      hostNode.mask.samples.forEach(s => { mcx += s.x; mcy += s.y; mcz += s.z; });
+      const sN = hostNode.mask.samples.length || 1;
+      mcx /= sN; mcy /= sN; mcz /= sN;
+      let maxDist = 0;
+      hostNode.mask.samples.forEach(s => {
+        const dx = s.x - mcx, dy = s.y - mcy, dz = s.z - mcz;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (d > maxDist) maxDist = d;
+      });
+      const domePad = computeMaskDomeRadius(hostNode.mask.samples, hostNode.mask.falloffRadius);
+      const hostScale = Math.abs(hostNode.transform?.scale ?? 1);
+      maskFootprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
+    }
 
-    const blendCall = op === 'engrave' ? `max(dHost, -dGuest)` : `min(dHost, dGuest)`;
+    let frames, bandwidth;
+    if (useMaskFrames) {
+      const rawFrames = deriveEmbedFramesFromMask(hostNode.mask, 6);
+      const hostTransform = hostNode.transform;
+      frames = (hostTransform && !isIdentityTransform(hostTransform))
+        ? rawFrames.map(f => _transformFrameToHostParentSpaceGLSL(f, hostTransform))
+        : rawFrames;
+      bandwidth = defaultFrameBandwidth(Math.max(maskFootprintRadius, 1e-4), frames.length);
+    } else {
+      ({ frames, bandwidth } = this._computeEmbedFrameField(
+        edgeH.fromNode,
+        { x: p.anchorX ?? 0, y: p.anchorY ?? 0, z: p.anchorZ ?? 0 },
+        p.regionSize ?? 1.0,
+        node.id
+      ));
+    }
+    const hStr = this._f(bandwidth);
 
-    return `// embedNode ${node.id}  (${op})${hostIsTiling ? '  [per-cell, tiling host]' : ''}
+    let rs;
+    if (useMaskFrames) {
+      const userScale = hostNode.mask.mode === 'curvatureFlood'
+        ? Math.max(p.regionSize ?? 1.0, 0.05)
+        : 1;
+      rs = this._uniformFloat(node, 'embedRegionSize', Math.max(maskFootprintRadius * userScale, 1e-4));
+    } else {
+      rs = this._uniformFloat(node, 'embedRegionSize', p.regionSize ?? 1.0);
+    }
+
+    const MAX_EMBED_FRAMES = 6;
+    const FAR_SENTINEL = { x: 1e6, y: 1e6, z: 1e6 };
+
+    const frameDecls = [];
+    const blendTerms = [];
+    for (let i = 0; i < MAX_EMBED_FRAMES; i++) {
+      const f = frames[i] || {
+        c0: FAR_SENTINEL, T:{x:1,y:0,z:0}, B:{x:0,y:0,z:1}, N:{x:0,y:1,z:0},
+        Sxx: 0, Sxy: 0, Syy: 0,
+      };
+      frameDecls.push(`
+  vec3 fc${i}  = ${this._f3(f.c0)};
+  vec3 fT${i}  = ${this._f3(f.T)};
+  vec3 fB${i}  = ${this._f3(f.B)};
+  vec3 fN${i}  = ${this._f3(f.N)};
+  float fSxx${i} = ${this._f(f.Sxx)};
+  float fSxy${i} = ${this._f(f.Sxy)};
+  float fSyy${i} = ${this._f(f.Syy)};`);
+
+      blendTerms.push(`
+  { vec3 dd = foldedP - fc${i};
+    float dist = length(dd);
+    float r = dist / ${hStr};
+    float ww = r >= 1.0 ? 0.0 : (1.0-r)*(1.0-r)*(1.0-r)*(1.0-r)*(4.0*r+1.0);
+    sumW  += ww;
+    c0sum += ww * fc${i};
+    Nsum  += ww * fN${i};
+    Tsum  += ww * fT${i};
+    Hrow0 += ww * vec3(
+      fSxx${i}*fT${i}.x*fT${i}.x + fSyy${i}*fB${i}.x*fB${i}.x + 2.0*fSxy${i}*fT${i}.x*fB${i}.x,
+      fSxx${i}*fT${i}.x*fT${i}.y + fSyy${i}*fB${i}.x*fB${i}.y + fSxy${i}*(fT${i}.x*fB${i}.y + fT${i}.y*fB${i}.x),
+      fSxx${i}*fT${i}.x*fT${i}.z + fSyy${i}*fB${i}.x*fB${i}.z + fSxy${i}*(fT${i}.x*fB${i}.z + fT${i}.z*fB${i}.x)
+    );
+    Hrow1 += ww * vec3(
+      fSxx${i}*fT${i}.x*fT${i}.y + fSyy${i}*fB${i}.x*fB${i}.y + fSxy${i}*(fT${i}.x*fB${i}.y + fT${i}.y*fB${i}.x),
+      fSxx${i}*fT${i}.y*fT${i}.y + fSyy${i}*fB${i}.y*fB${i}.y + 2.0*fSxy${i}*fT${i}.y*fB${i}.y,
+      fSxx${i}*fT${i}.y*fT${i}.z + fSyy${i}*fB${i}.y*fB${i}.z + fSxy${i}*(fT${i}.y*fB${i}.z + fT${i}.z*fB${i}.y)
+    );
+    Hrow2 += ww * vec3(
+      fSxx${i}*fT${i}.x*fT${i}.z + fSyy${i}*fB${i}.x*fB${i}.z + fSxy${i}*(fT${i}.x*fB${i}.z + fT${i}.z*fB${i}.x),
+      fSxx${i}*fT${i}.y*fT${i}.z + fSyy${i}*fB${i}.y*fB${i}.z + fSxy${i}*(fT${i}.y*fB${i}.z + fT${i}.z*fB${i}.y),
+      fSxx${i}*fT${i}.z*fT${i}.z + fSyy${i}*fB${i}.z*fB${i}.z + 2.0*fSxy${i}*fT${i}.z*fB${i}.z
+    );
+    if (ww > bestW) { bestW = ww; bestC0 = fc${i}; bestN = fN${i}; bestT = fT${i}; bestB = fB${i}; bestSxx = fSxx${i}; bestSxy = fSxy${i}; bestSyy = fSyy${i}; }
+  }`);
+    }
+
+    const blendCall = op === 'engrave'
+      ? `(-rUnion(-dHost, dGuest, ${seamSm}))`
+      : `rUnion(dHost, dGuest, ${seamSm})`;
+
+    return `// embedNode ${node.id}  (${op}, multi-frame: ${frames.length})${hostIsTiling ? '  [per-cell, tiling host]' : ''}
 float ${fn}(vec3 p) {
   vec3 foldedP = p;
 ${tilingFoldGLSL ? tilingFoldGLSL : ''}
   float dHost = ${hostFn}(${tilingFoldGLSL ? 'foldedP' : 'p'});
+  float absDHost = abs(dHost);
 
-  vec3 c0 = ${c0Str};
-  vec3 T0 = ${T0Str};
-  vec3 B0 = ${B0Str};
-  vec3 N0 = ${N0Str};
+  if (absDHost >= ${depthVal}) return dHost;
 
-  vec3 d = foldedP - c0;
-  float lx = dot(d, T0);
-  float ly = dot(d, B0);
-  float lz = dot(d, N0);
+${frameDecls.join('\n')}
+
+  float sumW = 0.0;
+  vec3 c0sum = vec3(0.0);
+  vec3 Nsum  = vec3(0.0);
+  vec3 Tsum  = vec3(0.0);
+  vec3 Hrow0 = vec3(0.0);
+  vec3 Hrow1 = vec3(0.0);
+  vec3 Hrow2 = vec3(0.0);
+  float bestW = -1.0;
+  vec3 bestC0 = fc0, bestN = fN0, bestT = fT0, bestB = fB0;
+  float bestSxx = fSxx0, bestSxy = fSxy0, bestSyy = fSyy0;
+${blendTerms.join('\n')}
+
+  float lx, ly, lzCorrected;
+  bool resolved = false;
+  if (sumW > 1e-8) {
+    vec3 c0b = c0sum / sumW;
+    vec3 NbRaw = Nsum / sumW;
+    float nLen = length(NbRaw);
+    if (nLen > 1e-6) {
+      vec3 Nb = NbRaw / nLen;
+      vec3 Traw = Tsum / sumW;
+      float tDotN = dot(Traw, Nb);
+      vec3 Tb0 = Traw - tDotN * Nb;
+      float tLen = length(Tb0);
+      if (tLen < 1e-6) {
+        vec3 helper = (abs(Nb.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        Tb0 = cross(helper, Nb);
+        tLen = max(length(Tb0), 1e-6);
+      }
+      vec3 Tb = Tb0 / tLen;
+      vec3 Bb = cross(Nb, Tb);
+
+      mat3 Hb = mat3(Hrow0, Hrow1, Hrow2) / sumW;
+      vec3 HT = Hb * Tb;
+      vec3 HB = Hb * Bb;
+      float Sxxb = dot(Tb, HT);
+      float Syyb = dot(Bb, HB);
+      float Sxyb = dot(Tb, HB);
+
+      vec3 dd2 = foldedP - c0b;
+      lx = dot(dd2, Tb);
+      ly = dot(dd2, Bb);
+      float lz = dot(dd2, Nb);
+      float sag = 0.5 * (Sxxb*lx*lx + 2.0*Sxyb*lx*ly + Syyb*ly*ly);
+      lzCorrected = lz - sag;
+      resolved = true;
+    }
+  }
+  if (!resolved) {
+    vec3 dd2 = foldedP - bestC0;
+    lx = dot(dd2, bestT);
+    ly = dot(dd2, bestB);
+    float lz = dot(dd2, bestN);
+    float sag = 0.5 * (bestSxx*lx*lx + 2.0*bestSxy*lx*ly + bestSyy*ly*ly);
+    lzCorrected = lz - sag;
+  }
 
   float tangentialR2 = lx*lx + ly*ly;
   float tangentialR = sqrt(tangentialR2);
-  float absDHost = abs(dHost);
-  if (tangentialR >= ${rs} || absDHost >= ${depthVal}) return dHost;
+  if (tangentialR >= ${rs}) return dHost;
 
-  // Anisotropic sag — quadratic form in (lx, ly), Euler's formula for
-  // normal curvature without ever computing an angle. See NodeEvaluator.js's
-  // matching case / differentialGeometry.js's computeShapeOperator2x2.
-  float sag = 0.5 * (${SxxStr}*lx*lx + 2.0*${SxyStr}*lx*ly + ${SyyStr}*ly*ly);
-  float lzCorrected = lz - sag;
   float dGuest = ${guestFn}(vec3(lx, ly, lzCorrected));
   float embedded = ${blendCall};
 
-  float innerR = ${rs} * 0.75;
-  float innerD = ${depthVal} * 0.75;
+  float innerR = ${rs} * ${innerFracVal};
+  float innerD = ${depthVal} * ${innerFracVal};
 
   float wT = 1.0;
   if (tangentialR > innerR) {
@@ -674,12 +876,175 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
     wD = 1.0 - x*x*(3.0-2.0*x);
   }
   float w = wT * wD;
+${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'});` : ''}
   return embedded * w + dHost * (1.0 - w);
 }`;
   }
 
   /** Bake a vec3 as a GLSL literal. */
   _f3(v) { return `vec3(${this._f(v.x)}, ${this._f(v.y)}, ${this._f(v.z)})`; }
+
+  /**
+   * Return the GLSL function name for a node's baked mask field
+   * (mask_<nodeId>), generating and queuing its declaration on first
+   * request within this generate() call, and reusing the same name on
+   * subsequent requests for the SAME node — a node's mask can be read
+   * from more than one place (a masked mapper AND a masked embedNode
+   * host in the same graph) without ever emitting a duplicate GLSL
+   * function, which would be a compile error.
+   *
+   * Mirrors evaluateMaskAt() in surfaceMask.js EXACTLY — see that
+   * function's header for why CPU and GLSL must agree here: the hard
+   * topology-aware work (geodesic/curvature reasoning) already happened
+   * at CPU bake time, so this is deliberately simple Euclidean/Wendland
+   * blending over the already-baked samples, nothing more — same
+   * fixed-slot-unroll pattern as _generateEmbedNode's frame array, for
+   * the same GLSL-ES-1.0-has-no-non-const-array-indexing reason.
+   *
+   * @returns {string|null} the function name, or null if the node has no
+   *   painted content — callers must treat null as "mask value is always
+   *   0" and skip calling this a second time for the same node/call.
+   */
+  _maskFieldGLSL(node) {
+    // Uses maskHasContent() — the SAME guard evaluateMaskAt() (CPU side)
+    // and NodeEvaluator's embedNode/blend cases already use — instead of
+    // a hand-rolled duplicate with different truthiness rules. The two
+    // checks had drifted: maskHasContent() treats mask.enabled===undefined
+    // as "has content" (enabled !== false), while this method's old inline
+    // check required enabled to be strictly truthy. A mask object that
+    // reached here with enabled left undefined would be treated as active
+    // by useMaskFrames (which calls maskHasContent) but rejected here —
+    // producing exactly this symptom: a call site emitted referencing a
+    // mask function that this method then declined to declare.
+    if (!maskHasContent(node?.mask)) {
+      return null;
+    }
+    if (this._maskFnCache.has(node.id)) return this._maskFnCache.get(node.id);
+
+    const fn = `mask_${node.id}`;
+    this._maskFnCache.set(node.id, fn);
+
+    // Cap for the uniform-array path — deliberately lower than the CPU
+    // path's MAX_MASK_SAMPLES (64). Every masked node now costs a FIXED
+    // uniform budget regardless of paint density, shared across every
+    // masked node in one shader — WebGL1's spec-minimum guaranteed
+    // fragment uniform budget is as low as 16 vec4 on some hardware, so
+    // this stays conservative. evaluateMaskAt (CPU/marching-squares) is
+    // completely unaffected — it reads mask.samples directly in JS and
+    // is not subject to this cap.
+    const GLSL_MASK_CAP = 24;
+    const samples = decimateSamples(node.mask.samples, GLSL_MASK_CAP);
+    const radius  = this._uniformFloat(node, 'maskRadius',  computeMaskDomeRadius(samples, node.mask.falloffRadius));
+    const nThresh = this._uniformFloat(node, 'maskNThresh', 1 - (node.mask.normalThreshold ?? -1));
+
+    if (samples.length === 0) {
+      this._maskFnDecls.push(`// mask ${fn} (empty)\nfloat ${fn}(vec3 p) { return 0.0; }`);
+      return fn;
+    }
+
+    // Bounding sphere over all sample positions, expanded by falloffRadius —
+    // computed ONCE here in JS, so the GLSL function can reject any query
+    // point outside it with a single length() check instead of paying for
+    // the full per-sample loop below. This is the dominant per-marching-
+    // step cost shared by EVERY masked node (rUnion/rIntersection/
+    // rDifference/rBlend/morphBlend/embedNode/noiseDisplaceNode/masked-
+    // mapper) — the loop below runs regardless of distance today, on
+    // every step of every ray.
+    // Sample SPREAD is baked (never changes without a repaint); the
+    // falloff radius itself stays a uniform and is added in GLSL below,
+    // so this bound stays correct as `radius` changes without a recompile.
+    let bcx = 0, bcy = 0, bcz = 0;
+    samples.forEach(s => { bcx += s.x; bcy += s.y; bcz += s.z; });
+    bcx /= samples.length; bcy /= samples.length; bcz /= samples.length;
+    let maxSpread = 0;
+    samples.forEach(s => {
+      const d = Math.hypot(s.x - bcx, s.y - bcy, s.z - bcz);
+      if (d > maxSpread) maxSpread = d;
+    });
+    const boundCx = this._f(bcx), boundCy = this._f(bcy), boundCz = this._f(bcz);
+    const boundSpread = this._f(maxSpread);
+
+    // Sample DATA (position/normal/weight) is now a uniform ARRAY, not
+    // baked GLSL text — a NEW paint stroke on an already-masked node
+    // re-uploads these via gl.uniform3fv/1fv and updates the count
+    // uniform. It does NOT change the shader SOURCE STRING, so it does
+    // NOT force a recompile — unlike the previous fully-unrolled version,
+    // where every single stroke (up to 64 unrolled blocks of GLSL text
+    // per masked node) was effectively a brand-new shader that had to be
+    // recompiled from scratch, across EVERY masked node in the graph at
+    // once, since they all live in one concatenated fragment shader.
+    const posName    = `u_${node.id}_maskPos`;
+    const normName   = `u_${node.id}_maskN`;
+    const weightName = `u_${node.id}_maskW`;
+    const countName  = `u_${node.id}_maskCount`;
+
+    const posArr    = new Float32Array(GLSL_MASK_CAP * 3);
+    const normArr   = new Float32Array(GLSL_MASK_CAP * 3);
+    const weightArr = new Float32Array(GLSL_MASK_CAP);
+    samples.forEach((s, i) => {
+      posArr[i * 3]     = s.x;
+      posArr[i * 3 + 1] = s.y;
+      posArr[i * 3 + 2] = s.z;
+      normArr[i * 3]     = s.nx;
+      normArr[i * 3 + 1] = s.ny;
+      normArr[i * 3 + 2] = s.nz;
+      weightArr[i] = s.w ?? 1;
+    });
+    this.vecUniforms.set(posName,    { data: posArr,    size: 3 });
+    this.vecUniforms.set(normName,   { data: normArr,   size: 3 });
+    this.vecUniforms.set(weightName, { data: weightArr, size: 1 });
+    this.intUniforms.set(countName, samples.length);
+
+    this._maskFnDecls.push(`
+// mask ${fn}  (node ${node.id}, up to ${GLSL_MASK_CAP} samples via uniform array${node.mask.samples.length > samples.length ? `, decimated from ${node.mask.samples.length}` : ''})
+uniform vec3  ${posName}[${GLSL_MASK_CAP}];
+uniform vec3  ${normName}[${GLSL_MASK_CAP}];
+uniform float ${weightName}[${GLSL_MASK_CAP}];
+uniform int   ${countName};
+float ${fn}(vec3 p) {
+  if (length(p - vec3(${boundCx}, ${boundCy}, ${boundCz})) > ${boundSpread} + ${radius}) return 0.0;
+  // envelope * localAverage — mirrors surfaceMask.js's
+  // _evaluatePointMask EXACTLY (see that function's comment for the
+  // full rationale). A plain normalized ratio (sumWeighted/sumW alone)
+  // is DISCONTINUOUS at the region boundary — it converges to a
+  // nonzero sample weight right up until the last contributing sample
+  // drops out, then hard-cuts to 0. That broke sphere tracing's
+  // Lipschitz assumption and produced jagged/faceted ray-march
+  // artifacts. envelope (a soft-OR over all kernels) forces the
+  // product to 0 smoothly instead.
+  float sumW = 0.0;
+  float sumWeighted = 0.0;
+  float missProduct = 1.0;
+  for (int i = 0; i < ${GLSL_MASK_CAP}; i++) {
+    if (i >= ${countName}) break;
+    vec3 dd = p - ${posName}[i];
+    float dist = length(dd);
+    if (dist < ${radius}) {
+      float r = dist / ${radius};
+      float wl = (1.0-r)*(1.0-r)*(1.0-r)*(1.0-r)*(4.0*r+1.0);
+      // Degenerate case (dist≈0): aligned (0.0), not maximally
+      // misaligned (1.0) — see surfaceMask.js's identical fix.
+      float nDot = dist > 1e-6 ? dot(dd, ${normName}[i]) / dist : 0.0;
+      // Soft fold gate, not a hard reject — see surfaceMask.js's
+      // _evaluatePointMask for the full rationale (a hard cutoff here
+      // fragmented ordinary curved surfaces into disconnected
+      // "bubbles" whenever normalThreshold was raised above its new,
+      // gate-disabled-by-default value).
+      float foldGate = ${nThresh} >= 1.0 ? 1.0 : 1.0 - smoothstep(${nThresh} - 0.15, ${nThresh}, abs(nDot));
+      float wlg = wl * foldGate;
+      sumW += wlg;
+      sumWeighted += wlg * ${weightName}[i];
+      missProduct *= (1.0 - wlg);
+    }
+  }
+  if (sumW <= 1e-6) return 0.0;
+  float envelope = 1.0 - missProduct;
+  float localAverage = clamp(sumWeighted / sumW, 0.0, 1.0);
+  return clamp(envelope * localAverage, 0.0, 1.0);
+}`);
+
+    return fn;
+  }
 
   /**
    * Self-corrects an embedNode's anchor onto the host's CURRENT surface,
@@ -709,27 +1074,54 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
    * in this SAME frame's (tangent,bitangent) basis, so they are guaranteed
    * aligned with the T0/B0 this function also returns, by construction.
    */
-  _computeEmbedFrame(hostNodeId, anchor) {
-    const fallback = { c0: anchor, T: {x:1,y:0,z:0}, B: {x:0,y:0,z:1}, N: {x:0,y:1,z:0}, Sxx: 0, Sxy: 0, Syy: 0 };
+  _computeEmbedFrameField(hostNodeId, anchor, regionSize, cacheKey) {
+    const hostNode = this.graph.nodes.get(hostNodeId);
+    const fingerprint = JSON.stringify({
+      hostNodeId, anchor, regionSize,
+      hostParams: hostNode?.params, hostTransform: hostNode?.transform,
+    });
+    const cached = this._embedFrameCache.get(cacheKey);
+    if (cached && cached.fingerprint === fingerprint) {
+      return { frames: cached.frames, bandwidth: cached.bandwidth };
+    }
+
+    const fallbackFrames = [{
+      c0: anchor, T: {x:1,y:0,z:0}, B: {x:0,y:0,z:1}, N: {x:0,y:1,z:0},
+      Sxx: 0, Sxy: 0, Syy: 0,
+    }];
+    let out;
     try {
       const tempEval = new NodeEvaluator(this.graph);
       const hostResult = tempEval.evaluate(hostNodeId);
       const hostFn = hostResult?.sdf || hostResult?.result;
-      if (typeof hostFn !== 'function') return fallback;
-
-      const c0 = snapToNearestSurface(hostFn, anchor, 4);
-      const frame = computeLocalFrame(hostFn, c0);
-      if (!frame) return { ...fallback, c0 };
-
-      let Sxx = 0, Sxy = 0, Syy = 0;
-      try {
-        ({ Sxx, Sxy, Syy } = computeShapeOperator2x2(hostFn, c0, frame));
-      } catch (e) { Sxx = 0; Sxy = 0; Syy = 0; }
-
-      return { c0, T: frame.tangent, B: frame.bitangent, N: frame.normal, Sxx, Sxy, Syy };
+      if (typeof hostFn !== 'function') {
+        out = { frames: fallbackFrames, bandwidth: defaultFrameBandwidth(regionSize, 1) };
+      } else {
+        // No maxFrames cap here — buildAdaptiveFrameField enforces its own
+        // default cap internally. Do NOT re-truncate here; that would be a
+        // second, independent capping rule risking drift from the CPU path
+        // (see frameField.js's module header).
+        let frames;
+        try {
+          frames = buildAdaptiveFrameField(hostFn, anchor, regionSize);
+        } catch (e) {
+          frames = fallbackFrames;
+        }
+        out = { frames, bandwidth: defaultFrameBandwidth(regionSize, frames.length) };
+      }
     } catch (e) {
-      return fallback;
+      out = { frames: fallbackFrames, bandwidth: defaultFrameBandwidth(regionSize, 1) };
     }
+
+    // KNOWN LIMITATION: the fingerprint covers the host node's OWN
+    // params/transform, not further-upstream nodes feeding it. If the
+    // host is itself fed by another node (e.g. noiseDisplace over a
+    // sphere) and you edit the upstream sphere without touching the host
+    // or the embed's own anchor/regionSize, this cache can go briefly
+    // stale. Acceptable for now; a full fix needs a graph-wide dirty
+    // counter.
+    this._embedFrameCache.set(cacheKey, { fingerprint, ...out });
+    return out;
   }
 
   /**
@@ -829,6 +1221,12 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
     const mapperInfo = this._resolveMapperInfo(node, 'mapper');
     const mapFn = mapperInfo?.fnName || null;
 
+    // Universal painted-region gate for that mapper — mirrors
+    // NodeEvaluator._applyNodeTransform's identical change exactly. A
+    // node's OWN mask (painted directly on its own card) confines the
+    // mapper's visible effect to the painted area.
+    const maskFnName = mapFn ? this._maskFieldGLSL(node) : null;
+
     if (identity && !mapFn) return glsl;
 
     const fn      = this._fnName(node.id);
@@ -856,16 +1254,27 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
     // resulting value is safe for sphere tracing (see
     // _computeMapperLipschitz's doc comment for which mappers qualify).
     let mapLine = '';
+    // Masked mapper reads the mask in the SAME local-space point `q` the
+    // wrapper templates below already compute — for a 3D node q is vec3
+    // and needs no adjustment; for a 2D node q is vec2, and the mask
+    // function (always vec3-in, see _maskFieldGLSL) needs it lifted to
+    // vec3(q, 0.0). is3D is computed just below this block in the
+    // original source — see the full method for its declaration.
+    const maskArg = is3D ? 'q' : 'vec3(q, 0.0)';
     if (mapFn && mapperInfo.lipschitz !== null) {
       const Lval = this._f(Math.max(mapperInfo.lipschitz, 1e-6));
-      mapLine = `d = ${mapFn}(d); d = d / ${Lval};`;
+      mapLine = maskFnName
+        ? `{ float dMapped = ${mapFn}(d) / ${Lval}; float mw = ${maskFnName}(${maskArg}); d = mix(d, dMapped, mw); }`
+        : `d = ${mapFn}(d); d = d / ${Lval};`;
     } else if (mapFn) {
       // No rigorous bound available for this mapper type (exponential/
       // logarithmic/power) — applied as-is. SceneManager's quality
       // heuristic still forces very conservative step sizes for these
       // three, which mitigates but does not mathematically guarantee
       // correctness.
-      mapLine = `d = ${mapFn}(d);`;
+      mapLine = maskFnName
+        ? `{ float dMapped = ${mapFn}(d); float mw = ${maskFnName}(${maskArg}); d = mix(d, dMapped, mw); }`
+        : `d = ${mapFn}(d);`;
     }
 
     let wrapperFn;
@@ -1250,7 +1659,9 @@ float ${fn}(vec2 p) {
       case 'morphBlend': {
         const fnA = this._resolveInputFn(node, 'sdfA');
         const fnB = this._resolveInputFn(node, 'sdfB');
-        if (!fnA || !fnB) return this._fallback2D(fn, node.id, 'morphBlend missing inputs');
+        if (!fnA || !fnB) {
+          return this._fallbackAdaptive(fn, node.id, 'morphBlend missing inputs', this._nodeOutputIs3D(node));
+        }
 
         const edgeA = this.graph.getIncomingEdge(node.id, 'sdfA');
         const edgeB = this.graph.getIncomingEdge(node.id, 'sdfB');
@@ -1267,19 +1678,31 @@ float ${fn}(vec2 p) {
         const callA = dim === 'vec3' ? (aIs3D ? 'p' : 'p.xy') : 'p';
         const callB = dim === 'vec3' ? (bIs3D ? 'p' : 'p.xy') : 'p';
 
+        // Painted-region gate — mirrors rUnion/rIntersection/rDifference/
+        // rBlend's identical maskFrom treatment above.
+        const maskFrom = p.maskFrom ?? 'none';
+        const gateHostNode = maskFrom === 'sdfB' ? nodeB : maskFrom === 'sdfA' ? nodeA : null;
+        const maskFnName = gateHostNode ? this._maskFieldGLSL(gateHostNode) : null;
+        const maskQueryArg = dim === 'vec3' ? 'p' : 'vec3(p, 0.0)';
+
         return `// morphBlend node ${node.id}
 float ${fn}(${dim} p) {
   float t = ${tExpr};
   float dA = ${fnA}(${callA});
   float dB = ${fnB}(${callB});
-  return mix(dA, dB, t);
+  float morphed = mix(dA, dB, t);
+${maskFnName ? `  float mw = ${maskFnName}(${maskQueryArg});
+  float base = ${maskFrom === 'sdfB' ? 'dB' : 'dA'};
+  return base + (morphed - base) * mw;` : '  return morphed;'}
 }`;
       }
 
       case 'schurBlend': {
         const fnA = this._resolveInputFn(node, 'sdfA');
         const fnB = this._resolveInputFn(node, 'sdfB');
-        if (!fnA || !fnB) return this._fallback2D(fn, node.id, 'schurBlend missing inputs');
+        if (!fnA || !fnB) {
+          return this._fallbackAdaptive(fn, node.id, 'schurBlend missing inputs', this._nodeOutputIs3D(node));
+        }
 
         const op  = p.operation  ?? 'union';
         const sm  = this._f(p.smoothness ?? 8);
@@ -1572,7 +1995,7 @@ float ${fn}(${dim} p) {
 
       case 'noiseDisplaceNode': {
         const inputFn  = this._resolveInputFn(node, 'sdf');
-        if (!inputFn) return this._fallback3D(fn, node.id, 'noiseDisplace missing sdf');
+        if (!inputFn) return this._fallbackAdaptive(fn, node.id, 'noiseDisplace missing sdf', this._nodeOutputIs3D(node));
         const amp      = this._f(node.params.amplitude ?? 0.3);
         const freq     = this._f(node.params.frequency  ?? 3.0);
         const animated = (node.params.animated ?? 'no') === 'yes';
@@ -1583,6 +2006,14 @@ float ${fn}(${dim} p) {
         const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
         const is3D     = baseNode && this._nodeOutputIs3D(baseNode);
         const dim      = is3D ? 'vec3' : 'vec2';
+
+        // Painted-region gate — confine the bumpiness to a region painted
+        // on the INPUT shape's own card. See NodeEvaluator's identical
+        // treatment of useMaskFromInput.
+        const useMaskFromInput = node.params.useMaskFromInput ?? 'no';
+        const maskFnName = (useMaskFromInput === 'yes' && baseNode)
+          ? this._maskFieldGLSL(baseNode)
+          : null;
 
         // When animated=yes, add uTime to the noise sample coordinate so
         // the pattern shifts over time. uTime is provided as a uniform by
@@ -1603,16 +2034,22 @@ float ${fn}(${dim} p) {
             `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq}${timeOffset})`;
           return `// noiseDisplaceNode ${node.id}  (3D, animated=${animated})
 float ${fn}(vec3 p) {
+  float baseVal = ${inputFn}(p);
   float n = ndNoise3(${sampleCoord}) * 2.0 - 1.0;
-  return ${inputFn}(p) + n * ${amp};
+  float displaced = baseVal + n * ${amp};
+${maskFnName ? `  float mw = ${maskFnName}(p);
+  return baseVal + (displaced - baseVal) * mw;` : '  return displaced;'}
 }`;
         } else {
           const sampleCoord =
             `vec2(p.x * ${freq}, p.y * ${freq}${timeOffset})`;
           return `// noiseDisplaceNode ${node.id}  (2D, animated=${animated})
 float ${fn}(vec2 p) {
+  float baseVal = ${inputFn}(p);
   float n = ndNoise2(${sampleCoord}) * 2.0 - 1.0;
-  return ${inputFn}(p) + n * ${amp};
+  float displaced = baseVal + n * ${amp};
+${maskFnName ? `  float mw = ${maskFnName}(vec3(p, 0.0));
+  return baseVal + (displaced - baseVal) * mw;` : '  return displaced;'}
 }`;
         }
       }
@@ -1702,7 +2139,7 @@ float ${fn}(vec3 p) {
 
       case 'repeatNode': {
         const inputFn = this._resolveInputFn(node, 'sdf');
-        if (!inputFn) return this._fallback3D(fn, node.id, 'repeatNode missing sdf');
+        if (!inputFn) return this._fallbackAdaptive(fn, node.id, 'repeatNode missing sdf', this._nodeOutputIs3D(node));
         const cX = Math.floor(node.params.countX  ?? 3);
         const cY = Math.floor(node.params.countY  ?? 3);
         const cZ = Math.floor(node.params.countZ  ?? 1);
@@ -1769,14 +2206,14 @@ float ${fn}(vec3 p) {
     return fns;
   }
 
-  _generateBinaryBlendNode(node) {
+ _generateBinaryBlendNode(node) {
     const fn = this._fnName(node.id);
     const p  = node.params || {};
 
     const fnA = this._resolveInputFn(node, 'sdfA');
     const fnB = this._resolveInputFn(node, 'sdfB');
     if (!fnA || !fnB) {
-      return this._fallback2D(fn, node.id, `${node.type} missing inputs`);
+      return this._fallbackAdaptive(fn, node.id, `${node.type} missing inputs`, this._nodeOutputIs3D(node));
     }
 
     const edgeA = this.graph.getIncomingEdge(node.id, 'sdfA');
@@ -1809,12 +2246,22 @@ float ${fn}(vec3 p) {
       ? (bIs3D ? 'tp' : 'tp.xy')
       : 'tp';
 
+    // Painted-region gate — mirrors NodeEvaluator's identical maskFrom
+    // treatment for these same four node types.
+    const maskFrom = p.maskFrom ?? 'none';
+    const gateHostNode = maskFrom === 'sdfB' ? nodeB : maskFrom === 'sdfA' ? nodeA : null;
+    const maskFnName = gateHostNode ? this._maskFieldGLSL(gateHostNode) : null;
+    const maskQueryArg = dim === 'vec3' ? 'tp' : 'vec3(tp, 0.0)';
+
     return `// ${node.type} node ${node.id}
 float ${fn}(${dim} p) {
   ${tpDecl}
   float dA = ${fnA}(${callA});
   float dB = ${fnB}(${callB});
-  return ${blendCall};
+  float blended = ${blendCall};
+${maskFnName ? `  float mw = ${maskFnName}(${maskQueryArg});
+  float base = ${maskFrom === 'sdfB' ? 'dB' : 'dA'};
+  return base + (blended - base) * mw;` : '  return blended;'}
 }`;
   }
 
@@ -1834,6 +2281,22 @@ float ${fn}(${dim} p) {
       return uName;
     }
     return this._f(value);
+  }
+
+  /**
+   * Register a plain numeric threshold (NOT frame/anchor geometry) as a
+   * GLSL uniform instead of a baked literal. This is what lets a slider
+   * like depth/regionSize/falloffRadius update at render time via a cheap
+   * gl.uniform1f call, instead of forcing a full shader recompile on
+   * every settle — recompiling a shader this size (up to 64 unrolled mask
+   * terms, 6-frame embed unroll) is the actual source of the freeze
+   * during rapid slider adjustment, not per-pixel/per-step runtime cost.
+   */
+  _uniformFloat(node, key, value) {
+    const name = `u_${node.id}_${key}`;
+    this.uniforms.set(name, value);
+    this._uniformDecls.add(name);
+    return name;
   }
 
   _f(v) {
@@ -1885,5 +2348,30 @@ float ${fn}(vec3 p) { return 1e10; }`;
     };
     this.graph.nodes.forEach((_, id) => visit(id));
     return order;
+  }
+
+  /**
+   * BFS backward from outputNode's connected 'sdf' inputs, following
+   * EVERY incoming edge regardless of port name (sdf, hostSdf, guestSdf,
+   * mapper, sdfA, sdfB, base, mapperA, mapperB, ...) — anything that some
+   * chain of edges ultimately feeds into the rendered output. Used by
+   * generate() to skip GLSL generation for nodes sitting in the graph but
+   * not actually wired to anything downstream, so adding/editing an
+   * unlinked node never changes the generated shader source string (and
+   * therefore never triggers a needless recompile).
+   */
+  _computeReachableNodes(outputNode) {
+    const reachable = new Set();
+    const stack = [];
+    this.graph.getAllIncomingEdges(outputNode.id, 'sdf').forEach(e => stack.push(e.fromNode));
+    while (stack.length > 0) {
+      const id = stack.pop();
+      if (reachable.has(id)) continue;
+      reachable.add(id);
+      this.graph.edges.forEach(edge => {
+        if (edge.toNode === id) stack.push(edge.fromNode);
+      });
+    }
+    return reachable;
   }
 }

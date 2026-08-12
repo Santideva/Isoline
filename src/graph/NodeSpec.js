@@ -337,6 +337,9 @@ export const NODE_TYPES = {
     params: [
       { name: 'smoothness', type: 'number', default: 8, min: 0, max: 32, step: 0.1,
         hint: 'How smoothly the two shapes join. Higher = softer, rounder seam.' },
+      { name: 'maskFrom', type: 'select', default: 'none', options: ['none', 'sdfA', 'sdfB'],
+        label: 'confine to region',
+        hint: 'Confine this operation to a painted region on one of the two inputs. "sdfA": outside the paint, the result is just A unaffected by B. "sdfB": outside the paint, just B unaffected by A. Paint the region on the corresponding input\'s own card, in the "Surface Region" section.' },
     ],
   },
 
@@ -353,6 +356,9 @@ export const NODE_TYPES = {
     params: [
       { name: 'smoothness', type: 'number', default: 8, min: 0, max: 32, step: 0.1,
         hint: 'How smoothly the overlap blends at its edges.' },
+      { name: 'maskFrom', type: 'select', default: 'none', options: ['none', 'sdfA', 'sdfB'],
+        label: 'confine to region',
+        hint: 'Confine this operation to a painted region on one of the two inputs. See R-Union\'s identical control for the full explanation.' },
     ],
   },
 
@@ -369,6 +375,9 @@ export const NODE_TYPES = {
     params: [
       { name: 'smoothness', type: 'number', default: 8, min: 0, max: 32, step: 0.1,
         hint: 'How smoothly the cut blends into the surface.' },
+      { name: 'maskFrom', type: 'select', default: 'none', options: ['none', 'sdfA', 'sdfB'],
+        label: 'confine to region',
+        hint: 'Confine the cut to a painted region on one input. "sdfA" (the usual choice): outside the paint, A is left uncut by B — the cut only carves where you painted on A.' },
     ],
   },
 
@@ -388,6 +397,9 @@ export const NODE_TYPES = {
         hint: 'How the two shapes combine: merge, overlap only, or cut one from the other.' },
       { name: 'smoothness', type: 'number', default: 8, min: 0, max: 32, step: 0.1,
         hint: 'How smoothly the two shapes join. Higher = softer, rounder joins.' },
+      { name: 'maskFrom', type: 'select', default: 'none', options: ['none', 'sdfA', 'sdfB'],
+        label: 'confine to region',
+        hint: 'Confine this operation to a painted region on one input. Outside the paint, the result is just that input unaffected by the other.' },
     ],
   },
 
@@ -433,6 +445,9 @@ export const NODE_TYPES = {
         hint: 'Makes the shape continuously morph back and forth over time, ignoring the slider above.' },
       { name: 'speed', type: 'number', default: 0.8, min: 0, max: 3, step: 0.05,
         hint: 'How fast the shape morphs back and forth, when animated.' },
+      { name: 'maskFrom', type: 'select', default: 'none', options: ['none', 'sdfA', 'sdfB'],
+        label: 'confine to region',
+        hint: 'Confine the morph to a painted region. Outside the paint, the shape stays fixed as whichever input you chose (usually "sdfA") — the morph only happens where you painted.' },
     ],
   },
 
@@ -461,15 +476,22 @@ export const NODE_TYPES = {
       { name: 'operation', type: 'select', default: 'emboss', options: ['emboss','engrave'],
         hint: 'Emboss = a raised bump sticking out (like a rivet). Engrave = a carved-in dent (like a thumbprint). Want a dimple or hole in a face? Use Engrave, not Emboss.' },
       { name: 'anchorX', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
-        hint: 'World position of the decoration (left/right). Use "Pick Anchor on Surface" instead of typing this directly — (0,0,0) is usually the host\'s CENTER, not its surface.' },
+        advanced: true,
+        hint: 'World position of the decoration, used only when the host has no painted region. Use "Pick Anchor on Surface" instead of typing this directly — (0,0,0) is usually the host\'s CENTER, not its surface.' },
       { name: 'anchorY', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        advanced: true,
         hint: 'World position of the decoration (up/down). See the note on anchorX.' },
       { name: 'anchorZ', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
+        advanced: true,
         hint: 'World position of the decoration (front/back). See the note on anchorX.' },
       { name: 'regionSize', type: 'number', default: 1.0, min: 0.05, max: 10, step: 0.05,
-        hint: 'How wide an area of the surface is affected, in every direction ALONG the surface from the anchor — the FOOTPRINT of the decoration. This does NOT control how deep/tall it reaches — see "depth" for that.' },
+        hint: 'How wide an area of the surface is affected. If the host has a curvature-flooded region, this instead scales that region\'s size (1.0 = exactly the flooded extent). If the host has a PAINTED stroke, this has no effect — the paint\'s own shape is used directly.' },
       { name: 'depth', type: 'number', default: 0.35, min: 0.02, max: 5, step: 0.01,
         hint: 'How far the effect reaches from the TRUE surface — the emboss height or engrave depth. Keep this modest. A large depth combined with a wide footprint risks the decoration spilling past the host\'s own edges into empty space, producing disconnected floating fragments.' },
+      { name: 'edgeSoftness', type: 'number', default: 0.25, min: 0, max: 0.9, step: 0.01,
+        hint: 'How gradually the host surface folds into the decoration at its outer boundary. Higher = a softer, wider fold. Lower = a sharper, more sudden transition.' },
+      { name: 'seamSmoothness', type: 'number', default: 0, min: 0, max: 4, step: 0.05,
+        hint: 'Rounds the inner seam where the host and the decoration actually meet. 0 = a crisp seam (can look slightly rough up close, especially inside an engraved cavity). Higher = a smoother, more sculpted joint.' },
     ],
   },
 
@@ -908,6 +930,9 @@ export const NODE_TYPES = {
         hint: 'Makes the bumps shift and move over time, like rippling water.' },
       { name: 'speed', type: 'number', default: 0.4, min: 0, max: 3, step: 0.05,
         hint: 'How fast the bumps move, when animated.' },
+      { name: 'useMaskFromInput', type: 'select', default: 'no', options: ['no', 'yes'],
+        label: 'confine to region',
+        hint: 'Confine the bumpiness to a region painted on the input shape\'s own card (its "Surface Region" section). Outside the paint, the surface stays smooth.' },
     ],
   },
 

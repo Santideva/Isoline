@@ -238,6 +238,30 @@ export class WebGLRenderer {
     if (loc !== null) this._gl.uniform4f(loc, x, y, z, w);
   }
 
+  /**
+   * Upload a vec3 ARRAY uniform (e.g. uniform vec3 u_5_maskPos[24]) from a
+   * flat Float32Array of length count*3. Used by GLSLEvaluator's
+   * uniform-array mask encoding (see _maskFieldGLSL) so painted-region
+   * sample data updates via a plain buffer upload instead of forcing a
+   * full shader recompile on every new stroke.
+   */
+  _u3fv(name, arr) {
+    const loc = this._getUniformLoc(name);
+    if (loc !== null) this._gl.uniform3fv(loc, arr);
+  }
+
+  /** Upload a float ARRAY uniform from a flat Float32Array. */
+  _u1fv(name, arr) {
+    const loc = this._getUniformLoc(name);
+    if (loc !== null) this._gl.uniform1fv(loc, arr);
+  }
+
+  /** Upload a single int uniform (e.g. an active-sample-count). */
+  _u1i(name, v) {
+    const loc = this._getUniformLoc(name);
+    if (loc !== null) this._gl.uniform1i(loc, v);
+  }
+
   // ── Private — initialisation ──────────────────────────────────────────────
 
   _initCanvas(mountElement) {

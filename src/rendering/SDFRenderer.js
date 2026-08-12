@@ -16,7 +16,7 @@ export class SDFRenderer extends WebGLRenderer {
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
-  render(uniforms = new Map(), time = 0, bounds = null, isoStep = null) {
+  render(uniforms = new Map(), time = 0, bounds = null, isoStep = null, vecUniforms = new Map(), intUniforms = new Map()) {
     if (!this._ready) return;
     if (bounds)           this._bounds  = bounds;
     if (isoStep !== null) this._isoStep = isoStep;
@@ -32,6 +32,11 @@ export class SDFRenderer extends WebGLRenderer {
     this._u1f('uIsoStep', this._isoStep);
 
     uniforms.forEach((v, name) => this._u1f(name, v));
+    vecUniforms.forEach((entry, name) => {
+      if (entry.size === 3) this._u3fv(name, entry.data);
+      else this._u1fv(name, entry.data);
+    });
+    intUniforms.forEach((v, name) => this._u1i(name, v));
 
     this._drawQuad();
   }

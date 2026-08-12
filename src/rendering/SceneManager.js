@@ -19,9 +19,11 @@ import { SDFRenderer }      from "./SDFRenderer.js";
 import { RayMarchRenderer } from "./RayMarchRenderer.js";
 import { marchingCubes }    from "../utils/marchingCubes.js";
 import { trianglesToSTL, downloadSTL } from "../utils/stlExport.js";
-import { computeWorldBounds2D, computeWorldBounds3D, applyForwardTransform3D } from "../utils/transform3D.js";
-import { computeMeanCurvature3D, raymarchToSurface, fibonacciSphereSamples, epsilonForScale, computeLocalFrame, snapToNearestSurface, computePrincipalCurvatures3D } from "../utils/differentialGeometry.js";
+import { computeWorldBounds2D, computeWorldBounds3D, applyForwardTransform3D, applyInverseTransform3D } from "../utils/transform3D.js";
+import { raymarchToSurface, fibonacciSphereSamples, epsilonForScale, computeLocalFrame, snapToNearestSurface, computeNormal3D, computePrincipalCurvatures3D, computeShapeOperator2x2 } from "../utils/differentialGeometry.js";
 import { OrbitGenerators, sphericalToDir } from "./orbitGenerators.js";
+import { buildSurfaceGraph, dijkstraGeodesic, curvatureFlood, bakeGeodesicSamples, bakeCurvatureFloodSamples } from "../utils/surfaceGraph.js";
+import { decimateSamples, MAX_MASK_SAMPLES, createEmptyMask } from "../utils/surfaceMask.js";
 
 
 export class SceneManager {
@@ -58,6 +60,7 @@ export class SceneManager {
     this._gizmoNodeId       = null; // node currently showing a pivot gizmo, or null
     this._snapHighlightWorld = null; // {x,y,z} world point of an active snap highlight, or null
     this._embedRegionNodeId = null; // embedNode currently showing its anchor+region ring, or null
+    this._paintPreviewNodeId = null; // node currently showing its painted-region dot overlay, or null
     this._resizeGizmoOverlay();
 
     // Attach OrbitControls to the CONTAINER, not to renderer.domElement.
@@ -870,6 +873,70 @@ export class SceneManager {
     if (this._embedRegionNodeId !== null) {
       this._drawEmbedRegionOverlay(ctx, project);
     }
+
+    if (this._paintPreviewNodeId !== null) {
+      this._drawPaintPreviewOverlay(ctx, project);
+    }
+  }
+
+  /**
+   * Live visual feedback for the universal Surface Region paint tool —
+   * projects each of a node's baked mask.samples to screen space and
+   * draws a small dot, so the user can see what's selected regardless of
+   * whether anything currently consumes the mask (a masked mapper, or an
+   * embedNode using paintedRegion). Deliberately simple — reuses the same
+   * world→screen projection helper _drawGizmoOverlay already builds for
+   * the pivot gizmo and embed-region ring, adding no new rendering path.
+   */
+  _drawPaintPreviewOverlay(ctx, project) {
+    const node = stateStore.nodeGraph.nodes.get(this._paintPreviewNodeId);
+    const samples = node?.mask?.samples;
+    if (!Array.isArray(samples) || samples.length === 0) return;
+
+    const t = node.transform;
+    const worldPoints = samples.map(s => {
+      const w = applyForwardTransform3D(s, t);
+      return { world: w, screen: project(w), sample: s };
+    });
+
+    // Connecting lines between consecutive points ONLY in 'euclidean'
+    // (live-drag) mode, where consecutive samples genuinely are a path —
+    // see evaluateMaskAt's identical distinction in surfaceMask.js. Once
+    // baked to geodesic/curvatureFlood, samples represent an AREA with no
+    // meaningful point-to-point path, so lines there would look like
+    // random noise rather than a stroke.
+    if (node.mask.mode === 'euclidean' && worldPoints.length >= 2) {
+      ctx.strokeStyle = 'rgba(80,220,220,0.5)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      let started = false;
+      worldPoints.forEach(({ screen }) => {
+        if (!screen) return;
+        if (!started) { ctx.moveTo(screen.x, screen.y); started = true; }
+        else ctx.lineTo(screen.x, screen.y);
+      });
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = 'rgba(80,220,220,0.75)';
+    worldPoints.forEach(({ screen, sample }) => {
+      if (!screen) return;
+      const r = 2.5 + 3 * (sample.w ?? 1);
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  /** Show/hide the paint-region dot overlay for a given node. */
+  showPaintPreview(nodeId) {
+    this._paintPreviewNodeId = nodeId;
+    this._drawGizmoOverlay();
+  }
+
+  hidePaintPreview() {
+    this._paintPreviewNodeId = null;
+    this._drawGizmoOverlay();
   }
 
   showEmbedRegion(nodeId) {
@@ -1493,23 +1560,41 @@ export class SceneManager {
     };
   }
 
-  computeCurvatureInterestMap(sampleCount = 32) {
+  /**
+   * Sample ~sampleCount evenly-distributed directions around the scene's
+   * bounding sphere, ray-march inward to find each direction's actual
+   * surface hit, and score that point's curvature — producing a
+   * curvature "interest map" the curvatureGuided orbit generator biases
+   * toward. NOT recomputed per-frame (19 SDF evals × sampleCount is real
+   * cost) — only when curvature-guided mode is activated or explicitly
+   * refreshed via the UI's "Recompute Interest Map" button.
+   *
+   * @param {number} sampleCount
+   * @param {'magnitude'|'mean'|'anisotropy'} [metric='magnitude']
+   *   All three are Tier 1 (computeShapeOperator2x2) — identical 19-eval
+   *   cost regardless of choice, since Sxx/Sxy/Syy yield all three with
+   *   no extra SDF evaluations:
+   *     'mean'       — (k1+k2)/2. Legacy behavior. Cancels to ~0 at a
+   *                    saddle — kept for reachability, not recommended.
+   *     'magnitude'  — √(k1²+k2²). DEFAULT. Catches saddles the mean
+   *                    hides while still ranking ordinary bumps correctly
+   *                    by strength.
+   *     'anisotropy' — |k1−k2|. How directionally uneven curvature is,
+   *                    independent of overall strength — zero on any
+   *                    umbilic point no matter how curved, peaks exactly
+   *                    at saddles/blend seams. Not yet consumed by an
+   *                    adaptive resampler (no such system exists yet) —
+   *                    exposed here as the first concrete use of it.
+   */
+  computeCurvatureInterestMap(sampleCount = 32, metric = 'magnitude') {
     const { center, radius } = this.computeSceneBoundingSphere();
     this.evaluator.graph = stateStore.nodeGraph;
     this.evaluator.invalidate();
-    // Prefer the fully-wired root SDF (respects the actual blend
-    // operations between nodes); fall back to a simple per-node union
-    // when no Output node is wired yet — see _combinedEvaluableSDF's
-    // doc comment for the tradeoff this fallback makes.
     let sdf = this.evaluator.getRootSDF();
     if (!sdf) sdf = this._combinedEvaluableSDF();
     if (!sdf) return [];
 
-    // Scale-relative epsilon, derived from the scene's own bounding-sphere
-    // radius rather than a fixed constant — a fixed 0.001 would behave
-    // very differently for a radius-1 scene vs. a radius-10000 one.
     const eps = epsilonForScale(radius);
-
     const directions = fibonacciSphereSamples(sampleCount);
     const map = [];
 
@@ -1521,16 +1606,29 @@ export class SceneManager {
       };
       const hit = raymarchToSurface(sdf, origin, dir, radius * 4, eps);
       if (!hit) return;
-      const curvature = computeMeanCurvature3D(sdf, hit, eps);
-      map.push({ dir, score: Math.abs(curvature) });
+
+      const frame = computeLocalFrame(sdf, hit, eps);
+      if (!frame) return; // degenerate gradient here — skip (equiv. to a 0 score previously)
+
+      const { Sxx, Sxy, Syy } = computeShapeOperator2x2(sdf, hit, frame, eps);
+
+      let score;
+      if (metric === 'mean') {
+        score = Math.abs((Sxx + Syy) / 2);
+      } else if (metric === 'anisotropy') {
+        score = Math.sqrt((Sxx - Syy) ** 2 + 4 * Sxy * Sxy);
+      } else {
+        score = Math.sqrt(Sxx*Sxx + Syy*Syy + 2*Sxy*Sxy);
+      }
+
+      map.push({ dir, score });
     });
 
-    // Normalize scores to [0,1] so curvatureStrength behaves consistently
-    // regardless of the scene's absolute curvature magnitude.
     const maxScore = map.reduce((m, s) => Math.max(m, s.score), 0) || 1;
     map.forEach(s => { s.score = s.score / maxScore; });
 
     this._curvatureInterestMap = map;
+    this._curvatureInterestMetric = metric;
     return map;
   }
 
@@ -1618,6 +1716,273 @@ export class SceneManager {
       if (t > MAX_DIST) break;
     }
     return null;
+  }
+
+/**
+   * Paint-stroke sampling — the drag-time counterpart to
+   * pickSurfacePointOnNode. Sphere-traces ONE node's OWN composed SDF in
+   * isolation (never the combined scene) and, on a hit, computes the full
+   * local surface frame (normal + tangent + bitangent) there — tangent/
+   * bitangent are what let a painted region later build its OWN
+   * coordinate frame for embedNode's guest projection (see
+   * surfaceMask.js:deriveEmbedFramesFromMask), instead of only gating an
+   * anchor-centered one. Returns null on a miss (cursor dragged off the
+   * shape) — callers must hold the previous sample rather than write NaN
+   * into stroke data.
+   */
+  paintSampleAtScreenPosition(hostNodeId, clientX, clientY) {
+    this.camera.updateMatrixWorld(true);
+    const dom  = this.renderer.domElement;
+    const rect = dom.getBoundingClientRect();
+    const ndcX =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+    const ndcY = -((clientY - rect.top)  / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+    const ro = raycaster.ray.origin;
+    const rd = raycaster.ray.direction;
+
+    const fn = this._isolatedSDF(hostNodeId);
+    if (!fn) return null;
+
+    const hit = raymarchToSurface(fn, ro, rd, 100, 0.0005);
+    if (!hit) return null;
+
+    const frame = computeLocalFrame(fn, hit, 0.001);
+    if (!frame) return null;
+
+    // Mask samples are stored in the node's OWN LOCAL space — matching
+    // node.transform's local-to-world convention — so painting stays
+    // attached to the shape if it's later moved, rotated, or scaled via
+    // the Transform section, exactly like the shape's own geometry does.
+    // This function ray-marches the fully-transformed (world-space) SDF,
+    // since that's what the user is actually looking at and clicking on,
+    // so the hit point/frame must be converted back to local space
+    // before being recorded.
+    const node = stateStore.nodeGraph.nodes.get(hostNodeId);
+    const t = node?.transform;
+    const localHit = t ? applyInverseTransform3D(hit, t) : hit;
+    const localN   = t ? this._inverseRotateDirection(frame.normal,    t) : frame.normal;
+    const localT   = t ? this._inverseRotateDirection(frame.tangent,   t) : frame.tangent;
+    const localB   = t ? this._inverseRotateDirection(frame.bitangent, t) : frame.bitangent;
+
+    return {
+      x: localHit.x, y: localHit.y, z: localHit.z,
+      nx: localN.x, ny: localN.y, nz: localN.z,
+      tx: localT.x, ty: localT.y, tz: localT.z,
+      bx: localB.x, by: localB.y, bz: localB.z,
+      w: 1,
+    };
+  }
+
+  /**
+   * Rotate a direction vector (no translation, no pivot offset) by the
+   * INVERSE of a node's transform rotation — the direction-vector
+   * counterpart to applyInverseTransform3D, needed to convert a
+   * world-space surface frame into the node's local space alongside the
+   * point itself.
+   */
+  _inverseRotateDirection(dir, t) {
+    const rx = t.rotateX ?? 0, ry = t.rotateY ?? 0, rz = t.rotateZ ?? 0;
+    let x = dir.x, y = dir.y, z = dir.z;
+    if (rz !== 0) {
+      const c = Math.cos(-rz), s = Math.sin(-rz);
+      const nx = x * c - y * s, ny = x * s + y * c;
+      x = nx; y = ny;
+    }
+    if (ry !== 0) {
+      const c = Math.cos(-ry), s = Math.sin(-ry);
+      const nx =  x * c + z * s, nz = -x * s + z * c;
+      x = nx; z = nz;
+    }
+    if (rx !== 0) {
+      const c = Math.cos(-rx), s = Math.sin(-rx);
+      const ny = y * c - z * s, nz = y * s + z * c;
+      y = ny; z = nz;
+    }
+    return { x, y, z };
+  }
+
+  /**
+   * Get the isolated (never combined-scene) SDF function for one node —
+   * shared helper for paintSampleAtScreenPosition and the bake methods
+   * below.
+   */
+  _isolatedSDF(nodeId) {
+    this.evaluator.graph = stateStore.nodeGraph;
+    let result;
+    try { result = this.evaluator.evaluate(nodeId); } catch (e) { return null; }
+    const fn = result?.sdf || result?.result;
+    return typeof fn === 'function' ? fn : null;
+  }
+
+  /**
+   * Refine a raw Euclidean brush stroke into geodesic-weighted baked
+   * samples, by growing a local surface graph outward from the stroke and
+   * running Dijkstra. Called ONCE per stroke (on mouseup), never per
+   * mousemove — see surfaceGraph.js's header for the cost model this
+   * relies on. Writes the result directly into node.mask.samples.
+   *
+   * @param {number} nodeId                    The node being painted on.
+   * @param {Array}  rawStrokeSamplesLocal      Raw {x,y,z,nx,ny,nz,tx,ty,tz,bx,by,bz,w}
+   *   samples accumulated during the drag (paintSampleAtScreenPosition
+   *   results) — already in the node's LOCAL space.
+   * @returns {boolean} true if the bake succeeded and mask was updated.
+   */
+  bakeGeodesicMaskForNode(nodeId, rawStrokeSamplesLocal) {
+    const fn = this._isolatedSDF(nodeId); // world-space-in
+    if (!fn || !rawStrokeSamplesLocal || rawStrokeSamplesLocal.length === 0) return false;
+
+    const node = stateStore.nodeGraph.nodes.get(nodeId);
+    if (!node) return false;
+    const t = node.transform;
+    const mask = node.mask || createEmptyMask();
+    const radius = mask.falloffRadius ?? 0.4;
+    const stepSize = Math.max(radius / 6, 0.03);
+
+    const rawWorld = rawStrokeSamplesLocal.map(s => {
+      const w = applyForwardTransform3D(s, t);
+      return { x: w.x, y: w.y, z: w.z };
+    });
+
+    let pathLen = 0;
+    for (let i = 1; i < rawWorld.length; i++) {
+      const a = rawWorld[i - 1], b = rawWorld[i];
+      pathLen += Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+    }
+    const isEffectivelyAClick = pathLen < stepSize * 1.5;
+
+    if (isEffectivelyAClick) {
+      // A near-stationary click should bake exactly ONE sample and let
+      // evaluateMaskAt's own falloffRadius kernel produce the round dab
+      // — NOT run BFS graph growth at all. Growing even one ring from a
+      // single seed unconditionally produces 1 + ringDirections
+      // neighbor points before the radius gate ever engages, which is
+      // why a click still read as a small CLUSTER rather than a single
+      // dot even after the previous (growth-radius-shrinking) fix.
+      const rawPt = rawWorld[0];
+      const snapped = snapToNearestSurface(fn, rawPt, 4, 0.001);
+      const frame = computeLocalFrame(fn, snapped, 0.001);
+      if (!frame) return false;
+      const shapeOp = computeShapeOperator2x2(fn, snapped, frame, 0.001);
+
+      const localPos = applyInverseTransform3D(snapped, t);
+      const localN = this._inverseRotateDirection(frame.normal, t);
+      const localT = this._inverseRotateDirection(frame.tangent, t);
+      const localB = this._inverseRotateDirection(frame.bitangent, t);
+
+      const bakedLocal = [{
+        x: localPos.x, y: localPos.y, z: localPos.z,
+        nx: localN.x, ny: localN.y, nz: localN.z,
+        tx: localT.x, ty: localT.y, tz: localT.z,
+        bx: localB.x, by: localB.y, bz: localB.z,
+        Sxx: shapeOp.Sxx, Sxy: shapeOp.Sxy, Syy: shapeOp.Syy,
+        w: 1,
+      }];
+
+      stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'geodesic');
+      stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', bakedLocal);
+      stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
+      return true;
+    }
+
+    const graph = buildSurfaceGraph(fn, rawWorld, {
+      stepSize,
+      radius: radius * 1.4,
+      maxNodes: 260,
+      timeBudgetMs: 20,
+    });
+    if (graph.nodes.length === 0) return false;
+
+    const geodesicDist = dijkstraGeodesic(graph, graph.seedIndices);
+    const bakedWorld = bakeGeodesicSamples(graph, geodesicDist, radius);
+    if (bakedWorld.length === 0) return false;
+
+    const bakedLocal = bakedWorld.map(s => {
+      const localPos = applyInverseTransform3D(s, t);
+      const localN   = this._inverseRotateDirection({ x: s.nx, y: s.ny, z: s.nz }, t);
+      const localT   = this._inverseRotateDirection({ x: s.tx, y: s.ty, z: s.tz }, t);
+      const localB   = this._inverseRotateDirection({ x: s.bx, y: s.by, z: s.bz }, t);
+      return {
+        x: localPos.x, y: localPos.y, z: localPos.z,
+        nx: localN.x, ny: localN.y, nz: localN.z,
+        tx: localT.x, ty: localT.y, tz: localT.z,
+        bx: localB.x, by: localB.y, bz: localB.z,
+        Sxx: s.Sxx, Sxy: s.Sxy, Syy: s.Syy,
+        w: s.w,
+      };
+    });
+
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'geodesic');
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', decimateSamples(bakedLocal, MAX_MASK_SAMPLES));
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
+    return true;
+  }
+
+  /**
+   * Curvature-similarity flood select from a single clicked surface point.
+   * A one-shot operation (not a drag) — a different GESTURE from the
+   * brush tools, not merely a different falloff mode on the same one.
+   *
+   * @param {number} nodeId
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {boolean} true if the flood succeeded and mask was updated.
+   */
+  bakeCurvatureFloodMaskForNode(nodeId, clientX, clientY) {
+    const fn = this._isolatedSDF(nodeId);
+    if (!fn) return false;
+
+    const sampleLocal = this.paintSampleAtScreenPosition(nodeId, clientX, clientY);
+    if (!sampleLocal) return false;
+
+    const node = stateStore.nodeGraph.nodes.get(nodeId);
+    if (!node) return false;
+    const t = node.transform;
+    const mask = node.mask || createEmptyMask();
+    const threshold = mask.curvatureThreshold ?? 0.15;
+    const radius = mask.falloffRadius ?? 0.4;
+
+    const sampleWorld = applyForwardTransform3D(sampleLocal, t);
+
+    // The flood's own spatial reach isn't bounded by falloffRadius the way
+    // the brush is — curvature similarity, not distance, decides extent —
+    // so the graph is grown with a generous radius cap (guards against an
+    // almost-uniform-curvature object flooding without bound) rather than
+    // the mask's falloff radius.
+    const FLOOD_SPATIAL_CAP = Math.max(radius * 6, 3.0);
+    const graph = buildSurfaceGraph(fn, [sampleWorld], {
+      stepSize: Math.max(radius / 5, 0.04),
+      radius: FLOOD_SPATIAL_CAP,
+      maxNodes: 400,
+      timeBudgetMs: 30,
+    });
+    if (graph.nodes.length === 0) return false;
+
+    const seedIdx = graph.seedIndices[0] ?? 0;
+    const flood = curvatureFlood(graph, seedIdx, threshold);
+    const bakedWorld = bakeCurvatureFloodSamples(graph, flood, threshold);
+    if (bakedWorld.length === 0) return false;
+
+    const bakedLocal = bakedWorld.map(s => {
+      const localPos = applyInverseTransform3D(s, t);
+      const localN   = this._inverseRotateDirection({ x: s.nx, y: s.ny, z: s.nz }, t);
+      const localT   = this._inverseRotateDirection({ x: s.tx, y: s.ty, z: s.tz }, t);
+      const localB   = this._inverseRotateDirection({ x: s.bx, y: s.by, z: s.bz }, t);
+      return {
+        x: localPos.x, y: localPos.y, z: localPos.z,
+        nx: localN.x, ny: localN.y, nz: localN.z,
+        tx: localT.x, ty: localT.y, tz: localT.z,
+        bx: localB.x, by: localB.y, bz: localB.z,
+        Sxx: s.Sxx, Sxy: s.Sxy, Syy: s.Syy,
+        w: s.w,
+      };
+    });
+
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'curvatureFlood');
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', decimateSamples(bakedLocal, MAX_MASK_SAMPLES));
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
+    return true;
   }
 
   /**
@@ -2281,6 +2646,32 @@ _adaptRenderScale() {
   }
 
   /**
+   * Scale factor for ambient-occlusion/soft-shadow sampling distances in
+   * the ray march shader, derived from the SMALLEST embedNode depth
+   * currently in the graph. The fixed AO/shadow sampling constants in
+   * RayMarchRenderer's fragment shader were tuned around a "normal"
+   * shape scale — a shallow engrave cavity is much smaller than that
+   * scale, so those same fixed offsets over/under-sample relative to the
+   * cavity's own size, which shows up as speckle/banding inside it.
+   * Returns 1.0 (no change) when there is no embedNode in the graph, or
+   * when its depth is at/above the constants' original tuning point
+   * (0.35) — this is purely a downward adjustment for SHALLOW cavities,
+   * never an upward one.
+   */
+  _computeEmbedDetailScale() {
+    const graph = this.glslEvaluator?.graph ?? stateStore.nodeGraph;
+    let minDepth = Infinity;
+    graph.nodes.forEach(n => {
+      if (n.type === 'embedNode') {
+        const d = n.params?.depth ?? 0.35;
+        if (d < minDepth) minDepth = d;
+      }
+    });
+    if (!isFinite(minDepth)) return 1.0;
+    return Math.min(1.0, Math.max(0.15, minDepth / 0.35));
+  }
+
+  /**
    * Set ray march quality parameters.
    * @param {number} maxSteps  Maximum sphere-tracing iterations (default 128)
    * @param {number} epsilon   Hit threshold (default 0.001)
@@ -2331,7 +2722,13 @@ _adaptRenderScale() {
       source.includes('powerMapper')
     );
 
-    const hasWarp = !hasDifference && !hasRiskyMapper && (
+    // embedNode's blend (host↔guest seam, plus the outer host/embedded
+    // falloff) is not distance-preserving either — same class of problem
+    // as rDifference, and at least as steep at the seam — so it needs the
+    // conservative tier below, not the milder "warp" tier.
+    const hasEmbed = source.includes('embedNode');
+
+    const hasWarp = !hasDifference && !hasRiskyMapper && !hasEmbed && (
       source.includes('twistNode')        ||
       source.includes('bendNode')         ||
       source.includes('noiseDisplaceNode')||
@@ -2340,7 +2737,7 @@ _adaptRenderScale() {
     );
 
     let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
-    if (hasDifference || hasRiskyMapper) {
+    if (hasDifference || hasRiskyMapper || hasEmbed) {
       targetMaxSteps  = 256;
       targetStepScale = 0.25;
       targetEpsilon   = 0.0001;
@@ -2485,7 +2882,7 @@ _adaptRenderScale() {
     // occurs normally after stateStore.clear() or mid-construction.
     if (!this._graphIsRenderable()) return;
 
-    const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '2d');
+    const { source, uniforms, vecUniforms, intUniforms, rootFn } = this.glslEvaluator.generate(time, '2d');
 
     if (!source || !rootFn) {
       // _graphIsRenderable() confirmed the graph is wired, so a null result
@@ -2513,7 +2910,7 @@ _adaptRenderScale() {
       logger.info('SDFRenderer: shader compiled successfully.');
     }
 
-    this.sdfRenderer.render(uniforms, time);
+    this.sdfRenderer.render(uniforms, time, null, null, vecUniforms, intUniforms);
   }
 
   /**
@@ -2548,7 +2945,7 @@ _adaptRenderScale() {
     // wired any geometry to the output node.
     if (!this._graphIsRenderable()) return;
 
-    const { source, uniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
+    const { source, uniforms, vecUniforms, intUniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
 
     if (!source || !rootFn) {
       // _graphIsRenderable() confirmed the graph is wired, so a null result
@@ -2583,8 +2980,9 @@ _adaptRenderScale() {
       }
     }
 
+    this.rayMarchRenderer.setDetailScale(this._computeEmbedDetailScale());
     this.rayMarchRenderer.syncCamera(this.camera, this.controls);
-    this.rayMarchRenderer.render(uniforms, time);
+    this.rayMarchRenderer.render(uniforms, time, vecUniforms, intUniforms);
 
     // Automatically adapt render resolution to maintain ~30fps.
     // Runs every frame in Ray March mode — drops scale when slow,

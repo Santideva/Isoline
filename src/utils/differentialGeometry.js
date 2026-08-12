@@ -221,7 +221,7 @@ export function computePrincipalCurvatures3D(sdfFn, point, eps = 0.001) {
   // fall back to the plain T/B tangent frame — a safe, deterministic
   // choice that introduces no visible artifact, since k1≈k2 there means
   // curvature is the same regardless of which direction is chosen.
-  const UMBILIC_EPS = 1e-8;
+  const UMBILIC_EPS = 1e-4;
   let dir1, dir2;
   if (disc < UMBILIC_EPS) {
     dir1 = { ...frame.tangent };
