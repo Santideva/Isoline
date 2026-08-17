@@ -26,7 +26,7 @@ import {
 } from '../utils/affine.js';
 import { buildAdaptiveFrameField, evaluateBlendedFrame, defaultFrameBandwidth } from '../utils/frameField.js';
 import { applyInverseTransform3D, applyForwardTransform3D, isIdentityTransform } from '../utils/transform3D.js';
-import { evaluateMaskAt, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
+import { evaluateMaskAt, evaluateMaskDistance, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
 import { ComplexShape2D } from '../Geometry/ComplexShape2d.js';
 import { TrianglePrimitive, ArcPrimitive } from '../Primitives/primaryDerivativePrimitives.js';
 import { CirclePrimitive, RegularPolygonPrimitive, PolytopePrimitive } from '../Primitives/regionPrimitives.js';
@@ -564,8 +564,8 @@ export class NodeEvaluator {
 
       case 'embedNode': {
         const hostSDF  = this._resolveSDF(node, 'hostSdf');
-        const guestSDF = this._resolveSDF(node, 'guestSdf');
-        if (!hostSDF || !guestSDF) return { result: () => Infinity };
+        const guestSDF = this._resolveSDF(node, 'guestSdf'); // may be null — guestSdf is now optional
+        if (!hostSDF) return { result: () => Infinity };
 
         const hostEdgeForTiling = this.graph.getIncomingEdge(node.id, 'hostSdf');
         const hostNodeForTiling = hostEdgeForTiling ? this.graph.nodes.get(hostEdgeForTiling.fromNode) : null;
@@ -576,15 +576,61 @@ export class NodeEvaluator {
 
         const hostMask = hostNodeForTiling ? hostNodeForTiling.mask : null;
         const useMask = maskHasContent(hostMask);
+        const isPaintMask = useMask && hostMask.mode !== 'curvatureFlood';
 
-        const { operation, anchorX, anchorY, anchorZ, regionSize, depth, edgeSoftness, seamSmoothness } = node.params;
-        const rawAnchor = { x: anchorX ?? 0, y: anchorY ?? 0, z: anchorZ ?? 0 };
+        const { operation, anchorX, anchorY, anchorZ, regionSize, depth, edgeSoftness, seamSmoothness, width } = node.params;
 
-        // Plain (unweighted) centroid-based footprint of the mask's OWN
-        // samples, measured in the host's LOCAL space (matching how
-        // mask samples are stored), converted to the host's PARENT
-        // space (where tangentialR/rs are actually compared below) via
-        // the host's own uniform scale.
+        // ── NO-GUEST STROKE-RELIEF PATH ───────────────────────────────
+        if (!guestSDF) {
+          if (!isPaintMask) {
+            return { result: (pt, cs = [], t = 0) => hostSDF(pt, cs, t) };
+          }
+
+          const wStroke = Math.max(width ?? 0.06, 1e-4);
+          const dStroke = Math.max(depth ?? 0.08, 1e-4);
+          const softStroke = Math.min(Math.max(edgeSoftness ?? 0.15, 0), 0.9);
+          const seamStroke = seamSmoothness ?? 0;
+          const coreR = wStroke * (1 - softStroke);
+          const rejectBeyond = wStroke + dStroke; // cheap pre-check radius
+
+          const strokeFn = (pt, cs = [], t = 0) => {
+            const rawP = { x: pt.x, y: pt.y, z: pt.z || 0 };
+            const p = tilingFoldForEmbed ? tilingFoldForEmbed(rawP) : rawP;
+            const dHost = hostSDF(p, cs, t);
+
+            // Cheap reject BEFORE the (more expensive) real distance
+            // scan — most ray-march steps are nowhere near the stroke.
+            if (Math.abs(dHost) >= rejectBeyond) return dHost;
+
+            const dist = evaluateMaskDistance(hostMask, p);
+            if (!isFinite(dist) || dist >= rejectBeyond) return dHost;
+
+            // "relief" is a RAW guest-like SDF value (negative = inside
+            // the stroke tube) — deliberately NEVER pre-negated by
+            // operation. Sign handling belongs entirely to the combiner
+            // below, exactly mirroring how the guest-projection path
+            // treats dGuest. Pre-negating this AND negating the combine
+            // step (an earlier version did both) cancels out and is why
+            // engrave previously had almost no visible effect.
+            const relief = Math.max(dist - wStroke, Math.abs(dHost) - dStroke);
+
+            const combined = operation === 'engrave'
+              ? weightedRDifference(dHost, relief, seamStroke)
+              : weightedRUnion(dHost, relief, seamStroke);
+
+            let edgeW = 1;
+            if (dist > coreR) {
+              const x = Math.min(1, (dist - coreR) / Math.max(wStroke - coreR, 1e-4));
+              edgeW = 1 - x * x * (3 - 2 * x);
+            }
+
+            return dHost + (combined - dHost) * edgeW;
+          };
+
+          return { result: strokeFn };
+        }
+
+        // ── GUEST-PROJECTION PATH (unchanged) ──────────────────────────
         let maskFootprintRadius = 0;
         if (useMask) {
           let mcx = 0, mcy = 0, mcz = 0;
@@ -602,11 +648,8 @@ export class NodeEvaluator {
           maskFootprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
         }
 
-        // Multi-frame adaptive field — several curvature-adaptive
-        // frames spread across the WHOLE painted/flooded footprint
-        // (see deriveEmbedFramesFromMask), converted from the host's
-        // LOCAL space into the host's PARENT space whenever the host
-        // has a non-identity transform.
+        const rawAnchor = { x: anchorX ?? 0, y: anchorY ?? 0, z: anchorZ ?? 0 };
+
         let frames;
         if (useMask) {
           let rawFrames = deriveEmbedFramesFromMask(hostMask, 6);
@@ -631,16 +674,6 @@ export class NodeEvaluator {
           }
         }
 
-        // rs — the SINGLE radius used for BOTH the tangentialR
-        // bail-out AND the wT/innerR feather shape in sdfFn below (a
-        // previous version used two different variables here, which
-        // disagreed and produced a hard/discontinuous edge).
-        //
-        // For 'curvatureFlood' mode, the node's own regionSize slider
-        // (otherwise inert once painted) is repurposed as a SCALE
-        // MULTIPLIER on the flooded footprint: 1.0 = exactly the
-        // flooded extent, smaller = shrink the guest's confinement
-        // inside it.
         let rs;
         if (useMask) {
           const userScale = hostMask.mode === 'curvatureFlood'
@@ -690,11 +723,6 @@ export class NodeEvaluator {
           }
           let w = wT * wD;
 
-          // Paint modes: the painted stroke's own silhouette IS the
-          // decoration's shape. Flood mode keeps the wT*wD radial gate
-          // above (unchanged) so the GUEST's own silhouette shows
-          // through, confined to the flood's size/position rather than
-          // the flood's own irregular outline.
           if (useMask && hostMask.mode !== 'curvatureFlood') {
             w = evaluateMaskAt(hostMask, p);
           }

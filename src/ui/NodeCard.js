@@ -355,13 +355,7 @@ export class NodeCard {
           () => this.onAnchorPick(this.node.id)
         ));
       }
-      if (this.onAutoFitEmbedGuest) {
-        wrap.appendChild(_actionBtn(
-          '🧩 Auto-Fit Guest to Region',
-          'Automatically position, scale, and (for Repeat/Tiling guests) space the second shape to fit the region\'s footprint and depth — removes the need to manually wrestle its Transform into place.',
-          () => this.onAutoFitEmbedGuest(this.node.id)
-        ));
-      }
+      
       container.appendChild(wrap);
       return container;
     }
@@ -860,6 +854,24 @@ export class NodeCard {
         const note = document.createElement('div');
         note.textContent = 'Confined by painted region';
         note.title = 'The host has a painted stroke — the decoration\'s shape comes entirely from the paint, not this slider. Clear the region (on the host\'s card) to use regionSize again.';
+        note.style.cssText = `
+          flex: 1;
+          font-size: 10px;
+          opacity: 0.55;
+          font-style: italic;
+          padding: 3px 2px;
+          cursor: help;
+        `;
+        return note;
+      }
+    }
+
+    if (this.node.type === 'embedNode' && paramSpec.name === 'width') {
+      const guestEdge = this.nodeGraph.getIncomingEdge(this.node.id, 'guestSdf');
+      if (guestEdge) {
+        const note = document.createElement('div');
+        note.textContent = 'Only used without a guest shape';
+        note.title = 'A guest shape is connected — its own outline is used instead of this line-width setting. Disconnect guestSdf to draw a stroke directly from paint instead.';
         note.style.cssText = `
           flex: 1;
           font-size: 10px;

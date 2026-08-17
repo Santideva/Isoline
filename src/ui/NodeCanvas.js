@@ -50,7 +50,7 @@
     import { PRESETS } from '../presets/presets.js';
     import * as THREE from 'three';
     import { NODE_TYPES } from '../graph/NodeSpec.js';
-    import { maskHasContent } from '../utils/surfaceMask.js';
+    import { maskHasContent, computeMaskDomeRadius } from '../utils/surfaceMask.js';
 
     // Types that are shown as cards in the canvas
     const TOP_LEVEL_TYPES = new Set([
@@ -173,6 +173,22 @@ function _isConvexPolygon(vertices) {
 
         this._buildDOM();
         this._attachGlobalEvents();
+        this._buildControlLegend();
+
+        // "Compiling shader…" toast — fires only around a REAL recompile,
+        // and only if that compile takes long enough to matter.
+        let _compileToastTimer = null;
+        this.sceneManager._onCompileStart = () => {
+            clearTimeout(_compileToastTimer);
+            _compileToastTimer = setTimeout(() => {
+                this._showToast('⏳ Compiling shader…', 8000);
+            }, 150);
+        };
+        this.sceneManager._onCompileEnd = () => {
+            clearTimeout(_compileToastTimer);
+            const existing = document.getElementById('nc-toast');
+            if (existing && existing.textContent.includes('Compiling')) existing.remove();
+        };
     }
 
     // ── Public ────────────────────────────────────────────────────────────────
@@ -182,6 +198,69 @@ function _isConvexPolygon(vertices) {
 
     /** Programmatically close the canvas. */
     close() { this._doClose(); }
+
+    _buildControlLegend() {
+        const legend = document.createElement('div');
+        legend.id = 'nc-control-legend';
+        legend.style.cssText = `
+            position: fixed;
+            bottom: 14px;
+            left: 14px;
+            z-index: 900;
+            font-family: var(--font-sans, sans-serif);
+            pointer-events: auto;
+        `;
+
+        const toggle = document.createElement('button');
+        toggle.textContent = '⌨';
+        toggle.title = 'Controls reference';
+        toggle.style.cssText = `
+            width: 26px; height: 26px;
+            border-radius: 50%;
+            background: rgba(20,20,26,0.55);
+            border: 1px solid rgba(255,255,255,0.15);
+            color: rgba(255,255,255,0.6);
+            font-size: 13px;
+            cursor: pointer;
+        `;
+
+        const panel = document.createElement('div');
+        panel.style.cssText = `
+            display: none;
+            position: absolute;
+            bottom: 32px;
+            left: 0;
+            background: rgba(16,16,22,0.95);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 6px;
+            padding: 10px 12px;
+            font-size: 11px;
+            line-height: 1.7;
+            color: rgba(220,220,230,0.9);
+            white-space: nowrap;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+        `;
+        panel.innerHTML = `
+            <div style="opacity:0.55; text-transform:uppercase; font-size:9px; margin-bottom:4px;">Camera (mouse)</div>
+            <div>Drag — orbit &nbsp; · &nbsp; Scroll — zoom &nbsp; · &nbsp; Middle-drag — pan</div>
+            <div style="opacity:0.55; text-transform:uppercase; font-size:9px; margin:8px 0 4px;">Geometry (shape itself)</div>
+            <div>Alt+Drag — move position</div>
+            <div>Alt+Shift+Drag — move pivot</div>
+            <div>Scale — use the card's Transform → Scale slider</div>
+        `;
+
+        toggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        });
+        document.addEventListener('mousedown', (e) => {
+            if (!legend.contains(e.target)) panel.style.display = 'none';
+        });
+
+        legend.appendChild(panel);
+        legend.appendChild(toggle);
+        document.body.appendChild(legend);
+    }
 
     // ── DOM construction ──────────────────────────────────────────────────────
 
@@ -2895,6 +2974,13 @@ function _isConvexPolygon(vertices) {
         this.sceneManager.showPaintPreview(nodeId);
         if (!this._paintDragAttached) { this._attachPaintDrag(); this._paintDragAttached = true; }
         this._showToast('Drag on the glowing shape to paint a region. Click the button again to stop.', 4500);
+
+        // Force the empty→painted shader recompile to happen NOW, in
+        // response to this deliberate click, instead of invisibly on the
+        // user's first live mousemove mid-stroke. See _prewarmPaintShader.
+        // Double rAF so the toast above actually gets a chance to paint
+        // before the (possibly multi-second) blocking compile begins.
+        requestAnimationFrame(() => requestAnimationFrame(() => this._prewarmPaintShader(nodeId)));
     }
 
     /**
@@ -2926,15 +3012,73 @@ function _isConvexPolygon(vertices) {
         this.sceneManager.showPaintPreview(nodeId);
         if (!this._paintClickAttached) { this._attachPaintFloodClick(); this._paintClickAttached = true; }
         this._showToast('Click a point on the glowing shape to flood-select similar curvature. Click the button again to cancel.', 5000);
+
+        // See _armPaintBrush's identical call for the full rationale.
+        // Passing 'curvatureFlood' here (not the default) warms the
+        // FLOOD-shaped branch of _maskFieldGLSL, which is structurally
+        // different GLSL from the path/stroke branch paint uses — without
+        // this, the arm-time prewarm would warm the wrong branch and the
+        // user's first flood click would still eat one recompile.
+        requestAnimationFrame(() => requestAnimationFrame(() => this._prewarmPaintShader(nodeId, 'curvatureFlood')));
+    }
+
+    /**
+     * Force the ray-march shader to compile the "painted mask present"
+     * code path ONCE, right now, rather than letting that transition
+     * happen invisibly on the user's first live paint sample mid-drag.
+     * Any node downstream of nodeId whose GLSL depends on
+     * maskHasContent(node.mask) — embedNode's no-guest relief path being
+     * the expensive one — emits genuinely different source text the
+     * moment mask.samples goes from empty to non-empty. That's a real,
+     * unavoidable recompile; this just relocates it to a moment where:
+     *   - the main thread isn't needed for anything else (no mousemoves
+     *     to drop), so nothing gets corrupted by it
+     *   - the existing _onCompileStart/_onCompileEnd toast hooks get a
+     *     real chance to paint before the block begins (see the double
+     *     rAF at the call site)
+     * The seed sample is removed immediately after, so the user's actual
+     * stroke starts from a genuinely empty, correctly-rendered mask.
+     */
+    _prewarmPaintShader(nodeId, mode = 'euclidean') {
+        if (this.sceneManager.renderMode !== 'rayMarch') return;
+        const graph = this.stateStore.nodeGraph;
+        const node = graph.nodes.get(nodeId);
+        if (!node || maskHasContent(node.mask)) return; // nothing to warm, or already painted
+
+        const dummySample = {
+            x: 0, y: 0, z: 0,
+            nx: 0, ny: 1, nz: 0,
+            tx: 1, ty: 0, tz: 0,
+            bx: 0, by: 0, bz: 1,
+            w: 1,
+        };
+
+        // mode matters here, not just samples/enabled: _maskFieldGLSL
+        // emits STRUCTURALLY DIFFERENT GLSL for 'curvatureFlood' (point-
+        // cloud blend) vs. any other mode (swept-tube path) — warming the
+        // wrong branch would leave the first real bake to eat its own
+        // recompile anyway. See the two call sites for which mode to pass.
+        graph.updateNodeMask(nodeId, 'mode', mode);
+        graph.updateNodeMask(nodeId, 'samples', [dummySample]);
+        graph.updateNodeMask(nodeId, 'enabled', true);
+        this.sceneManager.evaluator.invalidate();
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager._renderRayMarch(); // blocking compile: passthrough → painted relief
+
+        graph.updateNodeMask(nodeId, 'samples', []);
+        graph.updateNodeMask(nodeId, 'enabled', false);
+        graph.updateNodeMask(nodeId, 'mode', 'euclidean'); // back to createEmptyMask()'s default
+        this.sceneManager.evaluator.invalidate();
+        this.sceneManager._lastRayMarchSource = null;
+        this.sceneManager._renderRayMarch(); // blocking compile: back to correct empty-mask visual
     }
 
     _clearPaintMask(nodeId) {
         this._undo.snapshot();
         const graph = this.stateStore.nodeGraph;
         graph.updateNodeMask(nodeId, 'samples', []);
+        graph.updateNodeMask(nodeId, 'strokeBreaks', []);
         graph.updateNodeMask(nodeId, 'enabled', false);
-        this.sceneManager._lastGLSLSource     = null;
-        this.sceneManager._lastRayMarchSource = null;
         this.sceneManager.evaluator.invalidate();
         this._rebuildCards();
         this._renderInPlace();
@@ -2951,15 +3095,6 @@ function _isConvexPolygon(vertices) {
         this._recomposeTimer = setTimeout(() => this._renderInPlace(), 150);
     }
 
-    /**
-     * Continuous paint-brush drag capture. Modeled on _attachViewportDrag:
-     * disables OrbitControls for the drag, snapshots undo once at
-     * mousedown, and separates the cheap per-event write (raw Euclidean
-     * sample, live visual feedback) from the expensive one-shot geodesic
-     * bake that runs on mouseup (SceneManager.bakeGeodesicMaskForNode) —
-     * see surfaceGraph.js's cost-model header for why that split is what
-     * keeps this performant.
-     */
     _attachPaintDrag() {
         const container = this.sceneManager._mountEl;
         if (!container) return;
@@ -2972,23 +3107,27 @@ function _isConvexPolygon(vertices) {
             if (!sample) return;
             this._paintStrokeBuffer.push(sample);
 
-            // Live feedback during the drag uses the raw Euclidean samples
-            // directly (cheap — no graph build) so painting feels
-            // immediate; the geodesic refinement replaces this on release.
+            // Live preview shows PRIOR committed strokes plus this
+            // stroke's raw (not yet smoothed/baked) points, so the user
+            // sees everything painted so far while still dragging — not
+            // just the current stroke. A matching strokeBreaks entry is
+            // included so the LIVE preview itself doesn't draw a stray
+            // connecting line between the previous stroke and this one;
+            // the actual bake at mouseup recomputes this correctly
+            // regardless.
             const graph = this.stateStore.nodeGraph;
+            const liveSamples = [...this._priorCommittedSamples, ...this._paintStrokeBuffer];
+            const liveBreaks = this._priorCommittedSamples.length > 0
+              ? [...this._priorStrokeBreaks, this._priorCommittedSamples.length]
+              : [...this._priorStrokeBreaks];
             graph.updateNodeMask(nodeId, 'mode', 'euclidean');
-            graph.updateNodeMask(nodeId, 'samples', [...this._paintStrokeBuffer]);
+            graph.updateNodeMask(nodeId, 'samples', liveSamples);
+            graph.updateNodeMask(nodeId, 'strokeBreaks', liveBreaks);
             graph.updateNodeMask(nodeId, 'enabled', true);
 
-            // Mask sample DATA is a GLSL uniform ARRAY (see
-            // GLSLEvaluator._maskFieldGLSL), not baked into the shader
-            // source text — a new stroke sample does not need a recompile
-            // on every mousemove. The one genuine exception (the VERY
-            // FIRST sample of a stroke, which newly adds the mask
-            // function's declaration) is still caught correctly by the
-            // diff check. This was previously the single largest source of
-            // freezing while painting — every mousemove forced a full
-            // recompile.
+            // Mask sample DATA is a GLSL uniform ARRAY, not baked into
+            // shader source text — a new stroke sample does not need a
+            // recompile on every mousemove.
             this.sceneManager.evaluator.invalidate();
             this.sceneManager.showPaintPreview(nodeId);
 
@@ -3005,17 +3144,22 @@ function _isConvexPolygon(vertices) {
 
             const node = this.stateStore.nodeGraph.nodes.get(this._paintBrushMode);
             const existingMode = node?.mask?.mode;
-            // Starting a NEW drag on a node that already has a baked
-            // geodesic/flood region replaces it rather than appending raw
-            // Euclidean samples on top of already-refined ones — mixing
-            // sample kinds in one array would make the next bake's source
-            // seed set incoherent. Continuing to paint in the SAME
-            // session (several drags before ever releasing into a bake)
-            // still appends, since existingMode stays 'euclidean' until
-            // the first mouseup bakes it.
-            this._paintStrokeBuffer = (existingMode === 'euclidean' && Array.isArray(node?.mask?.samples))
+            // Snapshot whatever was already COMMITTED (finished, baked
+            // strokes from earlier in this session) BEFORE the live
+            // preview above starts overwriting mask.samples with THIS
+            // stroke's raw points. This is the actual fix for strokes
+            // wiping each other: once a stroke bakes, mode becomes
+            // 'geodesic' — never 'euclidean' — so a check that only
+            // continued appending while mode==='euclidean' always failed
+            // starting with the SECOND stroke, silently discarding the
+            // first.
+            this._priorCommittedSamples = (existingMode === 'geodesic' && Array.isArray(node?.mask?.samples))
               ? [...node.mask.samples]
               : [];
+            this._priorStrokeBreaks = (existingMode === 'geodesic' && Array.isArray(node?.mask?.strokeBreaks))
+              ? [...node.mask.strokeBreaks]
+              : [];
+            this._paintStrokeBuffer = [];
 
             isPainting = true;
             liveSample(e.clientX, e.clientY);
@@ -3034,12 +3178,15 @@ function _isConvexPolygon(vertices) {
             const nodeId = this._paintBrushMode;
             clearTimeout(this._recomposeTimer);
             if (nodeId != null && this._paintStrokeBuffer?.length > 0) {
-                const ok = this.sceneManager.bakeGeodesicMaskForNode(nodeId, this._paintStrokeBuffer);
+                const ok = this.sceneManager.bakeGeodesicMaskForNode(
+                    nodeId,
+                    this._paintStrokeBuffer,
+                    this._priorCommittedSamples,
+                    this._priorStrokeBreaks
+                );
                 if (!ok) {
                     this._showToast('Could not refine the painted region — keeping the quick preview instead.', 3000);
                 }
-                this.sceneManager._lastGLSLSource     = null;
-                this.sceneManager._lastRayMarchSource = null;
                 this.sceneManager.evaluator.invalidate();
                 this._rebuildCards();
             }
@@ -3063,8 +3210,22 @@ function _isConvexPolygon(vertices) {
                 return;
             }
 
-            this.sceneManager._lastGLSLSource     = null;
-            this.sceneManager._lastRayMarchSource = null;
+            // Silently shrink any downstream embed's guest ONLY if it's
+            // genuinely oversized for the just-flooded region — see
+            // _autoFitOversizedEmbedGuests's header for the exact
+            // conditions. Folded into the same undo snapshot as the
+            // flood itself, so one Ctrl+Z undoes both together.
+            this._autoFitOversizedEmbedGuests(nodeId);
+
+            // Deliberately NOT force-nulling _lastGLSLSource/
+            // _lastRayMarchSource here — same reasoning as _onParamChange's
+            // identical comment. Mask sample DATA is uniform-driven (see
+            // GLSLEvaluator's _uniformFloat bounding-sphere fix), so
+            // re-flooding an ALREADY-flooded node changes only uniform
+            // values, not generated source text — generate()'s own diff
+            // check correctly skips recompiling in that case. Forcing a
+            // null here defeated that check and cost one full ANGLE
+            // recompile per flood click for no reason.
             this.sceneManager.evaluator.invalidate();
             this._rebuildCards();
             this.sceneManager.showPaintPreview(nodeId);
@@ -3126,6 +3287,92 @@ function _isConvexPolygon(vertices) {
     }
 
     /**
+     * Automatically shrink an embedNode's guest ONLY when it's genuinely
+     * too large for a freshly curvature-flooded region — e.g. a Torus
+     * left at its default radius 2 dropped into a region sized 0.3. BOTH
+     * of the following must hold for this to do anything at all:
+     *   1. The host's mask mode is 'curvatureFlood' — paint-mode and
+     *      unpainted hosts are never touched.
+     *   2. The guest's current radius exceeds the region's target radius
+     *      by more than 15% — a guest that's already roughly the right
+     *      size (including one the user already resized by hand) is left
+     *      completely alone.
+     * Never GROWS a guest — that stays the user's own call via the
+     * regionSize slider, which already scales the flooded footprint.
+     */
+    _autoFitOversizedEmbedGuests(hostNodeId) {
+        const graph = this.stateStore.nodeGraph;
+        const hostNode = graph.nodes.get(hostNodeId);
+        if (!hostNode || hostNode.mask?.mode !== 'curvatureFlood') return;
+
+        graph.nodes.forEach((embedNode, embedNodeId) => {
+            if (embedNode.type !== 'embedNode') return;
+            const hostEdge = graph.getIncomingEdge(embedNodeId, 'hostSdf');
+            if (!hostEdge || hostEdge.fromNode !== hostNodeId) return;
+            const guestEdge = graph.getIncomingEdge(embedNodeId, 'guestSdf');
+            if (!guestEdge) return;
+            const guestNodeId = guestEdge.fromNode;
+            const guestNode = graph.nodes.get(guestNodeId);
+            if (!guestNode) return;
+
+            const mask = hostNode.mask;
+            const samples = mask.samples;
+            if (!samples || samples.length === 0) return;
+            let mcx = 0, mcy = 0, mcz = 0;
+            samples.forEach(s => { mcx += s.x; mcy += s.y; mcz += s.z; });
+            const sN = samples.length;
+            mcx /= sN; mcy /= sN; mcz /= sN;
+            let maxDist = 0;
+            samples.forEach(s => {
+                const d = Math.hypot(s.x - mcx, s.y - mcy, s.z - mcz);
+                if (d > maxDist) maxDist = d;
+            });
+            const domePad = computeMaskDomeRadius(samples, mask.falloffRadius);
+            const hostScale = Math.abs(hostNode.transform?.scale ?? 1);
+            const footprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
+            const userScale = Math.max(embedNode.params.regionSize ?? 1.0, 0.05);
+            const regionSize = Math.max(footprintRadius * userScale, 1e-4);
+            const depth = embedNode.params.depth ?? 0.35;
+            const targetRadius = Math.min(depth, regionSize) * 0.9;
+
+            const currentRadius = this.sceneManager.estimateNodeRadius(guestNodeId);
+            if (!isFinite(currentRadius) || currentRadius <= 1e-6) return;
+
+            const OVERSIZE_THRESHOLD = 1.15;
+            if (currentRadius <= targetRadius * OVERSIZE_THRESHOLD) return;
+
+            const curScale = guestNode.transform?.scale ?? 1;
+            const newScale = curScale * (targetRadius / currentRadius);
+            graph.updateNodeTransform(guestNodeId, 'scale', newScale);
+            graph.updateNodeTransform(guestNodeId, 'posX', 0);
+            graph.updateNodeTransform(guestNodeId, 'posY', 0);
+            graph.updateNodeTransform(guestNodeId, 'posZ', 0);
+
+            const isFiniteArray = guestNode.type === 'repeatNode' ||
+                (guestNode.type === 'tilingNode' && guestNode.params.extent === 'finite');
+            if (isFiniteArray) {
+                const cx = guestNode.params.countX ?? 1;
+                const cy = guestNode.params.countY ?? 1;
+                const spanX = (cx - 1) * (guestNode.params.spacingX ?? 1);
+                const spanY = (cy - 1) * (guestNode.params.spacingY ?? 1);
+                const maxSpan = Math.max(spanX, spanY, 1e-6);
+                const targetSpan = regionSize * 1.6;
+                const spacingScale = Math.min(1, targetSpan / maxSpan);
+                graph.updateNodeParam(guestNodeId, 'spacingX', (guestNode.params.spacingX ?? 1) * spacingScale);
+                graph.updateNodeParam(guestNodeId, 'spacingY', (guestNode.params.spacingY ?? 1) * spacingScale);
+            }
+
+            const card = this._cards.get(guestNodeId);
+            if (card) {
+                card.updateTransformParam('scale', newScale);
+                card.updateTransformParam('posX', 0);
+                card.updateTransformParam('posY', 0);
+                card.updateTransformParam('posZ', 0);
+            }
+        });
+    }
+
+    /**
      * Auto-Fit Guest to Region: removes the manual "wrestle the guest's
      * Transform into place" step for embedNode. Resets the guest's own
      * position to (0,0,0) (its coordinates are already relative to the
@@ -3136,7 +3383,7 @@ function _isConvexPolygon(vertices) {
      * shrinks its SPACING (never its count, which is a deliberate user
      * choice) so the whole array's footprint fits within regionSize.
      *
-     * Deliberately NOT solving "how many copies should there be" — that
+     * Deliberately NOT solving "how many copies there should be" — that
      * would mean overriding a choice the user made intentionally. This
      * fits the choice they made into the space available.
      */
@@ -3160,9 +3407,32 @@ function _isConvexPolygon(vertices) {
         const hostEdge = graph.getIncomingEdge(embedNodeId, 'hostSdf');
         const hostNode = hostEdge ? graph.nodes.get(hostEdge.fromNode) : null;
         const usingPaintedRegion = maskHasContent(hostNode?.mask);
-        const regionSize = usingPaintedRegion
-          ? Math.max(hostNode.mask.falloffRadius ?? 0.4, 1e-4)
-          : (embedNode.params.regionSize ?? 1.0);
+        let regionSize;
+        if (usingPaintedRegion) {
+          // Mirrors NodeEvaluator/GLSLEvaluator's own confinement-radius
+          // math exactly — this was previously just the BRUSH radius
+          // (falloffRadius), not the true painted FOOTPRINT the embed is
+          // actually confined to, so Auto-Fit could size the guest
+          // against a smaller number than what was really painted.
+          const samples = hostNode.mask.samples;
+          let mcx = 0, mcy = 0, mcz = 0;
+          samples.forEach(s => { mcx += s.x; mcy += s.y; mcz += s.z; });
+          const sN = samples.length || 1;
+          mcx /= sN; mcy /= sN; mcz /= sN;
+          let maxDist = 0;
+          samples.forEach(s => {
+            const d = Math.hypot(s.x - mcx, s.y - mcy, s.z - mcz);
+            if (d > maxDist) maxDist = d;
+          });
+          const domePad = computeMaskDomeRadius(samples, hostNode.mask.falloffRadius);
+          const hostScale = Math.abs(hostNode.transform?.scale ?? 1);
+          const footprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
+          const userScale = hostNode.mask.mode === 'curvatureFlood'
+            ? Math.max(embedNode.params.regionSize ?? 1.0, 0.05) : 1;
+          regionSize = Math.max(footprintRadius * userScale, 1e-4);
+        } else {
+          regionSize = embedNode.params.regionSize ?? 1.0;
+        }
         const depth = embedNode.params.depth ?? 0.35;
 
         this._undo.snapshot();

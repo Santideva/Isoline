@@ -35,7 +35,7 @@
 // (always has a decimal point, non-finite values become 1e10).
 // ─────────────────────────────────────────────────────────────────────────────
 import { isIdentityTransform, applyForwardTransform3D } from '../utils/transform3D.js';
-import { decimateSamples, MAX_MASK_SAMPLES, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
+import { decimateSamples, decimateOrderedPath, MAX_MASK_SAMPLES, maskHasContent, deriveEmbedFramesFromMask, computeMaskDomeRadius } from '../utils/surfaceMask.js';
 import { NodeEvaluator } from '../graph/NodeEvaluator.js';
 import { buildAdaptiveFrameField, evaluateBlendedFrame, defaultFrameBandwidth } from '../utils/frameField.js';
 
@@ -130,8 +130,7 @@ export class GLSLEvaluator {
     this._time = time;
     this._maskFnCache = new Map();
     this._maskFnDecls = [];
-    // Names of uniforms emitted THIS call — declared once, up front, in
-    // the assembled source below. Reset per call like _maskFnDecls.
+    this._maskDistFnCache = new Map();   // ← add this
     this._uniformDecls = new Set();
 
     // Resolve effective mode
@@ -661,35 +660,88 @@ float ${fn}(float d) { return d; }`;
     const fn = this._fnName(node.id);
     const p  = node.params;
 
-    const hostFn  = this._resolveInputFn(node, 'hostSdf');
-    const guestFn = this._resolveInputFn(node, 'guestSdf');
-    if (!hostFn || !guestFn) return this._fallback3D(fn, node.id, 'embedNode missing inputs');
+    const hostFn = this._resolveInputFn(node, 'hostSdf');
+    if (!hostFn) return this._fallback3D(fn, node.id, 'embedNode missing host');
 
     const edgeH = this.graph.getIncomingEdge(node.id, 'hostSdf');
+    const hostNode = edgeH ? this.graph.nodes.get(edgeH.fromNode) : null;
+    if (hostNode && !this._nodeOutputIs3D(hostNode)) {
+      return this._fallback3D(fn, node.id, 'embedNode requires a 3D host');
+    }
+
+    // guestSdf is OPTIONAL. When nothing is wired into it AND the host has
+    // a PAINTED (non-flood) Surface Region, the painted stroke itself
+    // becomes the geometry (no guest shape evaluated at all). Flood mode
+    // still REQUIRES a connected guest.
+    const guestFn = this._resolveInputFn(node, 'guestSdf');
     const edgeG = this.graph.getIncomingEdge(node.id, 'guestSdf');
-    const hostNode  = edgeH ? this.graph.nodes.get(edgeH.fromNode) : null;
     const guestNode = edgeG ? this.graph.nodes.get(edgeG.fromNode) : null;
-    if ((hostNode && !this._nodeOutputIs3D(hostNode)) ||
-        (guestNode && !this._nodeOutputIs3D(guestNode))) {
-      console.warn(`embedNode ${node.id}: host and guest must both be 3D solids in V1.`);
-      return this._fallback3D(fn, node.id, 'embedNode requires 3D host and guest');
+    if (guestNode && !this._nodeOutputIs3D(guestNode)) {
+      console.warn(`embedNode ${node.id}: guest must be a 3D solid if connected.`);
+      return this._fallback3D(fn, node.id, 'embedNode requires a 3D guest when one is connected');
     }
 
     const useMaskFrames = !!(hostNode && maskHasContent(hostNode.mask));
-    // Paint modes use the mask field as the decoration's shape; flood
-    // mode keeps the default radial gate so the guest's own silhouette
-    // shows through — see NodeEvaluator.js's matching embedNode comment.
-    const useMaskAsShape = !!(hostNode && hostNode.mask && hostNode.mask.mode !== 'curvatureFlood');
-    const embedMaskFnName = (useMaskFrames && useMaskAsShape) ? this._maskFieldGLSL(hostNode) : null;
+    const isPaintMaskGLSL = useMaskFrames && hostNode.mask.mode !== 'curvatureFlood';
+
+    const hostIsTiling = hostNode && hostNode.type === 'tilingNode';
+    const tilingFoldGLSL = hostIsTiling ? this._buildTilingFoldGLSL(hostNode) : null;
+
+    // ── NO-GUEST STROKE-RELIEF PATH ─────────────────────────────────────
+    if (!guestFn) {
+      if (!isPaintMaskGLSL) {
+        return `// embedNode ${node.id}  (no guest, no paint — passthrough)
+float ${fn}(vec3 p) {
+  return ${hostFn}(p);
+}`;
+      }
+
+      const maskDistFnName = this._maskDistanceGLSL(hostNode);
+      const opStroke = p.operation ?? 'emboss';
+      const wStroke = this._uniformFloat(node, 'embedStrokeWidth', Math.max(p.width ?? 0.06, 1e-4));
+      const dStroke = this._uniformFloat(node, 'embedDepth', Math.max(p.depth ?? 0.08, 1e-4));
+      const softStroke = Math.min(Math.max(p.edgeSoftness ?? 0.15, 0), 0.9);
+      const seamStroke = this._uniformFloat(node, 'embedStrokeSeamSm', p.seamSmoothness ?? 0);
+
+      // Same raw-relief, sign-handled-only-by-combiner pattern as the
+      // CPU path (see NodeEvaluator.js's identical comment) — relief is
+      // NEVER pre-negated by operation; only the combine step differs.
+      const combineCallStroke = opStroke === 'engrave'
+        ? `(-rUnion(-dHost, relief, ${seamStroke}))`
+        : `rUnion(dHost, relief, ${seamStroke})`;
+
+      const wStrokeNum = Math.max(p.width ?? 0.06, 1e-4);
+      const coreRNum = wStrokeNum * (1 - softStroke);
+      const coreRVal = this._uniformFloat(node, 'embedStrokeCoreR2', coreRNum);
+
+      return `// embedNode ${node.id}  (${opStroke}, no-guest stroke relief)
+float ${fn}(vec3 p) {
+  vec3 foldedP = p;
+${tilingFoldGLSL ? tilingFoldGLSL : ''}
+  float dHost = ${hostFn}(${tilingFoldGLSL ? 'foldedP' : 'p'});
+  float rejectBeyond = ${wStroke} + ${dStroke};
+  if (abs(dHost) >= rejectBeyond) return dHost;
+  float dist = ${maskDistFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'});
+  if (dist >= rejectBeyond) return dHost;
+  float relief = max(dist - ${wStroke}, abs(dHost) - ${dStroke});
+  float combined = ${combineCallStroke};
+  float edgeW = 1.0;
+  if (dist > ${coreRVal}) {
+    float x = min(1.0, (dist - ${coreRVal}) / max(${wStroke} - ${coreRVal}, 1e-4));
+    edgeW = 1.0 - x*x*(3.0-2.0*x);
+  }
+  return dHost + (combined - dHost) * edgeW;
+}`;
+    }
+
+    // ── GUEST-PROJECTION PATH ────────────────────────────────────────────
+    const embedMaskFnName = useMaskFrames ? this._maskFieldGLSL(hostNode) : null;
 
     const op = p.operation ?? 'emboss';
     const depthVal = this._uniformFloat(node, 'embedDepth', p.depth ?? 0.35);
     const edgeSoftnessVal = Math.min(Math.max(p.edgeSoftness ?? 0.25, 0), 0.9);
     const innerFracVal = this._uniformFloat(node, 'embedInnerFrac', 1 - edgeSoftnessVal);
     const seamSm = this._uniformFloat(node, 'embedSeamSm', p.seamSmoothness ?? 0);
-
-    const hostIsTiling = hostNode && hostNode.type === 'tilingNode';
-    const tilingFoldGLSL = hostIsTiling ? this._buildTilingFoldGLSL(hostNode) : null;
 
     let maskFootprintRadius = 0;
     if (useMaskFrames) {
@@ -906,16 +958,6 @@ ${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'
    *   0" and skip calling this a second time for the same node/call.
    */
   _maskFieldGLSL(node) {
-    // Uses maskHasContent() — the SAME guard evaluateMaskAt() (CPU side)
-    // and NodeEvaluator's embedNode/blend cases already use — instead of
-    // a hand-rolled duplicate with different truthiness rules. The two
-    // checks had drifted: maskHasContent() treats mask.enabled===undefined
-    // as "has content" (enabled !== false), while this method's old inline
-    // check required enabled to be strictly truthy. A mask object that
-    // reached here with enabled left undefined would be treated as active
-    // by useMaskFrames (which calls maskHasContent) but rejected here —
-    // producing exactly this symptom: a call site emitted referencing a
-    // mask function that this method then declined to declare.
     if (!maskHasContent(node?.mask)) {
       return null;
     }
@@ -924,16 +966,24 @@ ${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'
     const fn = `mask_${node.id}`;
     this._maskFnCache.set(node.id, fn);
 
-    // Cap for the uniform-array path — deliberately lower than the CPU
-    // path's MAX_MASK_SAMPLES (64). Every masked node now costs a FIXED
-    // uniform budget regardless of paint density, shared across every
-    // masked node in one shader — WebGL1's spec-minimum guaranteed
-    // fragment uniform budget is as low as 16 vec4 on some hardware, so
-    // this stays conservative. evaluateMaskAt (CPU/marching-squares) is
-    // completely unaffected — it reads mask.samples directly in JS and
-    // is not subject to this cap.
     const GLSL_MASK_CAP = 24;
-    const samples = decimateSamples(node.mask.samples, GLSL_MASK_CAP);
+    // Paint modes ('euclidean'/'geodesic') are an ORDERED PATH and need
+    // order-preserving decimation; 'curvatureFlood' is an unordered
+    // cloud and uses farthest-point decimation as before. Mixing these
+    // up would either scramble a stroke's connectivity or waste spread
+    // on a flood that doesn't need it.
+    const isPath = node.mask.mode !== 'curvatureFlood';
+
+    let samples, strokeBreaksDecimated;
+    if (isPath) {
+      const decimated = decimateOrderedPath(node.mask.samples, node.mask.strokeBreaks, GLSL_MASK_CAP);
+      samples = decimated.samples;
+      strokeBreaksDecimated = decimated.strokeBreaks;
+    } else {
+      samples = decimateSamples(node.mask.samples, GLSL_MASK_CAP);
+      strokeBreaksDecimated = [];
+    }
+
     const radius  = this._uniformFloat(node, 'maskRadius',  computeMaskDomeRadius(samples, node.mask.falloffRadius));
     const nThresh = this._uniformFloat(node, 'maskNThresh', 1 - (node.mask.normalThreshold ?? -1));
 
@@ -942,17 +992,6 @@ ${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'
       return fn;
     }
 
-    // Bounding sphere over all sample positions, expanded by falloffRadius —
-    // computed ONCE here in JS, so the GLSL function can reject any query
-    // point outside it with a single length() check instead of paying for
-    // the full per-sample loop below. This is the dominant per-marching-
-    // step cost shared by EVERY masked node (rUnion/rIntersection/
-    // rDifference/rBlend/morphBlend/embedNode/noiseDisplaceNode/masked-
-    // mapper) — the loop below runs regardless of distance today, on
-    // every step of every ray.
-    // Sample SPREAD is baked (never changes without a repaint); the
-    // falloff radius itself stays a uniform and is added in GLSL below,
-    // so this bound stays correct as `radius` changes without a recompile.
     let bcx = 0, bcy = 0, bcz = 0;
     samples.forEach(s => { bcx += s.x; bcy += s.y; bcz += s.z; });
     bcx /= samples.length; bcy /= samples.length; bcz /= samples.length;
@@ -961,26 +1000,31 @@ ${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'
       const d = Math.hypot(s.x - bcx, s.y - bcy, s.z - bcz);
       if (d > maxSpread) maxSpread = d;
     });
-    const boundCx = this._f(bcx), boundCy = this._f(bcy), boundCz = this._f(bcz);
-    const boundSpread = this._f(maxSpread);
+    // UNIFORMS, not baked literals — see _uniformFloat's header comment.
+    // These are a cheap early-reject bounding sphere, recomputed from
+    // node.mask.samples on every call. Baking them as GLSL literals meant
+    // every new paint sample during a live drag changed the generated
+    // shader's SOURCE TEXT, forcing a full recompile per mousemove — the
+    // actual cause of the mid-stroke freeze / dropped-sample corruption.
+    // Now only a genuine sample-COUNT change (which alters the unrolled
+    // loop bound) still requires a recompile; moving/adding samples
+    // within that count does not.
+    const boundCx = this._uniformFloat(node, 'maskBoundCx', bcx);
+    const boundCy = this._uniformFloat(node, 'maskBoundCy', bcy);
+    const boundCz = this._uniformFloat(node, 'maskBoundCz', bcz);
+    const boundSpread = this._uniformFloat(node, 'maskBoundSpread', maxSpread);
 
-    // Sample DATA (position/normal/weight) is now a uniform ARRAY, not
-    // baked GLSL text — a NEW paint stroke on an already-masked node
-    // re-uploads these via gl.uniform3fv/1fv and updates the count
-    // uniform. It does NOT change the shader SOURCE STRING, so it does
-    // NOT force a recompile — unlike the previous fully-unrolled version,
-    // where every single stroke (up to 64 unrolled blocks of GLSL text
-    // per masked node) was effectively a brand-new shader that had to be
-    // recompiled from scratch, across EVERY masked node in the graph at
-    // once, since they all live in one concatenated fragment shader.
     const posName    = `u_${node.id}_maskPos`;
     const normName   = `u_${node.id}_maskN`;
     const weightName = `u_${node.id}_maskW`;
+    const breakName  = `u_${node.id}_maskBreak`;
     const countName  = `u_${node.id}_maskCount`;
 
     const posArr    = new Float32Array(GLSL_MASK_CAP * 3);
     const normArr   = new Float32Array(GLSL_MASK_CAP * 3);
     const weightArr = new Float32Array(GLSL_MASK_CAP);
+    const breakArr  = new Float32Array(GLSL_MASK_CAP); // 1.0 = "this sample starts a NEW stroke"
+    const breakSet  = new Set(strokeBreaksDecimated);
     samples.forEach((s, i) => {
       posArr[i * 3]     = s.x;
       posArr[i * 3 + 1] = s.y;
@@ -989,29 +1033,93 @@ ${embedMaskFnName ? `  w = ${embedMaskFnName}(${tilingFoldGLSL ? 'foldedP' : 'p'
       normArr[i * 3 + 1] = s.ny;
       normArr[i * 3 + 2] = s.nz;
       weightArr[i] = s.w ?? 1;
+      breakArr[i]  = breakSet.has(i) ? 1 : 0;
     });
     this.vecUniforms.set(posName,    { data: posArr,    size: 3 });
     this.vecUniforms.set(normName,   { data: normArr,   size: 3 });
     this.vecUniforms.set(weightName, { data: weightArr, size: 1 });
+    this.vecUniforms.set(breakName,  { data: breakArr,  size: 1 });
     this.intUniforms.set(countName, samples.length);
 
-    this._maskFnDecls.push(`
-// mask ${fn}  (node ${node.id}, up to ${GLSL_MASK_CAP} samples via uniform array${node.mask.samples.length > samples.length ? `, decimated from ${node.mask.samples.length}` : ''})
+    if (isPath) {
+      // PATH mode — swept-tube distance to the stroke's own segments.
+      // This is the GLSL counterpart that was previously MISSING
+      // entirely: ray-march rendering always used point-cloud
+      // interpolation regardless of mode, which is why baked paint kept
+      // looking beaded/patterned even after the CPU-side fix. Mirrors
+      // surfaceMask.js's _evaluateSegmentedMask exactly, including the
+      // per-index isolated-point fallback for single-click dabs.
+      this._maskFnDecls.push(`
+// mask ${fn}  (node ${node.id}, PATH/stroke — up to ${GLSL_MASK_CAP} samples)
+uniform vec3  ${posName}[${GLSL_MASK_CAP}];
+uniform vec3  ${normName}[${GLSL_MASK_CAP}];
+uniform float ${weightName}[${GLSL_MASK_CAP}];
+uniform float ${breakName}[${GLSL_MASK_CAP}];
+uniform int   ${countName};
+float ${fn}(vec3 p) {
+  if (length(p - vec3(${boundCx}, ${boundCy}, ${boundCz})) > ${boundSpread} + ${radius}) return 0.0;
+  float sumW = 0.0;
+  float sumWeighted = 0.0;
+  float missProduct = 1.0;
+  for (int i = 0; i < ${GLSL_MASK_CAP}; i++) {
+    if (i >= ${countName}) break;
+    bool isStart = (i == 0) || (${breakName}[i] > 0.5);
+    bool isEnd = (i == ${countName} - 1);
+    if (!isEnd && (i + 1 < ${GLSL_MASK_CAP}) && ${breakName}[i + 1] > 0.5) isEnd = true;
+
+    if (isStart && isEnd) {
+      // Isolated single-point stroke (a click/dab) — point contribution.
+      vec3 dd = p - ${posName}[i];
+      float dist = length(dd);
+      if (dist < ${radius}) {
+        float r = dist / ${radius};
+        float wl = (1.0-r)*(1.0-r)*(1.0-r)*(1.0-r)*(4.0*r+1.0);
+        float nDot = dist > 1e-6 ? dot(dd, ${normName}[i]) / dist : 0.0;
+        float foldGate = ${nThresh} >= 1.0 ? 1.0 : 1.0 - smoothstep(${nThresh} - 0.15, ${nThresh}, abs(nDot));
+        float wlg = wl * foldGate;
+        sumW += wlg; sumWeighted += wlg * ${weightName}[i]; missProduct *= (1.0 - wlg);
+      }
+    } else if (!isEnd) {
+      // Segment i -> i+1 contribution.
+      vec3 a = ${posName}[i];
+      vec3 b = ${posName}[i + 1];
+      vec3 ab = b - a;
+      float abLenSq = dot(ab, ab);
+      vec3 ap = p - a;
+      float tt = abLenSq > 1e-10 ? clamp(dot(ap, ab) / abLenSq, 0.0, 1.0) : 0.0;
+      vec3 c = a + ab * tt;
+      vec3 dd = p - c;
+      float dist = length(dd);
+      if (dist < ${radius}) {
+        vec3 na = ${normName}[i];
+        vec3 nb = ${normName}[i + 1];
+        vec3 ni = na + (nb - na) * tt;
+        float nlen = max(length(ni), 1e-6);
+        float nDot = dist > 1e-6 ? dot(dd, ni / nlen) / dist : 0.0;
+        float foldGate = ${nThresh} >= 1.0 ? 1.0 : 1.0 - smoothstep(${nThresh} - 0.15, ${nThresh}, abs(nDot));
+        float r = dist / ${radius};
+        float wl = (1.0-r)*(1.0-r)*(1.0-r)*(1.0-r)*(4.0*r+1.0);
+        float segW = ${weightName}[i] + (${weightName}[i+1] - ${weightName}[i]) * tt;
+        float wlg = wl * foldGate;
+        sumW += wlg; sumWeighted += wlg * segW; missProduct *= (1.0 - wlg);
+      }
+    }
+  }
+  if (sumW <= 1e-6) return 0.0;
+  float envelope = 1.0 - missProduct;
+  float localAverage = clamp(sumWeighted / sumW, 0.0, 1.0);
+  return clamp(envelope * localAverage, 0.0, 1.0);
+}`);
+    } else {
+      // FLOOD mode — unordered point cloud, unchanged from before.
+      this._maskFnDecls.push(`
+// mask ${fn}  (node ${node.id}, FLOOD — up to ${GLSL_MASK_CAP} samples)
 uniform vec3  ${posName}[${GLSL_MASK_CAP}];
 uniform vec3  ${normName}[${GLSL_MASK_CAP}];
 uniform float ${weightName}[${GLSL_MASK_CAP}];
 uniform int   ${countName};
 float ${fn}(vec3 p) {
   if (length(p - vec3(${boundCx}, ${boundCy}, ${boundCz})) > ${boundSpread} + ${radius}) return 0.0;
-  // envelope * localAverage — mirrors surfaceMask.js's
-  // _evaluatePointMask EXACTLY (see that function's comment for the
-  // full rationale). A plain normalized ratio (sumWeighted/sumW alone)
-  // is DISCONTINUOUS at the region boundary — it converges to a
-  // nonzero sample weight right up until the last contributing sample
-  // drops out, then hard-cuts to 0. That broke sphere tracing's
-  // Lipschitz assumption and produced jagged/faceted ray-march
-  // artifacts. envelope (a soft-OR over all kernels) forces the
-  // product to 0 smoothly instead.
   float sumW = 0.0;
   float sumWeighted = 0.0;
   float missProduct = 1.0;
@@ -1022,14 +1130,7 @@ float ${fn}(vec3 p) {
     if (dist < ${radius}) {
       float r = dist / ${radius};
       float wl = (1.0-r)*(1.0-r)*(1.0-r)*(1.0-r)*(4.0*r+1.0);
-      // Degenerate case (dist≈0): aligned (0.0), not maximally
-      // misaligned (1.0) — see surfaceMask.js's identical fix.
       float nDot = dist > 1e-6 ? dot(dd, ${normName}[i]) / dist : 0.0;
-      // Soft fold gate, not a hard reject — see surfaceMask.js's
-      // _evaluatePointMask for the full rationale (a hard cutoff here
-      // fragmented ordinary curved surfaces into disconnected
-      // "bubbles" whenever normalThreshold was raised above its new,
-      // gate-disabled-by-default value).
       float foldGate = ${nThresh} >= 1.0 ? 1.0 : 1.0 - smoothstep(${nThresh} - 0.15, ${nThresh}, abs(nDot));
       float wlg = wl * foldGate;
       sumW += wlg;
@@ -1041,6 +1142,116 @@ float ${fn}(vec3 p) {
   float envelope = 1.0 - missProduct;
   float localAverage = clamp(sumWeighted / sumW, 0.0, 1.0);
   return clamp(envelope * localAverage, 0.0, 1.0);
+}`);
+    }
+
+    return fn;
+  }
+
+  /**
+   * GLSL counterpart of surfaceMask.js's evaluateMaskDistance — returns a
+   * TRUE minimum distance to the stroke path (or 1e6 if out of range),
+   * not a kernel-weighted coverage value. See that function's header for
+   * the full rationale.
+   */
+  _maskDistanceGLSL(node) {
+    if (!maskHasContent(node?.mask)) return null;
+    if (!this._maskDistFnCache) this._maskDistFnCache = new Map();
+    if (this._maskDistFnCache.has(node.id)) return this._maskDistFnCache.get(node.id);
+
+    const fn = `maskDist_${node.id}`;
+    this._maskDistFnCache.set(node.id, fn);
+
+    const GLSL_MASK_CAP = 24;
+    const decimated = decimateOrderedPath(node.mask.samples, node.mask.strokeBreaks, GLSL_MASK_CAP);
+    const samples = decimated.samples;
+    const strokeBreaksDecimated = decimated.strokeBreaks;
+
+    const radius  = this._uniformFloat(node, 'maskDistRadius', computeMaskDomeRadius(samples, node.mask.falloffRadius));
+    const nThresh = this._uniformFloat(node, 'maskDistNThresh', 1 - (node.mask.normalThreshold ?? -1));
+
+    if (samples.length === 0) {
+      this._maskFnDecls.push(`// maskDist ${fn} (empty)\nfloat ${fn}(vec3 p) { return 1e6; }`);
+      return fn;
+    }
+
+    let bcx=0,bcy=0,bcz=0;
+    samples.forEach(s => { bcx+=s.x; bcy+=s.y; bcz+=s.z; });
+    bcx/=samples.length; bcy/=samples.length; bcz/=samples.length;
+    let maxSpread = 0;
+    samples.forEach(s => { const d = Math.hypot(s.x-bcx, s.y-bcy, s.z-bcz); if (d>maxSpread) maxSpread=d; });
+    // UNIFORMS, not baked literals — see the identical fix in
+    // _maskFieldGLSL above for the full rationale (this was the other
+    // half of the mid-paint-stroke recompile storm).
+    const boundCx = this._uniformFloat(node, 'maskDistBoundCx', bcx);
+    const boundCy = this._uniformFloat(node, 'maskDistBoundCy', bcy);
+    const boundCz = this._uniformFloat(node, 'maskDistBoundCz', bcz);
+    const boundSpread = this._uniformFloat(node, 'maskDistBoundSpread', maxSpread);
+
+    const posName   = `u_${node.id}_mdPos`;
+    const normName  = `u_${node.id}_mdN`;
+    const breakName = `u_${node.id}_mdBreak`;
+    const countName = `u_${node.id}_mdCount`;
+
+    const posArr   = new Float32Array(GLSL_MASK_CAP * 3);
+    const normArr  = new Float32Array(GLSL_MASK_CAP * 3);
+    const breakArr = new Float32Array(GLSL_MASK_CAP);
+    const breakSet = new Set(strokeBreaksDecimated);
+    samples.forEach((s,i) => {
+      posArr[i*3]=s.x; posArr[i*3+1]=s.y; posArr[i*3+2]=s.z;
+      normArr[i*3]=s.nx; normArr[i*3+1]=s.ny; normArr[i*3+2]=s.nz;
+      breakArr[i] = breakSet.has(i) ? 1 : 0;
+    });
+    this.vecUniforms.set(posName,   { data: posArr,   size: 3 });
+    this.vecUniforms.set(normName,  { data: normArr,  size: 3 });
+    this.vecUniforms.set(breakName, { data: breakArr, size: 1 });
+    this.intUniforms.set(countName, samples.length);
+
+    this._maskFnDecls.push(`
+// maskDist ${fn}  (node ${node.id}, true min distance)
+uniform vec3  ${posName}[${GLSL_MASK_CAP}];
+uniform vec3  ${normName}[${GLSL_MASK_CAP}];
+uniform float ${breakName}[${GLSL_MASK_CAP}];
+uniform int   ${countName};
+float ${fn}(vec3 p) {
+  if (length(p - vec3(${boundCx}, ${boundCy}, ${boundCz})) > ${boundSpread} + ${radius}) return 1e6;
+  float best = 1e6;
+  for (int i = 0; i < ${GLSL_MASK_CAP}; i++) {
+    if (i >= ${countName}) break;
+    bool isStart = (i == 0) || (${breakName}[i] > 0.5);
+    bool isEnd = (i == ${countName} - 1);
+    if (!isEnd && (i + 1 < ${GLSL_MASK_CAP}) && ${breakName}[i + 1] > 0.5) isEnd = true;
+
+    if (isStart && isEnd) {
+      vec3 dd = p - ${posName}[i];
+      float dist = length(dd);
+      if (dist < ${radius} && dist < best) {
+        float nDot = dist > 1e-6 ? dot(dd, ${normName}[i]) / dist : 0.0;
+        bool pass = ${nThresh} >= 1.0 ? true : (abs(nDot) <= ${nThresh});
+        if (pass) best = dist;
+      }
+    } else if (!isEnd) {
+      vec3 a = ${posName}[i];
+      vec3 b = ${posName}[i + 1];
+      vec3 ab = b - a;
+      float abLenSq = dot(ab, ab);
+      vec3 ap = p - a;
+      float tt = abLenSq > 1e-10 ? clamp(dot(ap, ab) / abLenSq, 0.0, 1.0) : 0.0;
+      vec3 c = a + ab * tt;
+      vec3 dd = p - c;
+      float dist = length(dd);
+      if (dist < ${radius} && dist < best) {
+        vec3 na = ${normName}[i];
+        vec3 nb = ${normName}[i + 1];
+        vec3 ni = na + (nb - na) * tt;
+        float nlen = max(length(ni), 1e-6);
+        float nDot = dist > 1e-6 ? dot(dd, ni / nlen) / dist : 0.0;
+        bool pass = ${nThresh} >= 1.0 ? true : (abs(nDot) <= ${nThresh});
+        if (pass) best = dist;
+      }
+    }
+  }
+  return best;
 }`);
 
     return fn;
@@ -1996,39 +2207,29 @@ float ${fn}(${dim} p) {
       case 'noiseDisplaceNode': {
         const inputFn  = this._resolveInputFn(node, 'sdf');
         if (!inputFn) return this._fallbackAdaptive(fn, node.id, 'noiseDisplace missing sdf', this._nodeOutputIs3D(node));
-        const amp      = this._f(node.params.amplitude ?? 0.3);
-        const freq     = this._f(node.params.frequency  ?? 3.0);
-        const animated = (node.params.animated ?? 'no') === 'yes';
-        const speedVal = this._f(node.params.speed ?? 0.4);
 
-        // Determine if input is 3D
+        // amplitude/frequency/speed are now UNIFORMS, not baked literals
+        // — previously every slider tick changed the generated shader
+        // SOURCE TEXT, correctly triggering a recompile (the diff check
+        // itself was working as intended), but a recompile per drag
+        // frame is exactly what made this node's sliders feel slow.
+        const amp      = this._uniformFloat(node, 'ndAmplitude', node.params.amplitude ?? 0.3);
+        const freq     = this._uniformFloat(node, 'ndFrequency', node.params.frequency ?? 3.0);
+        const animated = (node.params.animated ?? 'no') === 'yes';
+        const speedVal = this._uniformFloat(node, 'ndSpeed', node.params.speed ?? 0.4);
+
         const edge     = this.graph.getIncomingEdge(node.id, 'sdf');
         const baseNode = edge ? this.graph.nodes.get(edge.fromNode) : null;
         const is3D     = baseNode && this._nodeOutputIs3D(baseNode);
         const dim      = is3D ? 'vec3' : 'vec2';
 
-        // Painted-region gate — confine the bumpiness to a region painted
-        // on the INPUT shape's own card. See NodeEvaluator's identical
-        // treatment of useMaskFromInput.
         const useMaskFromInput = node.params.useMaskFromInput ?? 'no';
         const maskFnName = (useMaskFromInput === 'yes' && baseNode)
           ? this._maskFieldGLSL(baseNode)
           : null;
 
-        // When animated=yes, add uTime to the noise sample coordinate so
-        // the pattern shifts over time. uTime is provided as a uniform by
-        // the renderer each frame. The 0.35 factor keeps animation speed
-        // comfortable — visible but not frantic.
-        // Was hardcoded to 0.35 here vs 0.5 on the CPU side — a genuine
-        // CPU/GLSL speed mismatch. Now both read the same node.params.speed.
         const timeOffset = animated ? ` + uTime * ${speedVal}` : '';
 
-        // ndHash, ndNoise3, and ndNoise2 are declared once in _preamble()
-        // and must NOT be redeclared here — doing so would cause a GLSL
-        // "function already has a body" compile error whenever two or more
-        // noiseDisplaceNode instances exist in the same graph (as in the
-        // Gothic Portal preset, which uses three separate noise nodes).
-        // This node's generated function only calls the shared helpers.
         if (is3D) {
           const sampleCoord =
             `vec3(p.x * ${freq}, p.y * ${freq}, p.z * ${freq}${timeOffset})`;
@@ -2057,7 +2258,7 @@ ${maskFnName ? `  float mw = ${maskFnName}(vec3(p, 0.0));
       case 'twistNode': {
         const inputFn  = this._resolveInputFn(node, 'sdf');
         if (!inputFn) return this._fallback3D(fn, node.id, 'twistNode missing sdf');
-        const strength = this._f(node.params.strength ?? 1.0);
+        const strength = this._uniformFloat(node, 'twistStrength', node.params.strength ?? 1.0);
 
         // Detect input dimension. Twist is inherently 3D (rotates XZ by Y).
         // For 2D input, we lift to 3D (z=0) so the operation is still valid.
@@ -2078,7 +2279,7 @@ float ${fn}(vec3 p) {
       case 'bendNode': {
         const inputFn  = this._resolveInputFn(node, 'sdf');
         if (!inputFn) return this._fallback3D(fn, node.id, 'bendNode missing sdf');
-        const strength = this._f(node.params.strength ?? 0.5);
+        const strength = this._uniformFloat(node, 'bendStrength', node.params.strength ?? 0.5);
 
         const edge      = this.graph.getIncomingEdge(node.id, 'sdf');
         const baseNode  = edge ? this.graph.nodes.get(edge.fromNode) : null;

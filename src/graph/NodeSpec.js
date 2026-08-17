@@ -469,12 +469,23 @@ export const NODE_TYPES = {
     timeVarying: false,
     ports: [
       { name: 'hostSdf',  type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
-      { name: 'guestSdf', type: PortType.SDF, dir: PortDirection.IN,  required: true,  default: null },
+      // guestSdf is now OPTIONAL. When left unconnected AND the host has
+      // a PAINTED (non-flood) Surface Region, this node uses the paint
+      // stroke itself as the source geometry (see the 'width' param
+      // below) — no guest shape needed at all. When guestSdf IS
+      // connected, behavior is unchanged: the guest is embedded via the
+      // host's tangent frame, confined by the painted/flooded region or
+      // the anchor disc. Flood-selected regions still REQUIRE a
+      // connected guest — that mode is specifically about placing an
+      // existing shape into a curvature-selected area.
+      { name: 'guestSdf', type: PortType.SDF, dir: PortDirection.IN,  required: false, default: null },
       { name: 'result',   type: PortType.SDF, dir: PortDirection.OUT, required: false, default: null },
     ],
     params: [
       { name: 'operation', type: 'select', default: 'emboss', options: ['emboss','engrave'],
         hint: 'Emboss = a raised bump sticking out (like a rivet). Engrave = a carved-in dent (like a thumbprint). Want a dimple or hole in a face? Use Engrave, not Emboss.' },
+      { name: 'width', type: 'number', default: 0.06, min: 0.005, max: 2, step: 0.005,
+        hint: 'ONLY used when no guest shape is connected and you painted a stroke directly on the host — sets how wide the drawn line reads as geometry. Has no effect when a guest shape is wired in, or when using Flood Select.' },
       { name: 'anchorX', type: 'number', default: 0, min: -10, max: 10, step: 0.01,
         advanced: true,
         hint: 'World position of the decoration, used only when the host has no painted region. Use "Pick Anchor on Surface" instead of typing this directly — (0,0,0) is usually the host\'s CENTER, not its surface.' },

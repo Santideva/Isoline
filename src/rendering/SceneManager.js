@@ -23,7 +23,7 @@ import { computeWorldBounds2D, computeWorldBounds3D, applyForwardTransform3D, ap
 import { raymarchToSurface, fibonacciSphereSamples, epsilonForScale, computeLocalFrame, snapToNearestSurface, computeNormal3D, computePrincipalCurvatures3D, computeShapeOperator2x2 } from "../utils/differentialGeometry.js";
 import { OrbitGenerators, sphericalToDir } from "./orbitGenerators.js";
 import { buildSurfaceGraph, dijkstraGeodesic, curvatureFlood, bakeGeodesicSamples, bakeCurvatureFloodSamples } from "../utils/surfaceGraph.js";
-import { decimateSamples, MAX_MASK_SAMPLES, createEmptyMask } from "../utils/surfaceMask.js";
+import { decimateSamples, decimateOrderedPath, MAX_MASK_SAMPLES, createEmptyMask, maskHasContent, computeMaskDomeRadius } from "../utils/surfaceMask.js";
 
 
 export class SceneManager {
@@ -894,24 +894,26 @@ export class SceneManager {
     if (!Array.isArray(samples) || samples.length === 0) return;
 
     const t = node.transform;
+    const breaks = new Set(node.mask.strokeBreaks || []);
     const worldPoints = samples.map(s => {
       const w = applyForwardTransform3D(s, t);
       return { world: w, screen: project(w), sample: s };
     });
 
-    // Connecting lines between consecutive points ONLY in 'euclidean'
-    // (live-drag) mode, where consecutive samples genuinely are a path —
-    // see evaluateMaskAt's identical distinction in surfaceMask.js. Once
-    // baked to geodesic/curvatureFlood, samples represent an AREA with no
-    // meaningful point-to-point path, so lines there would look like
-    // random noise rather than a stroke.
-    if (node.mask.mode === 'euclidean' && worldPoints.length >= 2) {
+    // Connecting lines trace the STROKE PATH — drawn for both
+    // 'euclidean' (live drag) and 'geodesic' (committed paint), since
+    // both now represent an ordered path (see surfaceMask.js's
+    // evaluateMaskAt). 'curvatureFlood' samples are an unordered area,
+    // so no lines are drawn for that mode. A line is skipped wherever
+    // strokeBreaks marks the start of a new stroke.
+    if (node.mask.mode !== 'curvatureFlood' && worldPoints.length >= 2) {
       ctx.strokeStyle = 'rgba(80,220,220,0.5)';
       ctx.lineWidth = 2;
       ctx.beginPath();
       let started = false;
-      worldPoints.forEach(({ screen }) => {
-        if (!screen) return;
+      worldPoints.forEach(({ screen }, i) => {
+        if (!screen) { started = false; return; }
+        if (breaks.has(i)) started = false;
         if (!started) { ctx.moveTo(screen.x, screen.y); started = true; }
         else ctx.lineTo(screen.x, screen.y);
       });
@@ -966,38 +968,83 @@ export class SceneManager {
     if (!node || node.type !== 'embedNode') return;
     const hostEdge = stateStore.nodeGraph.getIncomingEdge(node.id, 'hostSdf');
     if (!hostEdge) return;
-
-    this.evaluator.graph = stateStore.nodeGraph;
-    let hostResult;
-    try { hostResult = this.evaluator.evaluate(hostEdge.fromNode); } catch (e) { return; }
-    const hostFn = hostResult?.sdf || hostResult?.result;
-    if (typeof hostFn !== 'function') return;
+    const hostNode = stateStore.nodeGraph.nodes.get(hostEdge.fromNode);
 
     const p = node.params;
+    const hostHasMask = maskHasContent(hostNode?.mask);
 
-    // Same self-correction and frame-building the actual embedNode math
-    // uses (NodeEvaluator.js / GLSLEvaluator.js) — reused directly from
-    // differentialGeometry.js rather than an inline gradient closure and
-    // hand-rolled Gram-Schmidt, so this overlay can never silently drift
-    // from what the shape is actually sampled against.
-    const rawAnchor = { x: p.anchorX ?? 0, y: p.anchorY ?? 0, z: p.anchorZ ?? 0 };
-    const anchor = snapToNearestSurface(hostFn, rawAnchor, 4);
+    // Cache the expensive part (anchor snap + local frame + principal
+    // curvature), keyed by a fingerprint of everything that could
+    // change it. Recomputing this EVERY frame — the previous behavior —
+    // cost a ~19-SDF-eval curvature computation every single frame
+    // purely from this ring being visible, independent of any actual
+    // animated node. Only the cheap projection/drawing below still runs
+    // every frame; the expensive part now only recomputes when
+    // something relevant actually changed.
+    const fingerprint = JSON.stringify({
+      hostId: hostEdge.fromNode,
+      anchor: { x: p.anchorX, y: p.anchorY, z: p.anchorZ },
+      regionSize: p.regionSize, depth: p.depth,
+      hostParams: hostNode?.params, hostTransform: hostNode?.transform,
+      maskSampleCount: hostNode?.mask?.samples?.length ?? 0,
+      maskFalloff: hostNode?.mask?.falloffRadius, maskMode: hostNode?.mask?.mode,
+    });
 
-    const frame = computeLocalFrame(hostFn, anchor);
+    if (!this._embedRegionCache) this._embedRegionCache = new Map();
+    let cached = this._embedRegionCache.get(node.id);
+
+    if (!cached || cached.fingerprint !== fingerprint) {
+      this.evaluator.graph = stateStore.nodeGraph;
+      let hostResult;
+      try { hostResult = this.evaluator.evaluate(hostEdge.fromNode); } catch (e) { return; }
+      const hostFn = hostResult?.sdf || hostResult?.result;
+      if (typeof hostFn !== 'function') return;
+
+      let anchor, radius;
+      if (hostHasMask) {
+        // Mirrors NodeEvaluator/GLSLEvaluator's own confinement-radius
+        // math exactly, so this ring can never visually disagree with
+        // the radius actually used to render the embed.
+        const samples = hostNode.mask.samples;
+        let mcx = 0, mcy = 0, mcz = 0;
+        samples.forEach(s => { mcx += s.x; mcy += s.y; mcz += s.z; });
+        const sN = samples.length || 1;
+        mcx /= sN; mcy /= sN; mcz /= sN;
+        let maxDist = 0;
+        samples.forEach(s => {
+          const d = Math.hypot(s.x - mcx, s.y - mcy, s.z - mcz);
+          if (d > maxDist) maxDist = d;
+        });
+        const domePad = computeMaskDomeRadius(samples, hostNode.mask.falloffRadius);
+        const hostScale = Math.abs(hostNode.transform?.scale ?? 1);
+        const footprintRadius = (maxDist + domePad) * (hostScale > 1e-6 ? hostScale : 1);
+        const userScale = hostNode.mask.mode === 'curvatureFlood'
+          ? Math.max(p.regionSize ?? 1.0, 0.05) : 1;
+        radius = Math.max(footprintRadius * userScale, 1e-4);
+
+        const centroidLocal = { x: mcx, y: mcy, z: mcz };
+        const centroidWorld = applyForwardTransform3D(centroidLocal, hostNode.transform || {});
+        anchor = snapToNearestSurface(hostFn, centroidWorld, 4);
+      } else {
+        const rawAnchor = { x: p.anchorX ?? 0, y: p.anchorY ?? 0, z: p.anchorZ ?? 0 };
+        anchor = snapToNearestSurface(hostFn, rawAnchor, 4);
+        radius = p.regionSize ?? 1.0;
+      }
+
+      const frame = computeLocalFrame(hostFn, anchor);
+      const curv  = frame ? computePrincipalCurvatures3D(hostFn, anchor) : null;
+
+      cached = { fingerprint, anchor, radius, frame, curv };
+      this._embedRegionCache.set(node.id, cached);
+    }
+
+    const { anchor, radius, frame, curv } = cached;
     if (!frame) return; // degenerate gradient at this anchor — nothing stable to draw
 
     const n = frame.normal;
     const tx = frame.tangent.x,   ty = frame.tangent.y,   tz = frame.tangent.z;
     const bx = frame.bitangent.x, by = frame.bitangent.y, bz = frame.bitangent.z;
 
-    // Principal curvatures/directions — Tier 2, the one deliberate
-    // consumer of the full eigensolve in this codebase: a human reading
-    // this overlay wants an oriented "this direction is more/less curved"
-    // line, not a raw quadratic form. embedNode's own sag math never
-    // needs this — it stays on Tier 1 (computeShapeOperator2x2).
-    const curv = computePrincipalCurvatures3D(hostFn, anchor);
-
-    const radius = p.regionSize ?? 1.0;
     const RING_SEGMENTS = 24;
     const screenPts = [];
     for (let i = 0; i <= RING_SEGMENTS; i++) {
@@ -1008,7 +1055,7 @@ export class SceneManager {
       screenPts.push(project({ x: wx, y: wy, z: wz }));
     }
 
-    if (screenPts.every(pt => pt === null)) return; // entirely off-camera
+    if (screenPts.every(pt => pt === null)) return;
 
     ctx.beginPath();
     let started = false;
@@ -1031,14 +1078,6 @@ export class SceneManager {
       ctx.fill();
     }
 
-    // Local-axis gizmo — the direct answer to "why is my guest shape's
-    // rotation unpredictable relative to the camera": the guest's own
-    // Transform (position/rotation) applies to coordinates already
-    // expressed in THIS local frame, not world space. Red/green = along
-    // the surface (tangent/bitangent); blue = into/out of the surface
-    // (normal) — a guest's default Rz=0 orientation puts its own "up"
-    // axis along green, not blue, so most guests need SOME rotation to
-    // point outward rather than lying flat.
     if (anchorScreen) {
       const axisLen = Math.max(radius * 0.6, 0.15);
       const drawAxis = (dx, dy, dz, color, label) => {
@@ -1062,22 +1101,11 @@ export class SceneManager {
       drawAxis(bx, by, bz,     'rgba(90,255,120,0.95)',  'Y');
       drawAxis(n.x, n.y, n.z,  'rgba(90,150,255,0.95)',  'Z (normal)');
 
-      // Principal-curvature indicator — DISTINCT from the T0/B0 sampling
-      // axes above (dir1/dir2 generally are NOT aligned with tangent/
-      // bitangent — they only coincide when T0/B0 happen to already be
-      // principal-aligned). Two dashed lines, one per principal
-      // direction, each scaled by |k1|/|k2| so a strongly-curved
-      // direction (e.g. circumferentially around a cylinder) visibly
-      // reads longer than a flat one (e.g. along the cylinder's axis,
-      // where k2≈0 collapses that line away) — this is the actual
-      // "show anisotropy" addition, kept visually separate from the
-      // sampling-basis gizmo above so the two are never confused for
-      // each other.
       if (curv) {
         const maxK = Math.max(Math.abs(curv.k1), Math.abs(curv.k2), 1e-6);
         const drawPrincipal = (dir, k, color, label) => {
           const len = axisLen * 0.9 * (Math.abs(k) / maxK);
-          if (len < 1e-4) return; // umbilic/flat direction — nothing meaningful to draw
+          if (len < 1e-4) return;
           const tip1 = project({ x: anchor.x + dir.x*len, y: anchor.y + dir.y*len, z: anchor.z + dir.z*len });
           const tip2 = project({ x: anchor.x - dir.x*len, y: anchor.y - dir.y*len, z: anchor.z - dir.z*len });
           if (!tip1 || !tip2) return;
@@ -1097,11 +1125,6 @@ export class SceneManager {
         drawPrincipal(curv.dir2, curv.k2, 'rgba(230,120,255,0.9)', 'k2');
       }
 
-      // Depth indicator — small markers at ±depth along the normal,
-      // giving a rough sense of the emboss height / engrave depth. Not a
-      // precise boundary (the true gate follows the host's actual
-      // surface, which can curve — see the embedNode fix comment), just
-      // an at-a-glance scale reference.
       const depthVal = p.depth ?? 0.35;
       [1, -1].forEach(sign => {
         const tip = project({
@@ -1816,107 +1839,109 @@ export class SceneManager {
     return typeof fn === 'function' ? fn : null;
   }
 
-  /**
-   * Refine a raw Euclidean brush stroke into geodesic-weighted baked
-   * samples, by growing a local surface graph outward from the stroke and
-   * running Dijkstra. Called ONCE per stroke (on mouseup), never per
-   * mousemove — see surfaceGraph.js's header for the cost model this
-   * relies on. Writes the result directly into node.mask.samples.
+/**
+   * Bake a raw painted stroke into the node's mask, merging it with
+   * whatever strokes were already committed in this session.
    *
-   * @param {number} nodeId                    The node being painted on.
-   * @param {Array}  rawStrokeSamplesLocal      Raw {x,y,z,nx,ny,nz,tx,ty,tz,bx,by,bz,w}
-   *   samples accumulated during the drag (paintSampleAtScreenPosition
-   *   results) — already in the node's LOCAL space.
-   * @returns {boolean} true if the bake succeeded and mask was updated.
+   * IMPORTANT — this deliberately does NOT run buildSurfaceGraph/BFS
+   * flood-fill anymore. That growth step expanded a full 2D
+   * neighborhood outward from EVERY point along the 1D stroke path (a
+   * full ring in every tangent direction, not just perpendicular to the
+   * path), which inherently thickens/fills an AREA rather than tracing
+   * a clean STROKE — that was the actual root cause of the "patterned"/
+   * beaded look, and no amount of smoothing the input path could fix it
+   * since the distortion was introduced downstream of the input.
+   *
+   * Stroke width now comes entirely from evaluateMaskAt's own swept-tube
+   * (segment) distance evaluation using falloffRadius — exactly like an
+   * ordinary paint brush's stroke width, and exactly matching how live
+   * 'euclidean' drag preview already worked. This also removes the BFS
+   * growth's own real cost, which helps with the general paint-mode
+   * performance goal.
+   *
+   * @param {number} nodeId
+   * @param {Array}  rawStrokeSamplesLocal      This stroke's raw
+   *   {x,y,z,nx,ny,nz,...} samples (paintSampleAtScreenPosition results),
+   *   already in the node's LOCAL space.
+   * @param {Array}  priorCommittedSamplesLocal Samples from strokes
+   *   already committed earlier in this session (empty for the first
+   *   stroke).
+   * @param {number[]} priorStrokeBreaks        This mask's existing
+   *   strokeBreaks, to be extended with a new break for this stroke.
+   * @returns {boolean} true if the bake succeeded and the mask was updated.
    */
-  bakeGeodesicMaskForNode(nodeId, rawStrokeSamplesLocal) {
+  bakeGeodesicMaskForNode(nodeId, rawStrokeSamplesLocal, priorCommittedSamplesLocal = [], priorStrokeBreaks = []) {
     const fn = this._isolatedSDF(nodeId); // world-space-in
     if (!fn || !rawStrokeSamplesLocal || rawStrokeSamplesLocal.length === 0) return false;
 
     const node = stateStore.nodeGraph.nodes.get(nodeId);
     if (!node) return false;
     const t = node.transform;
-    const mask = node.mask || createEmptyMask();
-    const radius = mask.falloffRadius ?? 0.4;
-    const stepSize = Math.max(radius / 6, 0.03);
 
-    const rawWorld = rawStrokeSamplesLocal.map(s => {
-      const w = applyForwardTransform3D(s, t);
-      return { x: w.x, y: w.y, z: w.z };
-    });
+    // Smooth (moving average) the raw path's WORLD positions if long
+    // enough to meaningfully smooth, then re-snap every point back onto
+    // the TRUE host surface and recompute its local frame there —
+    // averaging alone can drift a point slightly off-surface.
+    const rawWorld = rawStrokeSamplesLocal.map(s => applyForwardTransform3D(s, t));
+    const worldPath = rawWorld.length >= 3 ? this._movingAverage(rawWorld, 2) : rawWorld;
+    const thisStrokeLocal = this._snapPointsToSurface(fn, worldPath, t);
+    if (thisStrokeLocal.length === 0) return false;
 
-    let pathLen = 0;
-    for (let i = 1; i < rawWorld.length; i++) {
-      const a = rawWorld[i - 1], b = rawWorld[i];
-      pathLen += Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
-    }
-    const isEffectivelyAClick = pathLen < stepSize * 1.5;
+    const mergedSamples = [...priorCommittedSamplesLocal, ...thisStrokeLocal];
+    const mergedBreaks = priorCommittedSamplesLocal.length > 0
+      ? [...priorStrokeBreaks, priorCommittedSamplesLocal.length]
+      : [...priorStrokeBreaks];
 
-    if (isEffectivelyAClick) {
-      // A near-stationary click should bake exactly ONE sample and let
-      // evaluateMaskAt's own falloffRadius kernel produce the round dab
-      // — NOT run BFS graph growth at all. Growing even one ring from a
-      // single seed unconditionally produces 1 + ringDirections
-      // neighbor points before the radius gate ever engages, which is
-      // why a click still read as a small CLUSTER rather than a single
-      // dot even after the previous (growth-radius-shrinking) fix.
-      const rawPt = rawWorld[0];
-      const snapped = snapToNearestSurface(fn, rawPt, 4, 0.001);
-      const frame = computeLocalFrame(fn, snapped, 0.001);
-      if (!frame) return false;
-      const shapeOp = computeShapeOperator2x2(fn, snapped, frame, 0.001);
-
-      const localPos = applyInverseTransform3D(snapped, t);
-      const localN = this._inverseRotateDirection(frame.normal, t);
-      const localT = this._inverseRotateDirection(frame.tangent, t);
-      const localB = this._inverseRotateDirection(frame.bitangent, t);
-
-      const bakedLocal = [{
-        x: localPos.x, y: localPos.y, z: localPos.z,
-        nx: localN.x, ny: localN.y, nz: localN.z,
-        tx: localT.x, ty: localT.y, tz: localT.z,
-        bx: localB.x, by: localB.y, bz: localB.z,
-        Sxx: shapeOp.Sxx, Sxy: shapeOp.Sxy, Syy: shapeOp.Syy,
-        w: 1,
-      }];
-
-      stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'geodesic');
-      stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', bakedLocal);
-      stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
-      return true;
-    }
-
-    const graph = buildSurfaceGraph(fn, rawWorld, {
-      stepSize,
-      radius: radius * 1.4,
-      maxNodes: 260,
-      timeBudgetMs: 20,
-    });
-    if (graph.nodes.length === 0) return false;
-
-    const geodesicDist = dijkstraGeodesic(graph, graph.seedIndices);
-    const bakedWorld = bakeGeodesicSamples(graph, geodesicDist, radius);
-    if (bakedWorld.length === 0) return false;
-
-    const bakedLocal = bakedWorld.map(s => {
-      const localPos = applyInverseTransform3D(s, t);
-      const localN   = this._inverseRotateDirection({ x: s.nx, y: s.ny, z: s.nz }, t);
-      const localT   = this._inverseRotateDirection({ x: s.tx, y: s.ty, z: s.tz }, t);
-      const localB   = this._inverseRotateDirection({ x: s.bx, y: s.by, z: s.bz }, t);
-      return {
-        x: localPos.x, y: localPos.y, z: localPos.z,
-        nx: localN.x, ny: localN.y, nz: localN.z,
-        tx: localT.x, ty: localT.y, tz: localT.z,
-        bx: localB.x, by: localB.y, bz: localB.z,
-        Sxx: s.Sxx, Sxy: s.Sxy, Syy: s.Syy,
-        w: s.w,
-      };
-    });
+    const decimated = decimateOrderedPath(mergedSamples, mergedBreaks, MAX_MASK_SAMPLES);
 
     stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'geodesic');
-    stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', decimateSamples(bakedLocal, MAX_MASK_SAMPLES));
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', decimated.samples);
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'strokeBreaks', decimated.strokeBreaks);
     stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
     return true;
+  }
+
+  /** Plain positional moving average over an ORDERED array of world-space
+   *  points — pure smoothing, no surface awareness. Snapping back onto
+   *  the true surface is a separate step (_snapPointsToSurface) so this
+   *  stays simple and reusable. */
+  _movingAverage(worldPoints, windowRadius = 2) {
+    const n = worldPoints.length;
+    return worldPoints.map((_, i) => {
+      let sx = 0, sy = 0, sz = 0, count = 0;
+      for (let k = -windowRadius; k <= windowRadius; k++) {
+        const j = i + k;
+        if (j < 0 || j >= n) continue;
+        sx += worldPoints[j].x; sy += worldPoints[j].y; sz += worldPoints[j].z;
+        count++;
+      }
+      return { x: sx / count, y: sy / count, z: sz / count };
+    });
+  }
+
+  /** Snap each of a series of WORLD-space points back onto the true host
+   *  surface, compute its local frame there, and convert to the host's
+   *  own LOCAL space (matching how mask samples are stored). Shared by
+   *  the smoothing path and by flood/click sampling. */
+  _snapPointsToSurface(fn, worldPoints, hostTransform) {
+    const out = [];
+    for (const pt of worldPoints) {
+      const snapped = snapToNearestSurface(fn, pt, 4, 0.001);
+      const frame = computeLocalFrame(fn, snapped, 0.001);
+      if (!frame) continue;
+      const localPos = applyInverseTransform3D(snapped, hostTransform);
+      const localN = this._inverseRotateDirection(frame.normal, hostTransform);
+      const localT = this._inverseRotateDirection(frame.tangent, hostTransform);
+      const localB = this._inverseRotateDirection(frame.bitangent, hostTransform);
+      out.push({
+        x: localPos.x, y: localPos.y, z: localPos.z,
+        nx: localN.x, ny: localN.y, nz: localN.z,
+        tx: localT.x, ty: localT.y, tz: localT.z,
+        bx: localB.x, by: localB.y, bz: localB.z,
+        w: 1,
+      });
+    }
+    return out;
   }
 
   /**
@@ -1980,6 +2005,7 @@ export class SceneManager {
     });
 
     stateStore.nodeGraph.updateNodeMask(nodeId, 'mode', 'curvatureFlood');
+    stateStore.nodeGraph.updateNodeMask(nodeId, 'strokeBreaks', []);
     stateStore.nodeGraph.updateNodeMask(nodeId, 'samples', decimateSamples(bakedLocal, MAX_MASK_SAMPLES));
     stateStore.nodeGraph.updateNodeMask(nodeId, 'enabled', true);
     return true;
@@ -2506,35 +2532,16 @@ export class SceneManager {
  *
  * Called once per frame from _renderRayMarch() after the render completes.
  */
-_adaptRenderScale() {
+_adaptRenderScale(scaleCap = 1.0) {
     const now = performance.now();
 
-    // ── Warmup phase ───────────────────────────────────────────────────────
-    // For the first WARMUP_FRAMES frames after entering Ray March mode,
-    // do nothing — no measurement, no adaptation, no canvas resize.
-    //
-    // This covers:
-    //   - The first-frame shader compilation stall (200-600ms on integrated
-    //     Intel) which would otherwise register as an extreme slow frame and
-    //     immediately trigger a scale drop + canvas resize + black flash.
-    //   - Browser/driver warmup — WebGL contexts often run slower for the
-    //     first few frames as GPU caches warm up, giving misleadingly high
-    //     frame times that would cause premature scale reduction.
-    //
-    // During warmup the renderer runs at _currentScale (initialized to
-    // WARMUP_SCALE in setRenderMode) — slightly below native to soften
-    // the impact of the compilation frame without causing a visible flash.
-    const WARMUP_FRAMES = 45; // ~1.5 seconds at 30fps — covers most compile times
+    const WARMUP_FRAMES = 45;
     this._warmupCounter = (this._warmupCounter ?? 0) + 1;
     if (this._warmupCounter <= WARMUP_FRAMES) {
-      this._lastFrameTime = now; // keep timestamp fresh so first real measurement is accurate
+      this._lastFrameTime = now;
       return;
     }
 
-    // ── Rolling average frame time ─────────────────────────────────────────
-    // React to a rolling average of the last N frames rather than individual
-    // frame times. This prevents single anomalous frames (garbage collection,
-    // tab switching, OS interrupts) from triggering incorrect scale decisions.
     if (this._lastFrameTime === undefined) {
       this._lastFrameTime = now;
       return;
@@ -2543,34 +2550,30 @@ _adaptRenderScale() {
     const frameMs = now - this._lastFrameTime;
     this._lastFrameTime = now;
 
-    // Maintain a circular buffer of recent frame times
     if (!this._frameTimes) this._frameTimes = [];
     this._frameTimes.push(frameMs);
-    const WINDOW = 8; // average over 8 frames (~quarter second at 30fps)
+    const WINDOW = 8;
     if (this._frameTimes.length > WINDOW) this._frameTimes.shift();
-    // Need a full window before making any decisions
     if (this._frameTimes.length < WINDOW) return;
     const avgMs = this._frameTimes.reduce((a, b) => a + b, 0) / this._frameTimes.length;
 
-    // ── Thresholds ─────────────────────────────────────────────────────────
-    const SLOW_MS    = 48;  // wider dead-band — animated noise varies ±8ms naturally
-    const RECOVER_MS = 22;  // only recover when clearly and consistently fast
-    const SCALE_STEP_DOWN = 0.015; // smaller steps → less frequent canvas resize
-    const SCALE_STEP_UP   = 0.008; // proportionally slower recovery
+    const SLOW_MS    = 48;
+    const RECOVER_MS = 22;
+    const SCALE_STEP_DOWN = 0.015;
+    const SCALE_STEP_UP   = 0.008;
     const SCALE_MIN = 0.80;
-    const SCALE_MAX = 1.0;
-    // Number of consecutive WINDOW-averages that must be fast before recovering.
-    // 20 windows × 8 frames = 160 frames ≈ ~5 seconds at 30fps.
-    // Slow recovery prevents the oscillation cycle: drop → fast → recover →
-    // slow → drop → flash that would otherwise repeat indefinitely.
+    // SCALE_MAX now respects the caller-supplied cap — see
+    // _renderRayMarch's proactive animation-scale-cap comment for why
+    // this can no longer be an unconditional 1.0. Without this, the
+    // reactive recovery branch below would happily climb scale back
+    // above the animation cap mid-animation, undoing the proactive drop
+    // a few seconds later.
+    const SCALE_MAX = scaleCap;
     const STABLE_WINDOWS_TO_RECOVER = 20;
 
     const currentScale = this._currentScale ?? 1.0;
 
     if (avgMs > SLOW_MS && currentScale > SCALE_MIN) {
-      // Average frame time is too slow — drop scale immediately.
-      // No slow-frame counter needed here since we're already averaging
-      // over 8 frames, which filters single-frame spikes naturally.
       const newScale = Math.max(SCALE_MIN, currentScale - SCALE_STEP_DOWN);
       if (Math.abs(newScale - currentScale) > 0.001) {
         this._currentScale = newScale;
@@ -2579,10 +2582,7 @@ _adaptRenderScale() {
           this.rayMarchRenderer.setRenderScale(newScale);
         }
       }
-
     } else if (avgMs < RECOVER_MS && currentScale < SCALE_MAX) {
-      // Average frame time is comfortably fast — count stable windows
-      // before recovering scale upward.
       this._stableWindowCount = (this._stableWindowCount ?? 0) + 1;
       if (this._stableWindowCount >= STABLE_WINDOWS_TO_RECOVER) {
         const newScale = Math.min(SCALE_MAX, currentScale + SCALE_STEP_UP);
@@ -2595,10 +2595,60 @@ _adaptRenderScale() {
         this._stableWindowCount = 0;
       }
     } else {
-      // Frame time is acceptable — reset stable counter but keep scale
       this._stableWindowCount = 0;
     }
   }
+
+_adaptRenderScale2D(scaleCap = 1.0) {
+    const now = performance.now();
+    const WARMUP_FRAMES = 45;
+    this._warmupCounter2D = (this._warmupCounter2D ?? 0) + 1;
+    if (this._warmupCounter2D <= WARMUP_FRAMES) {
+      this._lastFrameTime2D = now;
+      return;
+    }
+    if (this._lastFrameTime2D === undefined) {
+      this._lastFrameTime2D = now;
+      return;
+    }
+    const frameMs = now - this._lastFrameTime2D;
+    this._lastFrameTime2D = now;
+    if (!this._frameTimes2D) this._frameTimes2D = [];
+    this._frameTimes2D.push(frameMs);
+    const WINDOW = 8;
+    if (this._frameTimes2D.length > WINDOW) this._frameTimes2D.shift();
+    if (this._frameTimes2D.length < WINDOW) return;
+    const avgMs = this._frameTimes2D.reduce((a, b) => a + b, 0) / this._frameTimes2D.length;
+
+    const SLOW_MS = 48, RECOVER_MS = 22;
+    const SCALE_STEP_DOWN = 0.015, SCALE_STEP_UP = 0.008;
+    const SCALE_MIN = 0.80;
+    const SCALE_MAX = scaleCap;
+    const STABLE_WINDOWS_TO_RECOVER = 20;
+
+    const currentScale = this._currentScale2D ?? 1.0;
+
+    if (avgMs > SLOW_MS && currentScale > SCALE_MIN) {
+      const newScale = Math.max(SCALE_MIN, currentScale - SCALE_STEP_DOWN);
+      if (Math.abs(newScale - currentScale) > 0.001) {
+        this._currentScale2D = newScale;
+        this._stableWindowCount2D = 0;
+        if (this.sdfRenderer.setRenderScale) this.sdfRenderer.setRenderScale(newScale);
+      }
+    } else if (avgMs < RECOVER_MS && currentScale < SCALE_MAX) {
+      this._stableWindowCount2D = (this._stableWindowCount2D ?? 0) + 1;
+      if (this._stableWindowCount2D >= STABLE_WINDOWS_TO_RECOVER) {
+        const newScale = Math.min(SCALE_MAX, currentScale + SCALE_STEP_UP);
+        if (Math.abs(newScale - currentScale) > 0.001) {
+          this._currentScale2D = newScale;
+          if (this.sdfRenderer.setRenderScale) this.sdfRenderer.setRenderScale(newScale);
+        }
+        this._stableWindowCount2D = 0;
+      }
+    } else {
+      this._stableWindowCount2D = 0;
+    }
+  }  
 
   /**
    * Estimate scene rendering complexity from the graph node structure.
@@ -2633,6 +2683,15 @@ _adaptRenderScale() {
           break;
         case 'torus': case 'capsule':
           weight += 1;
+          break;
+        case 'embedNode':
+          // Was previously unweighted entirely — a scene with an embed
+          // started at the SAME initial scale as a bare primitive, even
+          // though embedNode's per-pixel cost (multi-frame blend + sag
+          // correction, and now a mandatory conservative march tier —
+          // see _applyRayMarchQualityForSource) is substantial. Engrave
+          // costs more than emboss (see the same file's tiering split).
+          weight += n.params?.operation === 'engrave' ? 5 : 3;
           break;
         default:
           break;
@@ -2685,48 +2744,29 @@ _adaptRenderScale() {
     this._lastRayMarchSource = null;
   }
 
-  /**
-   * Analyse the given GLSL source string once and apply the correct
-   * sphere-tracing quality settings. Called only when the source changes
-   * (graph edit, node add/remove, param change that affects the shader),
-   * never on every animation frame.
-   *
-   * Previously this analysis ran inside _renderRayMarch() on every frame,
-   * which caused mid-orbit recompilation whenever targetMaxSteps changed —
-   * the single biggest source of "freeze then lurch" choppiness during
-   * auto-orbit on integrated graphics.
-   *
-   * @param {string} source  The GLSL source string from GLSLEvaluator
-   */
   _applyRayMarchQualityForSource(source) {
     const hasDifference = source.includes('rDifference(') ||
       (source.includes('schurBlend') && source.includes('"difference"'));
 
-    // Any non-identity DistanceMapper (sinusoidal/polynomial/exponential/
-    // logarithmic/power) can turn a proper distance field into something
-    // with no relationship to actual distance-to-surface — sinusoidal in
-    // particular introduces periodic zero-crossings unrelated to true
-    // proximity, which breaks sphere tracing's safe-step assumption and
-    // can cause the ray marcher to skip straight through geometry,
-    // producing total invisibility. identityMapper is deliberately
-    // excluded — it's a pure no-op and never needs conservative stepping.
-    // sinusoidalMapper and polynomialMapper are now RIGOROUSLY handled via
-    // Lipschitz-bound normalization in GLSLEvaluator._wrapWithNodeTransform
-    // — their output is already a safe, correct distance value, so they no
-    // longer need this heuristic fallback. Only the three mappers with no
-    // honest global bound (exponential/logarithmic/power — see
-    // GLSLEvaluator._computeMapperLipschitz) still need forced small steps.
     const hasRiskyMapper = (
       source.includes('exponentialMapper') ||
       source.includes('logarithmicMapper') ||
       source.includes('powerMapper')
     );
 
-    // embedNode's blend (host↔guest seam, plus the outer host/embedded
-    // falloff) is not distance-preserving either — same class of problem
-    // as rDifference, and at least as steep at the seam — so it needs the
-    // conservative tier below, not the milder "warp" tier.
-    const hasEmbed = source.includes('embedNode');
+    // embedNode's generated comment line literally records its operation
+    // — "// embedNode <id>  (emboss, ..." or "(engrave, ..." — so this is
+    // a cheap, reliable way to tell the two apart without re-walking the
+    // graph. ENGRAVE genuinely needs the harshest tier (its blend is a
+    // difference-like combine at the seam, same non-Lipschitz class as
+    // rDifference). EMBOSS (a smooth union at the seam) does NOT need
+    // that same harshness — treating every embed as worst-case was
+    // costing 2-3x the necessary per-pixel work on the common case,
+    // which is exactly what turned "animated noise + one embed" into a
+    // near-hang.
+    const hasEmbed        = source.includes('embedNode');
+    const hasEmbedEngrave = hasEmbed && source.includes('(engrave,');
+    const hasEmbedEmbossOnly = hasEmbed && !hasEmbedEngrave;
 
     const hasWarp = !hasDifference && !hasRiskyMapper && !hasEmbed && (
       source.includes('twistNode')        ||
@@ -2737,11 +2777,19 @@ _adaptRenderScale() {
     );
 
     let targetMaxSteps, targetStepScale, targetEpsilon, targetMaxDist;
-    if (hasDifference || hasRiskyMapper || hasEmbed) {
+    if (hasDifference || hasRiskyMapper || hasEmbedEngrave) {
       targetMaxSteps  = 256;
       targetStepScale = 0.25;
       targetEpsilon   = 0.0001;
       targetMaxDist   = 80.0;
+    } else if (hasEmbedEmbossOnly) {
+      // Meaningfully cheaper than the difference-class tier, still more
+      // conservative than the generic warp tier — the multi-frame blend
+      // and sag correction are non-trivial even for a union-style seam.
+      targetMaxSteps  = 192;
+      targetStepScale = 0.45;
+      targetEpsilon   = 0.0003;
+      targetMaxDist   = 50.0;
     } else if (hasWarp) {
       targetMaxSteps  = 192;
       targetStepScale = 0.55;
@@ -2754,12 +2802,9 @@ _adaptRenderScale() {
       targetMaxDist   = 30.0;
     }
 
-    // Only force recompile if maxSteps actually changed — this is the
-    // only quality parameter baked into the GLSL loop bound. All other
-    // parameters are uniforms uploaded each frame with no recompile needed.
     if (this.rayMarchRenderer._maxSteps !== targetMaxSteps) {
       this.rayMarchRenderer._maxSteps = targetMaxSteps;
-      this._lastRayMarchSource = null;  // force recompile with new loop bound
+      this._lastRayMarchSource = null;
     }
     this.rayMarchRenderer._stepScale = targetStepScale;
     this.rayMarchRenderer._epsilon   = targetEpsilon;
@@ -2822,6 +2867,26 @@ _adaptRenderScale() {
       }
     }
 
+    // Same adaptive-scale machinery, mirrored for 2D GLSL mode.
+    if (mode === 'glsl') {
+      const WARMUP_SCALE_2D = this._estimateSceneComplexity();
+      this._currentScale2D      = WARMUP_SCALE_2D;
+      this._lastFrameTime2D     = undefined;
+      this._stableWindowCount2D = 0;
+      this._warmupCounter2D     = 0;
+      this._frameTimes2D        = [];
+      if (this.sdfRenderer.setRenderScale) {
+        this.sdfRenderer.setRenderScale(WARMUP_SCALE_2D);
+      }
+    } else {
+      this._currentScale2D  = 1.0;
+      this._warmupCounter2D = 0;
+      this._frameTimes2D    = [];
+      if (this.sdfRenderer.setRenderScale) {
+        this.sdfRenderer.setRenderScale(1.0);
+      }
+    }
+
     const threeCanvas = this.renderer?.domElement;
 
     // Hide all GPU canvases first, then show the correct one
@@ -2867,28 +2932,14 @@ _adaptRenderScale() {
    * genuine unexpected condition worth reporting.
    */
   _renderGLSL() {
-    // Mark dirty so the animation loop knows to render on its next tick
-    // if this was called externally (param change, preset load, etc.).
-    // When called from within _loop() itself, the loop clears the flag
-    // immediately after — so setting it here is a no-op in that path.
     this._glslDirty = true;
-
     const time = (performance.now() - this._startTime) / 1000;
 
-    // Exit silently if the graph is in any state where generation cannot
-    // produce meaningful output (no nodes, no output node, output unwired).
-    // This prevents the animation loop from calling generate() and emitting
-    // a warning on every frame when the graph is empty — a situation that
-    // occurs normally after stateStore.clear() or mid-construction.
     if (!this._graphIsRenderable()) return;
 
     const { source, uniforms, vecUniforms, intUniforms, rootFn } = this.glslEvaluator.generate(time, '2d');
 
     if (!source || !rootFn) {
-      // _graphIsRenderable() confirmed the graph is wired, so a null result
-      // from generate() is unexpected. This indicates an unsupported node
-      // type, a broken evaluator path, or a graph structure that the GLSL
-      // evaluator cannot currently handle.
       console.warn(
         'SDFRenderer: graph is wired but GLSLEvaluator produced no source. ' +
         'Check that all nodes between the geometry and the output node are ' +
@@ -2897,11 +2948,11 @@ _adaptRenderScale() {
       return;
     }
 
-    // Only recompile if the source has changed since the last frame.
-    // Recompilation is expensive; skipping it when the source is identical
-    // keeps the frame rate stable when the graph is not being edited.
     if (source !== this._lastGLSLSource) {
+      if (this._onCompileStart) this._onCompileStart();
+      const compileStart = performance.now();
       const result = this.sdfRenderer.compile(source);
+      if (this._onCompileEnd) this._onCompileEnd(performance.now() - compileStart);
       if (!result.ok) {
         console.error('SDFRenderer compile error:\n', result.error);
         return;
@@ -2910,7 +2961,18 @@ _adaptRenderScale() {
       logger.info('SDFRenderer: shader compiled successfully.');
     }
 
+    const animatingNow2D = this._sceneHasAnimatedNodes();
+    const animationScaleCap2D = animatingNow2D ? 0.65 : 1.0;
+    if ((this._currentScale2D ?? 1.0) > animationScaleCap2D) {
+      this._currentScale2D = animationScaleCap2D;
+      if (this.sdfRenderer.setRenderScale) {
+        this.sdfRenderer.setRenderScale(animationScaleCap2D);
+      }
+    }
+
     this.sdfRenderer.render(uniforms, time, null, null, vecUniforms, intUniforms);
+
+    this._adaptRenderScale2D(animationScaleCap2D);
   }
 
   /**
@@ -2930,28 +2992,14 @@ _adaptRenderScale() {
    * into the GLSL loop bound, so changes to it force a full shader recompile.
    */
     _renderRayMarch() {
-    // Mark dirty so the animation loop knows to render on its next tick
-    // if this was called externally (param change, preset load, etc.).
     this._rayMarchDirty = true;
-
     const time = (performance.now() - this._startTime) / 1000;
 
-    // Exit silently if the graph has no nodes, no output node, or the
-    // output node has no incoming connections. All three are expected states
-    // that occur during normal operation and should not produce console output.
-    // Without this guard the animation loop calls generate() and emits a
-    // warning on every frame (~60 fps) whenever the graph is empty —
-    // for example after stateStore.clear() or while the user has not yet
-    // wired any geometry to the output node.
     if (!this._graphIsRenderable()) return;
 
     const { source, uniforms, vecUniforms, intUniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
 
     if (!source || !rootFn) {
-      // _graphIsRenderable() confirmed the graph is wired, so a null result
-      // from generate() is unexpected. Likely causes: a node type in the
-      // graph is not supported in 3D mode, or the 3D GLSL template for a
-      // transform or blend type has not yet been implemented.
       console.warn(
         'RayMarchRenderer: graph is wired but GLSLEvaluator produced no 3D source. ' +
         'Check that all nodes in the graph are supported in 3D ray march mode ' +
@@ -2960,17 +3008,13 @@ _adaptRenderScale() {
       return;
     }
 
-    // ── Apply quality settings and compile if source changed ─────────────
-    // Quality analysis (_applyRayMarchQualityForSource) only runs when the
-    // source string actually changed — never on every frame. This prevents
-    // mid-orbit recompilation which was the primary cause of choppiness
-    // during auto-orbit with animated noise nodes.
     if (source !== this._lastRayMarchSource) {
       this._applyRayMarchQualityForSource(source);
-      // _applyRayMarchQualityForSource may have nulled _lastRayMarchSource
-      // if maxSteps changed — check again after calling it.
       if (source !== this._lastRayMarchSource) {
+        if (this._onCompileStart) this._onCompileStart();
+        const compileStart = performance.now();
         const result = this.rayMarchRenderer.compile(source);
+        if (this._onCompileEnd) this._onCompileEnd(performance.now() - compileStart);
         if (!result.ok) {
           console.error('RayMarchRenderer compile error:\n', result.error);
           return;
@@ -2980,14 +3024,20 @@ _adaptRenderScale() {
       }
     }
 
+    const animatingNow = this._sceneHasAnimatedNodes();
+    const animationScaleCap = animatingNow ? 0.65 : 1.0;
+    if ((this._currentScale ?? 1.0) > animationScaleCap) {
+      this._currentScale = animationScaleCap;
+      if (this.rayMarchRenderer.setRenderScale) {
+        this.rayMarchRenderer.setRenderScale(animationScaleCap);
+      }
+    }
+
     this.rayMarchRenderer.setDetailScale(this._computeEmbedDetailScale());
     this.rayMarchRenderer.syncCamera(this.camera, this.controls);
     this.rayMarchRenderer.render(uniforms, time, vecUniforms, intUniforms);
 
-    // Automatically adapt render resolution to maintain ~30fps.
-    // Runs every frame in Ray March mode — drops scale when slow,
-    // gradually recovers when fast. Transparent to the user.
-    this._adaptRenderScale();
+    this._adaptRenderScale(animationScaleCap);
   }
 
   rerender(method, sdfOverride = null) {

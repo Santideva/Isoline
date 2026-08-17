@@ -41,14 +41,17 @@ export function createEmptyMask() {
     enabled: false,
     mode: 'euclidean',        // 'euclidean' | 'geodesic' | 'curvatureFlood'
     falloffRadius: 0.4,
-    // Off by default (gate fully open) — a hard/strict version of this
-    // gate fragmented ordinary curved surfaces (sphere, capsule) into
-    // disconnected "bubbles," mistaking normal amount-of-curvature for
-    // an actual fold crossing. Raise only if paint visibly leaks across
-    // a genuinely sharp edge.
     normalThreshold: -1,
     curvatureThreshold: 0.15,  // used by curvatureFlood bake only
     samples: [],                // [{x,y,z,nx,ny,nz,w}] — baked, see header
+    // Indices into `samples` where a NEW, separate committed stroke
+    // begins. The first stroke always starts at index 0 and needs no
+    // entry here. Only meaningful for 'euclidean'/'geodesic' (paint)
+    // modes — 'curvatureFlood' samples are an unordered area with no
+    // path structure, so this stays empty for that mode. Lets multiple
+    // strokes (e.g. painting separate letters) accumulate in one mask
+    // without a spurious line/segment being evaluated BETWEEN strokes.
+    strokeBreaks: [],
   };
 }
 
@@ -154,28 +157,85 @@ export function maskHasContent(mask) {
  * @param {{x,y,z}} pt
  * @returns {number} in [0,1]
  */
-  export function evaluateMaskAt(mask, pt) {
+export function evaluateMaskAt(mask, pt) {
   if (!maskHasContent(mask)) return 0;
   const radius  = computeMaskDomeRadius(mask.samples, mask.falloffRadius);
   const nThresh = 1 - (mask.normalThreshold ?? -1);
   const samples = mask.samples;
 
-  // 'euclidean' (live-drag, pre-bake) samples are a genuine path — the
-  // mouse's actual trajectory across the surface — so distance is
-  // measured to the nearest SEGMENT between consecutive samples, giving
-  // a smooth capsule-swept-tube falloff instead of a chain of slightly
-  // scalloped circles when sample spacing is coarse relative to the
-  // falloff radius. Once geodesic/curvature-flood baking has run, the
-  // samples represent a dense AREA grown outward from the stroke (see
-  // surfaceGraph.js) — consecutive baked samples have no meaningful
-  // "next point" relationship, so point-distance max is the correct (and
-  // already smooth, given the graph's own even sampling) representation
-  // there; a literal curve fit through an area's points would be fitting
-  // a line to something that isn't one.
-  if (mask.mode === 'euclidean' && samples.length >= 2) {
-    return _evaluateSegmentedMask(samples, pt, radius, nThresh);
+  // curvatureFlood samples are an unordered AREA grown from a seed —
+  // there is no meaningful "next point" relationship, so point-cloud
+  // interpolation is correct there. Every OTHER mode ('euclidean' live
+  // drag, 'geodesic' committed paint) represents an ORDERED PATH — a
+  // stroke — and is now ALWAYS evaluated as a swept tube along that
+  // path (distance to the nearest segment). Previously this only
+  // applied to 'euclidean'; once a stroke baked to 'geodesic' it fell
+  // back to point-cloud interpolation, which is what actually produced
+  // the "patterned"/beaded look — the path's own connectivity was
+  // discarded at exactly the moment it mattered most.
+  if (mask.mode !== 'curvatureFlood' && samples.length >= 2) {
+    return _evaluateSegmentedMask(samples, pt, radius, nThresh, mask.strokeBreaks);
   }
   return _evaluatePointMask(samples, pt, radius, nThresh);
+}
+
+/**
+ * Real minimum geometric distance from pt to the nearest point on the
+ * mask's own stroke path (segments for paint, nearest sample for flood),
+ * respecting the same fold-rejection gate as evaluateMaskAt. Returns
+ * Infinity if nothing within radius passes the gate.
+ *
+ * embedNode's no-guest paint-relief needs a TRUE tangential distance —
+ * inverting evaluateMaskAt's coverage VALUE (an earlier version of this
+ * feature did this) is not valid: coverage blends contributions in every
+ * direction around each sample, not just tangentially, so treating
+ * sqrt(coverage) as "1 - normalized radius" produced disconnected,
+ * blob-like geometry with no reliable relationship to the actual stroke.
+ */
+export function evaluateMaskDistance(mask, pt) {
+  if (!maskHasContent(mask)) return Infinity;
+  const radius  = computeMaskDomeRadius(mask.samples, mask.falloffRadius);
+  const nThresh = 1 - (mask.normalThreshold ?? -1);
+  const samples = mask.samples;
+
+  const passesGate = (nDotOffset) => {
+    if (nThresh >= 1) return true;
+    return (1 - _smoothstepLocal(nThresh - FOLD_SOFTNESS, nThresh, Math.abs(nDotOffset))) > 1e-4;
+  };
+
+  let minDist = Infinity;
+
+  if (mask.mode !== 'curvatureFlood' && samples.length >= 2) {
+    const breakSet = new Set(mask.strokeBreaks || []);
+    for (let i = 0; i < samples.length - 1; i++) {
+      if (breakSet.has(i + 1)) continue;
+      const a = samples[i], b = samples[i + 1];
+      const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+      const abLenSq = abx*abx + aby*aby + abz*abz;
+      const apx = pt.x - a.x, apy = pt.y - a.y, apz = pt.z - a.z;
+      const t = abLenSq > 1e-10
+        ? Math.max(0, Math.min(1, (apx*abx + apy*aby + apz*abz) / abLenSq))
+        : 0;
+      const cx = a.x + abx*t, cy = a.y + aby*t, cz = a.z + abz*t;
+      const dx = pt.x - cx, dy = pt.y - cy, dz = pt.z - cz;
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      if (dist >= radius || dist >= minDist) continue;
+      const nx = a.nx + (b.nx - a.nx) * t, ny = a.ny + (b.ny - a.ny) * t, nz = a.nz + (b.nz - a.nz) * t;
+      const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+      const nDotOffset = dist > 1e-6 ? (dx*nx + dy*ny + dz*nz) / (dist*nLen) : 0;
+      if (passesGate(nDotOffset)) minDist = dist;
+    }
+  } else {
+    samples.forEach(s => {
+      const dx = pt.x - s.x, dy = pt.y - s.y, dz = pt.z - s.z;
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      if (dist >= radius || dist >= minDist) return;
+      const nDotOffset = dist > 1e-6 ? (dx*s.nx + dy*s.ny + dz*s.nz) / dist : 0;
+      if (passesGate(nDotOffset)) minDist = dist;
+    });
+  }
+
+  return minDist;
 }
 
 function _evaluatePointMask(samples, pt, radius, nThresh) {
@@ -216,41 +276,69 @@ function _evaluatePointMask(samples, pt, radius, nThresh) {
   return Math.max(0, Math.min(envelope * localAverage, 1));
 }
 
-function _evaluateSegmentedMask(samples, pt, radius, nThresh) {
+function _evaluateSegmentedMask(samples, pt, radius, nThresh, strokeBreaks = []) {
+  const breakSet = new Set(strokeBreaks || []);
+  const n = samples.length;
   let sumW = 0;
   let sumWeighted = 0;
   let missProduct = 1;
 
-  for (let i = 0; i < samples.length - 1; i++) {
-    const a = samples[i], b = samples[i + 1];
-    const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
-    const abLenSq = abx*abx + aby*aby + abz*abz;
-    const apx = pt.x - a.x, apy = pt.y - a.y, apz = pt.z - a.z;
-    const t = abLenSq > 1e-10
-      ? Math.max(0, Math.min(1, (apx*abx + apy*aby + apz*abz) / abLenSq))
-      : 0;
-    const cx = a.x + abx*t, cy = a.y + aby*t, cz = a.z + abz*t;
-    const dx = pt.x - cx, dy = pt.y - cy, dz = pt.z - cz;
+  const contributePoint = (s) => {
+    const dx = pt.x - s.x, dy = pt.y - s.y, dz = pt.z - s.z;
     const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-    if (dist >= radius) continue;
-
-    const nx = a.nx + (b.nx - a.nx) * t, ny = a.ny + (b.ny - a.ny) * t, nz = a.nz + (b.nz - a.nz) * t;
-    const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
-    // Same pinhole fix as _evaluatePointMask — see its comment.
-    const nDotOffset = dist > 1e-6 ? (dx*nx + dy*ny + dz*nz) / (dist*nLen) : 0;
-
+    if (dist >= radius) return;
+    const nDotOffset = dist > 1e-6
+      ? (dx*s.nx + dy*s.ny + dz*s.nz) / dist
+      : 0;
     const foldGate = nThresh >= 1
       ? 1
       : 1 - _smoothstepLocal(nThresh - FOLD_SOFTNESS, nThresh, Math.abs(nDotOffset));
-    if (foldGate <= 1e-4) continue;
+    if (foldGate <= 1e-4) return;
+    const r = dist / radius;
+    const kernel = ((1 - r) ** 4 * (4 * r + 1)) * foldGate;
+    sumW += kernel;
+    sumWeighted += kernel * (s.w ?? 1);
+    missProduct *= (1 - kernel);
+  };
 
+  const contributeSegment = (a, b) => {
+    const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+    const abLenSq = abx*abx + aby*aby + abz*abz;
+    const apx = pt.x - a.x, apy = pt.y - a.y, apz = pt.z - a.z;
+    const tParam = abLenSq > 1e-10
+      ? Math.max(0, Math.min(1, (apx*abx + apy*aby + apz*abz) / abLenSq))
+      : 0;
+    const cx = a.x + abx*tParam, cy = a.y + aby*tParam, cz = a.z + abz*tParam;
+    const dx = pt.x - cx, dy = pt.y - cy, dz = pt.z - cz;
+    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (dist >= radius) return;
+    const nx = a.nx + (b.nx - a.nx) * tParam, ny = a.ny + (b.ny - a.ny) * tParam, nz = a.nz + (b.nz - a.nz) * tParam;
+    const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+    const nDotOffset = dist > 1e-6 ? (dx*nx + dy*ny + dz*nz) / (dist*nLen) : 0;
+    const foldGate = nThresh >= 1
+      ? 1
+      : 1 - _smoothstepLocal(nThresh - FOLD_SOFTNESS, nThresh, Math.abs(nDotOffset));
+    if (foldGate <= 1e-4) return;
     const r = dist / radius;
     const kernel = ((1 - r) ** 4 * (4 * r + 1)) * foldGate;
     const aw = a.w ?? 1, bw = b.w ?? 1;
-    const segW = aw + (bw - aw) * t;
+    const segW = aw + (bw - aw) * tParam;
     sumW += kernel;
     sumWeighted += kernel * segW;
     missProduct *= (1 - kernel);
+  };
+
+  for (let i = 0; i < n; i++) {
+    const isStart = i === 0 || breakSet.has(i);
+    const isEnd   = i === n - 1 || breakSet.has(i + 1);
+    if (isStart && isEnd) {
+      // An isolated single-point "stroke" (a click/dab) — no segment
+      // exists for it at all, so give it a direct point contribution
+      // instead of silently contributing nothing.
+      contributePoint(samples[i]);
+    } else if (!breakSet.has(i + 1) && i + 1 < n) {
+      contributeSegment(samples[i], samples[i + 1]);
+    }
   }
 
   if (sumW <= 1e-6) return 0;
@@ -309,6 +397,57 @@ export function decimateSamples(samples, cap = MAX_MASK_SAMPLES) {
   }
 
   return selected;
+}
+
+/**
+ * Decimate an ORDERED path (paint stroke samples + their strokeBreaks)
+ * down to `cap` entries while preserving POINT ORDER and stroke
+ * boundaries — unlike decimateSamples() (farthest-point sampling),
+ * which would scramble a path's connectivity and silently corrupt the
+ * swept-tube evaluation _evaluateSegmentedMask depends on.
+ *
+ * Each stroke (the sub-range between consecutive break points) is
+ * decimated independently by even index stride, sharing the cap
+ * proportionally to its own length, and always keeping its own first
+ * and last point so endpoints are never lost.
+ *
+ * @returns {{ samples: Array, strokeBreaks: number[] }}
+ */
+export function decimateOrderedPath(samples, strokeBreaks, cap = MAX_MASK_SAMPLES) {
+  if (!Array.isArray(samples) || samples.length <= cap) {
+    return { samples: samples || [], strokeBreaks: strokeBreaks || [] };
+  }
+
+  const starts = [0, ...(strokeBreaks || [])].sort((a, b) => a - b);
+  const strokes = starts.map((s, i) => {
+    const e = i + 1 < starts.length ? starts[i + 1] : samples.length;
+    return samples.slice(s, e);
+  });
+
+  const totalLen = samples.length;
+  const outSamples = [];
+  const outBreaks = [];
+
+  strokes.forEach(stroke => {
+    if (stroke.length === 0) return;
+    const share = Math.max(1, Math.round((stroke.length / totalLen) * cap));
+    const keep = Math.min(share, stroke.length);
+    if (outSamples.length > 0) outBreaks.push(outSamples.length);
+
+    if (keep >= stroke.length) {
+      outSamples.push(...stroke);
+      return;
+    }
+    for (let i = 0; i < keep; i++) {
+      const idx = Math.min(
+        stroke.length - 1,
+        Math.round((i / (keep - 1 || 1)) * (stroke.length - 1))
+      );
+      outSamples.push(stroke[idx]);
+    }
+  });
+
+  return { samples: outSamples, strokeBreaks: outBreaks };
 }
 
 /**
