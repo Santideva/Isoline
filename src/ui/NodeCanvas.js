@@ -669,6 +669,13 @@ function _isConvexPolygon(vertices) {
             (v) => _dispatchAdd(v, { value: v })
         );
         _2dDropdown.el.title = 'Click a 2D primitive to add it to the graph';
+        // Tier gate: the ENTIRE 2D dropdown is advanced-only, not just some
+        // of its items — a Basic-tier user should never need to open this
+        // menu at all (2D workflows are themselves an advanced use case).
+        // Reuses the existing .nc-advanced-only / .nc-tier-basic mechanism
+        // (see the ⚙ Advanced toggle handler and the CSS rule injected in
+        // _buildDOM) rather than gating each item individually.
+        _2dDropdown.el.classList.add('nc-advanced-only');
         toolbar.appendChild(_2dDropdown.el);
 
         // ── 3D geometry dropdown ──────────────────────────────────────────────
@@ -678,10 +685,10 @@ function _isConvexPolygon(vertices) {
                 { value: 'sphere',   label: 'Sphere',   hint: 'A round ball.' },
                 { value: 'box',      label: 'Box',      hint: 'A cube or rectangular block.' },
                 { value: 'cylinder', label: 'Cylinder', hint: 'A tube or pillar shape.' },
-                { value: 'capsule',  label: 'Capsule',  hint: 'A cylinder with rounded, pill-like ends.' },
-                { value: 'torus',    label: 'Torus',    hint: 'A ring or donut shape.' },
+                { value: 'capsule',  label: 'Capsule',  hint: 'A cylinder with rounded, pill-like ends.', advanced: true },
+                { value: 'torus',    label: 'Torus',    hint: 'A ring or donut shape.', advanced: true },
                 { value: 'cone',     label: 'Cone',     hint: 'A shape that tapers to a point, like an ice cream cone.' },
-                { value: 'plane',    label: 'Plane',    hint: 'An endless flat surface, like a floor with no edges.' },
+                { value: 'plane',    label: 'Plane',    hint: 'An endless flat surface, like a floor with no edges.', advanced: true },
             ],
             (v) => _dispatchAdd(v, { value: v })
         );
@@ -692,8 +699,14 @@ function _isConvexPolygon(vertices) {
         const _xformDropdown = _makeCustomDropdown(
             'Transform ▾',
             [
-                { value: 'extrude',       label: 'Extrude',           hint: 'Pushes a flat shape through space to give it depth, turning 2D into 3D.' },
-                { value: 'revolve',       label: 'Revolve',           hint: 'Spins a flat shape around a line to make a solid, like a potter\'s wheel.' },
+                // extrude/revolve: advanced:true here is a TIER gate
+                // (hidden from Basic-tier users entirely). This is separate
+                // from _updateDropdownAvailability's dimensional-validity
+                // greying (✕ prefix + disabled cursor when the selected/
+                // sole primitive is 3D) — that logic is untouched and still
+                // applies on top of this whenever the item IS visible.
+                { value: 'extrude',       label: 'Extrude',           hint: 'Pushes a flat shape through space to give it depth, turning 2D into 3D.', advanced: true },
+                { value: 'revolve',       label: 'Revolve',           hint: 'Spins a flat shape around a line to make a solid, like a potter\'s wheel.', advanced: true },
                 { value: 'tiling',        label: 'Tiling / Repeat',   hint: 'Repeats the shape in a pattern — infinitely, or a limited number of times with exact count and spacing control.' },
                 { value: 'symmetryfold',  label: 'Sym. Fold',         hint: 'Mirrors the shape like a kaleidoscope.' },
                 { value: 'symmetryorbit', label: 'Sym. Orbit',        hint: 'Places several copies of the shape in a circle around a center point.', advanced: true },
@@ -730,7 +743,10 @@ function _isConvexPolygon(vertices) {
         const _mapperDropdown = _makeCustomDropdown(
             'Mapper ▾',
             [
-                { value: 'polynomialMapper',  label: 'Polynomial',  hint: 'Warps the edge based on distance — can create a bulging or pinched boundary.' },
+                // Gated advanced: doesn't animate anything (unlike
+                // sinusoidal/noise-displace/morph), making it the odd one
+                // out among the mapper family for a Basic-tier user.
+                { value: 'polynomialMapper',  label: 'Polynomial',  hint: 'Warps the edge based on distance — can create a bulging or pinched boundary.', advanced: true },
                 { value: 'sinusoidalMapper',  label: 'Sinusoidal',  hint: 'Adds rippling rings inside and outside the edge. Can pulse in and out over time.' },
                 { value: 'exponentialMapper', label: 'Exponential', hint: 'Stretches the falloff unevenly — sharp near the edge, soft further out.', advanced: true },
                 { value: 'logarithmicMapper', label: 'Logarithmic', hint: 'Compresses the falloff unevenly — soft near the edge, sharp further out.', advanced: true },

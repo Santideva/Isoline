@@ -1378,11 +1378,19 @@ export class SceneManager {
     if (typeof fn !== 'function') return 1;
 
     const node = stateStore.nodeGraph.nodes.get(nodeId);
-    const center = {
+    const nominalCenter = {
       x: node?.transform?.posX ?? 0,
       y: node?.transform?.posY ?? 0,
       z: node?.transform?.posZ ?? 0,
     };
+
+    // Some primitives are NOT centered on their own local origin — Cone's
+    // apex sits exactly at (0,0,0) (see GLSLEvaluator._generate3DNode's
+    // cone case: q.y ranges 0..height, not -height/2..height/2). Tracing
+    // OUTWARD from a point already ON the surface finds a sign change on
+    // the very first step, reporting a near-zero radius. Detect that case
+    // and find a genuinely-interior point to sample from instead.
+    const center = this._robustShapeCenter(fn, nominalCenter);
 
     const DIRS = [
       [1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],
@@ -1393,21 +1401,96 @@ export class SceneManager {
     const radii = [];
 
     DIRS.forEach(([dx, dy, dz]) => {
-      let t = 0, lastSign = null;
+      let t = 0, lastSign = null, lastCrossing = null;
       while (t < MAX_DIST) {
         const p = { x: center.x + dx*t, y: center.y + dy*t, z: center.z + dz*t };
         let d;
         try { d = fn(p); } catch (e) { break; }
         if (!isFinite(d)) break;
         const sign = d < 0 ? -1 : 1;
-        if (lastSign !== null && sign !== lastSign) { radii.push(t); return; }
+        // Track the LAST sign change, not the first — a non-convex shape
+        // (a torus is the clearest example) can be crossed twice by one
+        // ray: once entering the solid, once exiting the far side.
+        // Stopping at the FIRST crossing silently reports the torus's
+        // INNER tube radius instead of its true outer extent.
+        if (lastSign !== null && sign !== lastSign) lastCrossing = t;
         lastSign = sign;
         t += STEP;
       }
+      if (lastCrossing !== null) radii.push(lastCrossing);
     });
 
     if (radii.length === 0) return 1;
-    return radii.reduce((a,b) => a+b, 0) / radii.length;
+    // MAX, not average — this value is used as a conservative BOUNDING
+    // radius (Auto-Fit sizing, camera framing) and must not undershoot an
+    // anisotropic shape's true extent. Averaging silently blended a
+    // capsule's long axis (1.5) with its short axes (~0.5) into ~0.7, and
+    // did the same for a cube's face-normal distance (1.0) vs its true
+    // corner distance (1.732).
+    return radii.reduce((a, b) => Math.max(a, b), 0);
+  }
+
+  /**
+   * Find a point that is genuinely INSIDE the shape to sample radii from,
+   * for primitives whose own local origin is not their centroid (Cone —
+   * see estimateNodeRadius's comment). Cheap: only runs its probe when
+   * nominalCenter isn't already comfortably inside (d < -0.05), which is
+   * the common case for every OTHER primitive (sphere/box/cylinder/
+   * capsule/torus are all origin-centered by construction) — those return
+   * immediately with zero extra cost.
+   *
+   * Falls back to nominalCenter whenever the recentered guess doesn't
+   * actually land inside the shape (e.g. a torus, whose origin sits in
+   * the donut's hole and is genuinely outside the solid — its axis-
+   * aligned bounding box is still symmetric about that origin, so the
+   * probe below correctly reconstructs (0,0,0) and then discards it via
+   * this same check, leaving torus's existing correct behavior intact).
+   */
+  _robustShapeCenter(fn, nominalCenter) {
+    let dAtNominal;
+    try { dAtNominal = fn(nominalCenter); } catch (e) { return nominalCenter; }
+    if (isFinite(dAtNominal) && dAtNominal < -0.05) return nominalCenter;
+
+    const AXES = [[1,0,0],[0,1,0],[0,0,1]];
+    const MAX_DIST = 20, STEP = 0.05;
+    const mins = { x: 0, y: 0, z: 0 };
+    const maxs = { x: 0, y: 0, z: 0 };
+    const axisKeys = ['x', 'y', 'z'];
+
+    AXES.forEach(([dx, dy, dz], i) => {
+      const key = axisKeys[i];
+      [1, -1].forEach(sign => {
+        let t = 0, lastInsideSign = null, crossing = null;
+        while (t < MAX_DIST) {
+          const p = {
+            x: nominalCenter.x + dx * sign * t,
+            y: nominalCenter.y + dy * sign * t,
+            z: nominalCenter.z + dz * sign * t,
+          };
+          let d;
+          try { d = fn(p); } catch (e) { break; }
+          if (!isFinite(d)) break;
+          const isInside = d < 0;
+          if (lastInsideSign !== null && isInside !== lastInsideSign) crossing = t;
+          lastInsideSign = isInside;
+          t += STEP;
+        }
+        if (crossing !== null) {
+          const signedCrossing = sign * crossing;
+          if (sign > 0) maxs[key] = Math.max(maxs[key], signedCrossing);
+          else mins[key] = Math.min(mins[key], signedCrossing);
+        }
+      });
+    });
+
+    const recentered = {
+      x: nominalCenter.x + (mins.x + maxs.x) / 2,
+      y: nominalCenter.y + (mins.y + maxs.y) / 2,
+      z: nominalCenter.z + (mins.z + maxs.z) / 2,
+    };
+    let dAtRecentered;
+    try { dAtRecentered = fn(recentered); } catch (e) { return nominalCenter; }
+    return (isFinite(dAtRecentered) && dAtRecentered < 0) ? recentered : nominalCenter;
   }
 
   /**
@@ -2992,13 +3075,25 @@ _adaptRenderScale2D(scaleCap = 1.0) {
    * into the GLSL loop bound, so changes to it force a full shader recompile.
    */
     _renderRayMarch() {
-    this._rayMarchDirty = true;
+    // BUGFIX: this used to set `this._rayMarchDirty = true;` as its own
+    // first line — meaning the very frame that just consumed the dirty
+    // flag (setting it false in _loop()'s check, immediately above the
+    // _renderRayMarch() call) had it flipped straight back to true before
+    // the NEXT frame's check ever ran. That made the condition in _loop()
+    // (`camMoved || this._rayMarchDirty || this._sceneHasAnimatedNodes()`)
+    // permanently true regardless of whether anything actually changed —
+    // defeating the entire point of the dirty-flag skip described in this
+    // method's own header comment ("Skip the render entirely when the
+    // camera is stationary, no params changed, and no animated nodes
+    // exist"). Every other call site that needs an immediate re-render
+    // (setRenderMode(), NodeCanvas._renderInPlace(), the paint-drag path)
+    // either sets _rayMarchDirty = true explicitly beforehand or calls
+    // this method directly — none of them depended on this self-set.
     const time = (performance.now() - this._startTime) / 1000;
 
     if (!this._graphIsRenderable()) return;
 
     const { source, uniforms, vecUniforms, intUniforms, rootFn } = this.glslEvaluator.generate(time, '3d');
-
     if (!source || !rootFn) {
       console.warn(
         'RayMarchRenderer: graph is wired but GLSLEvaluator produced no 3D source. ' +

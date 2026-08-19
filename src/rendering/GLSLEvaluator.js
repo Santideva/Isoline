@@ -735,7 +735,18 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
     }
 
     // ── GUEST-PROJECTION PATH ────────────────────────────────────────────
-    const embedMaskFnName = useMaskFrames ? this._maskFieldGLSL(hostNode) : null;
+    // CPU/GLSL PARITY FIX: NodeEvaluator's embedNode case only overrides w
+    // via evaluateMaskAt() when hostMask.mode !== 'curvatureFlood' — for
+    // curvatureFlood it deliberately leaves w to the tangential/depth
+    // radial falloff (wT*wD) instead, since a flood selection's shape is
+    // already encoded in WHICH points became mask samples, not in a
+    // separate coverage function. This GLSL version applied the mask
+    // function UNCONDITIONALLY regardless of mode — the actual cause of
+    // the CPU-says-no-effect / GPU-shows-an-effect divergence measured by
+    // window.__torusDiag.inspectEmbed(). Matched to CPU's behavior here.
+    const embedMaskFnName = (useMaskFrames && hostNode.mask.mode !== 'curvatureFlood')
+      ? this._maskFieldGLSL(hostNode)
+      : null;
 
     const op = p.operation ?? 'emboss';
     const depthVal = this._uniformFloat(node, 'embedDepth', p.depth ?? 0.35);
@@ -762,7 +773,10 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
 
     let frames, bandwidth;
     if (useMaskFrames) {
-      const rawFrames = deriveEmbedFramesFromMask(hostNode.mask, 6);
+      // Kept in sync with MAX_EMBED_FRAMES above — requesting more frames
+      // here than the GLSL unroll below can hold would just have the
+      // extras silently discarded by the fixed-slot loop.
+      const rawFrames = deriveEmbedFramesFromMask(hostNode.mask, 3);
       const hostTransform = hostNode.transform;
       frames = (hostTransform && !isIdentityTransform(hostTransform))
         ? rawFrames.map(f => _transformFrameToHostParentSpaceGLSL(f, hostTransform))
@@ -788,7 +802,17 @@ ${tilingFoldGLSL ? tilingFoldGLSL : ''}
       rs = this._uniformFloat(node, 'embedRegionSize', p.regionSize ?? 1.0);
     }
 
-    const MAX_EMBED_FRAMES = 6;
+    // Reduced from 6 → 3. Each unrolled frame slot below carries its own
+    // mat3 Hessian/sag-correction block, and this entire loop is called
+    // from inside the ray-march loop (192+ iterations) which is ITSELF
+    // called again from two 32-step shadow loops and a 6-step AO loop.
+    // ANGLE must statically unroll all of that nesting before D3DCompile
+    // even starts — measured compile times of 7-16 SECONDS per shader at
+    // 6 frames, uniformly across every host/guest combination tested
+    // (see the embed-diag sweep). Halving the unrolled frame count is a
+    // partial mitigation, not a fix — the ray-march-loop × mask-sample-
+    // loop nesting is the other major contributor and is untouched here.
+    const MAX_EMBED_FRAMES = 3;
     const FAR_SENTINEL = { x: 1e6, y: 1e6, z: 1e6 };
 
     const frameDecls = [];
